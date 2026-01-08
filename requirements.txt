@@ -1,0 +1,17 @@
+torch
+torchvision
+pillow
+numpy
+opencv-python
+scikit-learn
+tqdm
+gdown
+albumentations
+mamba-ssm
+numpy
+timm
+einops
+fastprogress
+pytorch-lightning
+fvcore
+tensorflow
