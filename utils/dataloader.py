@@ -39,7 +39,7 @@ class FloodSegmentationDataset(Dataset):
                 A.RandomBrightnessContrast(p=0.2),
                 A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.3),
                 ToTensorV2()
-            ], seed=seed)
+            ])
         else:
             self.transform = A.Compose([
                 A.Resize(size, size),
@@ -52,6 +52,7 @@ class FloodSegmentationDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.images[idx]
         
+        # CRITICAL: Deterministic per-sample seed
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         
@@ -103,17 +104,20 @@ def seed_worker(worker_id):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(worker_seed)
 
-def get_dataloaders(dataset, batch_size=4, size=256, seed=42, num_classes=1):
-    """Create DataLoaders with STRICT reproducibility using num_workers=4"""
+def get_dataloaders(dataset, batch_size=4, size=256, seed=42, num_classes=1, dataset_type='floodvn'):
+    """
+    ✅ FIXED: Added dataset_type parameter
+    Create DataLoaders with STRICT reproducibility using num_workers=4
+    """
     
     train_dataset = FloodSegmentationDataset(
-        dataset, 'train', size, seed, num_classes, dataset
+        dataset, 'train', size, seed, num_classes, dataset_type=dataset_type
     )
     val_dataset = FloodSegmentationDataset(
-        dataset, 'val', size, seed, num_classes, dataset
+        dataset, 'val', size, seed, num_classes, dataset_type=dataset_type
     )
     test_dataset = FloodSegmentationDataset(
-        dataset, 'test', size, seed, num_classes, dataset
+        dataset, 'test', size, seed, num_classes, dataset_type=dataset_type
     )
     
     g = torch.Generator()

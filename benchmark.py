@@ -51,8 +51,8 @@ DATASETS = {
     'floodvn': {'id': '1tQYUVtSdYJ3cGn1oftmb9MeWrmu4ez7P', 'dir': 'floodvn'},
     'floodkaggle': {'id': '1tg3N5DW27LWgJ9cTvNeIUz5xoBqSrmEs', 'dir': 'floodkaggle'},
     'floodnet': {
-        'path': '/content/drive/MyDrive/FloodNet_Segmentation.zip',
-        'dir': 'floodnet'
+        'path': '/content/drive/MyDrive/FloodNet',  # Đọc trực tiếp từ Drive
+        'dir': '/content/drive/MyDrive/FloodNet'
     }
 }
 
@@ -60,25 +60,31 @@ def download_dataset(name):
     """Download and extract dataset"""
     
     if name == 'floodnet':
-        # FloodNet: extract from Google Drive path
-        zip_path = DATASETS['floodnet']['path']
-        extract_dir = DATASETS['floodnet']['dir']
+        # FloodNet: đọc trực tiếp từ Google Drive
+        floodnet_path = DATASETS['floodnet']['path']
         
-        if os.path.exists(extract_dir):
-            print(f"FloodNet exists at {extract_dir}. Skipping.")
-            return
-        
-        if not os.path.exists(zip_path):
+        if not os.path.exists(floodnet_path):
             raise FileNotFoundError(
-                f"FloodNet zip not found at {zip_path}\n"
-                f"Please ensure the file exists in Google Drive."
+                f"FloodNet not found at {floodnet_path}\n"
+                f"Please ensure FloodNet folder exists in Google Drive with structure:\n"
+                f"  /content/drive/MyDrive/FloodNet/\n"
+                f"    ├── train/\n"
+                f"    ├── val/\n"
+                f"    └── test/"
             )
         
-        print(f"Extracting FloodNet from {zip_path}...")
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_dir)
+        # Verify structure
+        for split in ['train', 'val', 'test']:
+            split_path = os.path.join(floodnet_path, split)
+            if not os.path.exists(split_path):
+                raise FileNotFoundError(
+                    f"Missing {split} folder in {floodnet_path}"
+                )
         
-        print(f"✓ FloodNet extracted to {extract_dir}")
+        print(f"✓ FloodNet found at {floodnet_path}")
+        print(f"  - train: {len(os.listdir(os.path.join(floodnet_path, 'train', 'image')))} images")
+        print(f"  - val:   {len(os.listdir(os.path.join(floodnet_path, 'val', 'image')))} images")
+        print(f"  - test:  {len(os.listdir(os.path.join(floodnet_path, 'test', 'image')))} images")
         
     else:
         # FloodVN / FloodKaggle: download from Google Drive
@@ -112,6 +118,10 @@ def verify_reproducibility(args, num_runs=2):
         set_seed(args.seed)
         
         from utils.trainer import train_segmentation
+        
+        # Get dataset path
+        dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
+        
         result = train_segmentation(
             model_name=args.model,
             loss_name=args.loss,
@@ -119,10 +129,11 @@ def verify_reproducibility(args, num_runs=2):
             epochs=min(args.epochs, 5),
             batch_size=args.batch_size,
             lr=args.lr,
-            dataset=args.dataset,
+            dataset=dataset_path,
             output_path=os.path.join(args.output_path, f'repro_run{run}'),
             seed=args.seed,
-            num_classes=10 if args.dataset == 'floodnet' else 1
+            num_classes=10 if args.dataset == 'floodnet' else 1,
+            dataset_type=args.dataset
         )
         results.append(result)
     
@@ -165,6 +176,10 @@ def run_multiseed_experiments(args, seeds):
         
         set_seed(seed)
         from utils.trainer import train_segmentation
+        
+        # Get dataset path
+        dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
+        
         result = train_segmentation(
             model_name=args.model,
             loss_name=args.loss,
@@ -172,10 +187,11 @@ def run_multiseed_experiments(args, seeds):
             epochs=args.epochs,
             batch_size=args.batch_size,
             lr=args.lr,
-            dataset=args.dataset,
+            dataset=dataset_path,
             output_path=os.path.join(args.output_path, f'seed_{seed}'),
             seed=seed,
-            num_classes=10 if args.dataset == 'floodnet' else 1
+            num_classes=10 if args.dataset == 'floodnet' else 1,
+            dataset_type=args.dataset
         )
         results.append({
             'seed': seed,
@@ -256,6 +272,9 @@ def main():
     if args.size is None:
         args.size = 256
     
+    # Get dataset path
+    dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
+    
     # Check for special modes
     if args.verify_repro:
         verify_reproducibility(args, num_runs=2)
@@ -270,6 +289,7 @@ def main():
     print("TRAINING CONFIGURATION")
     print("="*70)
     print(f"Dataset:       {args.dataset}")
+    print(f"Dataset Path:  {dataset_path}")
     print(f"Model:         {args.model}")
     print(f"Size:          {args.size}")
     print(f"Loss:          {args.loss}")
@@ -289,10 +309,11 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        dataset=args.dataset,
+        dataset=dataset_path,
         output_path=args.output_path,
         seed=args.seed,
-        num_classes=num_classes
+        num_classes=num_classes,
+        dataset_type=args.dataset
     )
 
 if __name__ == '__main__':

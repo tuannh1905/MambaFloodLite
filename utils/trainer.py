@@ -18,8 +18,11 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr, 
-                       dataset, output_path, seed, num_classes=1):
-    """Train with ABSOLUTE reproducibility - num_workers=4"""
+                       dataset, output_path, seed, num_classes=1, dataset_type='floodvn'):
+    """
+    ✅ FIXED: dataset_type now has default value 'floodvn'
+    Train with ABSOLUTE reproducibility - num_workers=4
+    """
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -33,7 +36,7 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     from utils.dataloader import get_dataloaders
     train_loader, val_loader, test_loader = get_dataloaders(
         dataset=dataset, batch_size=batch_size, size=size, 
-        seed=seed, num_classes=num_classes
+        seed=seed, num_classes=num_classes, dataset_type=dataset_type
     )
     
     print(f"✓ DataLoaders: num_workers=4, persistent_workers=False")
