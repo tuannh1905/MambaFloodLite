@@ -33,8 +33,11 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     print(f"{'='*70}")
     print(f"Number of classes: {num_classes} ({'binary' if num_classes == 1 else 'multi-class'})")
     
-    model = get_model(model_name, num_classes=num_classes).to(device)
-    
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+
+    model = get_model(model_name, num_classes=num_classes, seed=seed).to(device)
     total_params, trainable_params = count_parameters(model)
     print(f"Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     print(f"Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
@@ -44,8 +47,9 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     print(f"{'='*70}")
     criterion = get_loss(loss_name, num_classes=num_classes)
     
+    torch.manual_seed(seed)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
+        
     os.makedirs(output_path, exist_ok=True)
     save_path = os.path.join(
         output_path, 

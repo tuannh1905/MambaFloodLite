@@ -7,6 +7,7 @@ from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
+import random
 
 class FloodSegmentationDataset(Dataset):
     def __init__(self, root_dir, split='train', size=512, seed=42, num_classes=1, dataset_type='floodvn'):
@@ -14,6 +15,10 @@ class FloodSegmentationDataset(Dataset):
         self.size = size
         self.seed = seed
         self.num_classes = num_classes
+        self.split = split  # ADD THIS
+        
+        random.seed(seed)
+        np.random.seed(seed)
         
         if dataset_type == 'floodnet':
             self.root_dir = os.path.join(root_dir, split)
@@ -26,7 +31,7 @@ class FloodSegmentationDataset(Dataset):
         
         self.images = []
         if os.path.exists(self.images_dir):
-            for img_name in os.listdir(self.images_dir):
+            for img_name in sorted(os.listdir(self.images_dir)):
                 ext = os.path.splitext(img_name)[1].lower()
                 if ext in [".png", ".jpg", ".jpeg"]:
                     if dataset_type == 'floodnet':
@@ -58,6 +63,18 @@ class FloodSegmentationDataset(Dataset):
         return len(self.images)
     
     def __getitem__(self, idx):
+        # ==================== CRITICAL FIX ====================
+        # Set unique seed per sample for deterministic augmentation
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        
+        # Formula: base_seed + sample_index + worker_offset
+        # This ensures each sample gets same augmentation across runs
+        sample_seed = self.seed + idx + worker_id * 100000
+        np.random.seed(sample_seed)
+        random.seed(sample_seed)
+        # ======================================================
+        
         img_name = self.images[idx]
         img_path = os.path.join(self.images_dir, img_name)
         image = np.array(Image.open(img_path).convert('RGB'))
@@ -90,7 +107,12 @@ class FloodSegmentationDataset(Dataset):
         return image, mask
 
 
-def get_dataloaders(dataset, batch_size=8, size=512, seed=42, num_classes=1):
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+def get_dataloaders(dataset, batch_size=4, size=256, seed=42, num_classes=1):
     print(f"Using {dataset} dataset with {num_classes} classes")
     
     train_dataset = FloodSegmentationDataset(dataset, 'train', size, seed, num_classes, dataset)
@@ -99,8 +121,11 @@ def get_dataloaders(dataset, batch_size=8, size=512, seed=42, num_classes=1):
     
     print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    g = torch.Generator()
+    g.manual_seed(seed)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True, worker_init_fn=seed_worker, generator=g)
     
     return train_loader, val_loader, test_loader
