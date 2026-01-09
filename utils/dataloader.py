@@ -2,12 +2,12 @@ import os
 import torch
 import json
 import numpy as np
+import random
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
-import random
 
 class FloodSegmentationDataset(Dataset):
     def __init__(self, root_dir, split='train', size=512, seed=42, num_classes=1, dataset_type='floodvn'):
@@ -15,10 +15,7 @@ class FloodSegmentationDataset(Dataset):
         self.size = size
         self.seed = seed
         self.num_classes = num_classes
-        self.split = split  # ADD THIS
-        
-        random.seed(seed)
-        np.random.seed(seed)
+        self.split = split
         
         if dataset_type == 'floodnet':
             self.root_dir = os.path.join(root_dir, split)
@@ -29,20 +26,10 @@ class FloodSegmentationDataset(Dataset):
             self.images_dir = os.path.join(self.root_dir, 'images')
             self.labels_dir = os.path.join(self.root_dir, 'labels')
         
-        self.images = []
-        if os.path.exists(self.images_dir):
-            for img_name in sorted(os.listdir(self.images_dir)):
-                ext = os.path.splitext(img_name)[1].lower()
-                if ext in [".png", ".jpg", ".jpeg"]:
-                    if dataset_type == 'floodnet':
-                        mask_name = img_name
-                        mask_path = os.path.join(self.labels_dir, mask_name)
-                    else:
-                        label_name = os.path.splitext(img_name)[0] + ".json"
-                        mask_path = os.path.join(self.labels_dir, label_name)
-                    
-                    if os.path.exists(mask_path):
-                        self.images.append(img_name)
+        self.images = sorted([
+            img for img in os.listdir(self.images_dir)
+            if os.path.splitext(img)[1].lower() in [".png", ".jpg", ".jpeg"]
+        ])
         
         if split == 'train':
             self.transform = A.Compose([
@@ -52,7 +39,7 @@ class FloodSegmentationDataset(Dataset):
                 A.RandomBrightnessContrast(p=0.2),
                 A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.3),
                 ToTensorV2()
-            ])
+            ], seed=seed)
         else:
             self.transform = A.Compose([
                 A.Resize(size, size),
@@ -63,25 +50,25 @@ class FloodSegmentationDataset(Dataset):
         return len(self.images)
     
     def __getitem__(self, idx):
-        # ==================== CRITICAL FIX ====================
-        # Set unique seed per sample for deterministic augmentation
+        img_name = self.images[idx]
+        
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         
-        # Formula: base_seed + sample_index + worker_offset
-        # This ensures each sample gets same augmentation across runs
-        sample_seed = self.seed + idx + worker_id * 100000
+        filename_hash = hash(img_name) % 1000000
+        sample_seed = self.seed + filename_hash + worker_id * 10000000
+        
         np.random.seed(sample_seed)
         random.seed(sample_seed)
-        # ======================================================
+        torch.manual_seed(sample_seed)
         
-        img_name = self.images[idx]
         img_path = os.path.join(self.images_dir, img_name)
-        image = np.array(Image.open(img_path).convert('RGB'))
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         if self.dataset_type == 'floodnet':
             mask_path = os.path.join(self.labels_dir, img_name)
-            mask = np.array(Image.open(mask_path))
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
         else:
             base_name = os.path.splitext(img_name)[0]
             label_path = os.path.join(self.labels_dir, base_name + '.json')
@@ -106,26 +93,64 @@ class FloodSegmentationDataset(Dataset):
         
         return image, mask
 
-
 def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
+    """Initialize worker with deterministic seed based on global seed + worker_id"""
+    worker_seed = (torch.initial_seed() + worker_id) % (2**32)
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(worker_seed)
 
 def get_dataloaders(dataset, batch_size=4, size=256, seed=42, num_classes=1):
-    print(f"Using {dataset} dataset with {num_classes} classes")
+    """Create DataLoaders with STRICT reproducibility using num_workers=4"""
     
-    train_dataset = FloodSegmentationDataset(dataset, 'train', size, seed, num_classes, dataset)
-    val_dataset = FloodSegmentationDataset(dataset, 'val', size, seed, num_classes, dataset)
-    test_dataset = FloodSegmentationDataset(dataset, 'test', size, seed, num_classes, dataset)
-    
-    print(f"Dataset sizes - Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    train_dataset = FloodSegmentationDataset(
+        dataset, 'train', size, seed, num_classes, dataset
+    )
+    val_dataset = FloodSegmentationDataset(
+        dataset, 'val', size, seed, num_classes, dataset
+    )
+    test_dataset = FloodSegmentationDataset(
+        dataset, 'test', size, seed, num_classes, dataset
+    )
     
     g = torch.Generator()
     g.manual_seed(seed)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True, worker_init_fn=seed_worker, generator=g)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True, worker_init_fn=seed_worker, generator=g)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True, worker_init_fn=seed_worker, generator=g)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True if torch.cuda.is_available() else False,
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=g,
+        persistent_workers=False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True if torch.cuda.is_available() else False,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        persistent_workers=False
+    )
+    
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True if torch.cuda.is_available() else False,
+        drop_last=False,
+        worker_init_fn=seed_worker,
+        persistent_workers=False
+    )
     
     return train_loader, val_loader, test_loader

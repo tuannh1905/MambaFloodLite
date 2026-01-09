@@ -9,25 +9,50 @@ import shutil
 import zipfile
 import json
 
+import os
+import sys
+import torch
+import random
+import numpy as np
+import argparse
+import warnings
+
 def set_seed(seed):
+    """Set ALL random seeds with maximum strictness"""
+    # Python & System
     os.environ['PYTHONHASHSEED'] = str(seed)
-    os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
-    
     random.seed(seed)
+    
+    # NumPy
     np.random.seed(seed)
+    
+    # PyTorch CPU
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
     
-    torch.use_deterministic_algorithms(True)
-    
-    if hasattr(torch.backends.cudnn, 'allow_tf32'):
+    # PyTorch CUDA
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        
+        # CRITICAL: Disable all non-deterministic CUDA operations
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
+        # CRITICAL: Disable TF32 on Ampere GPUs (RTX 3000/4000, A100, Colab T4)
+        torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
-    if hasattr(torch.backends, 'cuda'):
-        if hasattr(torch.backends.cuda, 'matmul'):
-            if hasattr(torch.backends.cuda.matmul, 'allow_tf32'):
-                torch.backends.cuda.matmul.allow_tf32 = False
+        
+        # CRITICAL: Set CUDA workspace config for deterministic algorithms
+        os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+    
+    # CRITICAL: Force ALL PyTorch operations to be deterministic
+    torch.use_deterministic_algorithms(True, warn_only=False)
+    
+    # Suppress warnings
+    warnings.filterwarnings('ignore', category=UserWarning)
+    
+    print(f"✓ Seed set to {seed} (STRICT MODE)")
+
     
 DATASETS = {
     'floodvn': {'id': '1tQYUVtSdYJ3cGn1oftmb9MeWrmu4ez7P', 'dir': 'floodvn'},
