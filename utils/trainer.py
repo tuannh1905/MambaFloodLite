@@ -4,7 +4,6 @@ import torch.nn as nn
 from tqdm import tqdm
 
 def set_seed(seed):
-    """Reset seed - call before every major operation"""
     import random
     import numpy as np
     
@@ -19,10 +18,6 @@ def set_seed(seed):
 
 def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr, 
                        dataset, output_path, seed, num_classes=1, dataset_type='floodvn'):
-    """
-    ✅ FIXED: dataset_type now has default value 'floodvn'
-    Train with ABSOLUTE reproducibility - num_workers=4
-    """
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -56,6 +51,33 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     print(f"✓ Model: {model_name}")
     print(f"  Total params: {total_params:,}")
     print(f"  Trainable: {trainable_params:,}")
+    
+    from utils.metrics import calculate_model_complexity, measure_inference_time
+    
+    print(f"\n{'='*70}")
+    print("MODEL COMPLEXITY ANALYSIS")
+    print(f"{'='*70}")
+    
+    complexity = calculate_model_complexity(model, input_size=(1, 3, size, size), device=device)
+    
+    print(f"Total Parameters:    {complexity['total_params']:,}")
+    print(f"Trainable Parameters: {complexity['trainable_params']:,}")
+    print(f"Model Size:          {complexity['model_size_mb']:.2f} MB")
+    print(f"Peak Memory Usage:   {complexity['memory_mb']:.2f} MB")
+    print(f"GFLOPs:              {complexity['gflops']:.4f}")
+    
+    print(f"\n{'='*70}")
+    print("INFERENCE PERFORMANCE")
+    print(f"{'='*70}")
+    
+    inference_stats = measure_inference_time(model, input_size=(1, 3, size, size), device=device)
+    
+    print(f"Average Inference Time: {inference_stats['avg_time_s']*1000:.4f} ms (± {inference_stats['std_time_s']*1000:.4f} ms)")
+    print(f"Min Inference Time:     {inference_stats['min_time_s']*1000:.4f} ms")
+    print(f"Max Inference Time:     {inference_stats['max_time_s']*1000:.4f} ms")
+    print(f"FPS:                    {inference_stats['fps']:.2f}")
+    print(f"Latency:                {inference_stats['latency_ms']:.4f} ms")
+    print(f"{'='*70}\n")
     
     set_seed(seed)
     
@@ -139,6 +161,8 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
                 'torch_rng_state': torch.get_rng_state(),
                 'cuda_rng_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
                 'cuda_rng_state_all': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                'complexity': complexity,
+                'inference_stats': inference_stats,
                 'config': {
                     'model': model_name,
                     'loss': loss_name,
@@ -184,23 +208,46 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(masks.cpu().numpy())
     
-    from utils.metrics import calculate_miou
+    from utils.metrics import calculate_miou, calculate_dice_score, calculate_pixel_accuracy
+    
     miou = calculate_miou(all_preds, all_labels, num_classes)
+    dice = calculate_dice_score(all_preds, all_labels, num_classes)
+    pixel_acc = calculate_pixel_accuracy(all_preds, all_labels, num_classes)
     
     avg_test_loss = test_loss / len(test_loader)
     
     print(f"\n{'='*70}")
-    print("FINAL RESULTS")
+    print("FINAL RESULTS - ACCURACY METRICS")
     print(f"{'='*70}")
-    print(f"Test Loss:     {avg_test_loss:.10f}")
-    print(f"mIOU:          {miou:.10f}")
-    print(f"Best Val Loss: {best_val_loss:.10f}")
-    print(f"Saved:         {save_path}")
+    print(f"Test Loss:        {avg_test_loss:.10f}")
+    print(f"mIOU:             {miou:.10f}")
+    print(f"Dice Score:       {dice:.10f}")
+    print(f"Pixel Accuracy:   {pixel_acc:.10f}")
+    print(f"Best Val Loss:    {best_val_loss:.10f}")
+    print(f"\n{'='*70}")
+    print("MODEL COMPLEXITY")
+    print(f"{'='*70}")
+    print(f"Parameters:       {complexity['total_params']:,}")
+    print(f"Model Size:       {complexity['model_size_mb']:.2f} MB")
+    print(f"Memory Usage:     {complexity['memory_mb']:.2f} MB")
+    print(f"GFLOPs:           {complexity['gflops']:.4f}")
+    print(f"\n{'='*70}")
+    print("INFERENCE PERFORMANCE")
+    print(f"{'='*70}")
+    print(f"Avg Inference:    {inference_stats['avg_time_s']*1000:.4f} ms")
+    print(f"FPS:              {inference_stats['fps']:.2f}")
+    print(f"Latency:          {inference_stats['latency_ms']:.4f} ms")
+    print(f"\n{'='*70}")
+    print(f"Saved:            {save_path}")
     print(f"{'='*70}\n")
     
     return {
         'test_loss': avg_test_loss,
         'miou': miou,
+        'dice': dice,
+        'pixel_accuracy': pixel_acc,
         'best_val_loss': best_val_loss,
-        'model_path': save_path
+        'model_path': save_path,
+        'complexity': complexity,
+        'inference_stats': inference_stats
     }

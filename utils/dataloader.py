@@ -17,14 +17,10 @@ class FloodSegmentationDataset(Dataset):
         self.num_classes = num_classes
         self.split = split
         
-        if dataset_type == 'floodnet':
-            self.root_dir = os.path.join(root_dir, split)
-            self.images_dir = os.path.join(self.root_dir, 'image')
-            self.labels_dir = os.path.join(self.root_dir, 'mask')
-        else:
-            self.root_dir = os.path.join(root_dir, split)
-            self.images_dir = os.path.join(self.root_dir, 'images')
-            self.labels_dir = os.path.join(self.root_dir, 'labels')
+        # ✅ SỬA: Cả hai dataset đều dùng folder images và labels
+        self.root_dir = os.path.join(root_dir, split)
+        self.images_dir = os.path.join(self.root_dir, 'images')
+        self.labels_dir = os.path.join(self.root_dir, 'labels')
         
         self.images = sorted([
             img for img in os.listdir(self.images_dir)
@@ -68,9 +64,15 @@ class FloodSegmentationDataset(Dataset):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
         if self.dataset_type == 'floodnet':
+            # ✅ SỬA: FloodNet cũng dùng folder labels và file mask là ảnh .jpg
             mask_path = os.path.join(self.labels_dir, img_name)
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            
+            # ✅ THÊM: Kiểm tra nếu mask bị lỗi hoặc None
+            if mask is None:
+                raise ValueError(f"Không đọc được mask: {mask_path}. Kiểm tra file có tồn tại không!")
         else:
+            # FloodVN dùng file JSON
             base_name = os.path.splitext(img_name)[0]
             label_path = os.path.join(self.labels_dir, base_name + '.json')
             
@@ -86,6 +88,10 @@ class FloodSegmentationDataset(Dataset):
         
         transformed = self.transform(image=image, mask=mask)
         image = transformed['image'].float() / 255.0
+        
+        # ✅ THÊM: Kiểm tra mask sau transform
+        if transformed['mask'] is None:
+            raise ValueError(f"Mask bị None sau khi transform tại index {idx}")
         
         if self.num_classes == 1:
             mask = transformed['mask'].unsqueeze(0).float()

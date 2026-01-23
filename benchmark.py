@@ -11,37 +11,27 @@ import json
 import warnings
 
 def set_seed(seed):
-    """Set ALL random seeds with maximum strictness"""
-    # Python & System
     os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     
-    # NumPy
     np.random.seed(seed)
     
-    # PyTorch CPU
     torch.manual_seed(seed)
     
-    # PyTorch CUDA
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         
-        # CRITICAL: Disable all non-deterministic CUDA operations
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         
-        # CRITICAL: Disable TF32 on Ampere GPUs (RTX 3000/4000, A100, Colab T4)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         
-        # CRITICAL: Set CUDA workspace config for deterministic algorithms
         os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
     
-    # CRITICAL: Force ALL PyTorch operations to be deterministic
     torch.use_deterministic_algorithms(True, warn_only=False)
     
-    # Suppress warnings
     warnings.filterwarnings('ignore', category=UserWarning)
     
     print(f"✓ Seed set to {seed} (STRICT MODE)")
@@ -51,16 +41,14 @@ DATASETS = {
     'floodvn': {'id': '1tQYUVtSdYJ3cGn1oftmb9MeWrmu4ez7P', 'dir': 'floodvn'},
     'floodkaggle': {'id': '1tg3N5DW27LWgJ9cTvNeIUz5xoBqSrmEs', 'dir': 'floodkaggle'},
     'floodnet': {
-        'path': '/content/drive/MyDrive/FloodNet',  # Đọc trực tiếp từ Drive
+        'path': '/content/drive/MyDrive/FloodNet',
         'dir': '/content/drive/MyDrive/FloodNet'
     }
 }
 
 def download_dataset(name):
-    """Download and extract dataset"""
     
     if name == 'floodnet':
-        # FloodNet: đọc trực tiếp từ Google Drive
         floodnet_path = DATASETS['floodnet']['path']
         
         if not os.path.exists(floodnet_path):
@@ -73,7 +61,6 @@ def download_dataset(name):
                 f"    └── test/"
             )
         
-        # Verify structure
         for split in ['train', 'val', 'test']:
             split_path = os.path.join(floodnet_path, split)
             if not os.path.exists(split_path):
@@ -87,7 +74,6 @@ def download_dataset(name):
         print(f"  - test:  {len(os.listdir(os.path.join(floodnet_path, 'test', 'image')))} images")
         
     else:
-        # FloodVN / FloodKaggle: download from Google Drive
         folder = name
         if os.path.exists(folder):
             print(f"{name.capitalize()} exists. Skipping.")
@@ -119,7 +105,6 @@ def verify_reproducibility(args, num_runs=2):
         
         from utils.trainer import train_segmentation
         
-        # Get dataset path
         dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
         
         result = train_segmentation(
@@ -177,7 +162,6 @@ def run_multiseed_experiments(args, seeds):
         set_seed(seed)
         from utils.trainer import train_segmentation
         
-        # Get dataset path
         dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
         
         result = train_segmentation(
@@ -197,19 +181,46 @@ def run_multiseed_experiments(args, seeds):
             'seed': seed,
             'test_loss': result['test_loss'],
             'miou': result['miou'],
-            'best_val_loss': result['best_val_loss']
+            'dice': result['dice'],
+            'pixel_accuracy': result['pixel_accuracy'],
+            'best_val_loss': result['best_val_loss'],
+            'total_params': result['complexity']['total_params'],
+            'model_size_mb': result['complexity']['model_size_mb'],
+            'memory_mb': result['complexity']['memory_mb'],
+            'gflops': result['complexity']['gflops'],
+            'fps': result['inference_stats']['fps'],
+            'latency_ms': result['inference_stats']['latency_ms'],
+            'avg_inference_ms': result['inference_stats']['avg_time_s'] * 1000
         })
     
     losses = [r['test_loss'] for r in results]
     mious = [r['miou'] for r in results]
+    dices = [r['dice'] for r in results]
+    pixel_accs = [r['pixel_accuracy'] for r in results]
     val_losses = [r['best_val_loss'] for r in results]
+    fps_list = [r['fps'] for r in results]
+    latencies = [r['latency_ms'] for r in results]
     
     print(f"\n{'='*70}")
     print("STATISTICS FOR PAPER")
     print(f"{'='*70}")
-    print(f"Test Loss: {np.mean(losses):.4f} ± {np.std(losses):.4f}")
-    print(f"mIOU:      {np.mean(mious):.4f} ± {np.std(mious):.4f}")
-    print(f"Val Loss:  {np.mean(val_losses):.4f} ± {np.std(val_losses):.4f}")
+    print(f"\nACCURACY METRICS:")
+    print(f"  Test Loss:       {np.mean(losses):.4f} ± {np.std(losses):.4f}")
+    print(f"  mIOU:            {np.mean(mious):.4f} ± {np.std(mious):.4f}")
+    print(f"  Dice Score:      {np.mean(dices):.4f} ± {np.std(dices):.4f}")
+    print(f"  Pixel Accuracy:  {np.mean(pixel_accs):.4f} ± {np.std(pixel_accs):.4f}")
+    print(f"  Val Loss:        {np.mean(val_losses):.4f} ± {np.std(val_losses):.4f}")
+    
+    print(f"\nMODEL COMPLEXITY:")
+    print(f"  Parameters:      {results[0]['total_params']:,}")
+    print(f"  Model Size:      {results[0]['model_size_mb']:.2f} MB")
+    print(f"  Memory Usage:    {results[0]['memory_mb']:.2f} MB")
+    print(f"  GFLOPs:          {results[0]['gflops']:.4f}")
+    
+    print(f"\nINFERENCE PERFORMANCE:")
+    print(f"  FPS:             {np.mean(fps_list):.2f} ± {np.std(fps_list):.2f}")
+    print(f"  Latency:         {np.mean(latencies):.4f} ± {np.std(latencies):.4f} ms")
+    print(f"  Avg Inference:   {np.mean([r['avg_inference_ms'] for r in results]):.4f} ms")
     print(f"{'='*70}\n")
     
     result_file = os.path.join(args.output_path, f'{args.model}_{args.dataset}_multiseed.json')
@@ -229,14 +240,27 @@ def run_multiseed_experiments(args, seeds):
             'statistics': {
                 'test_loss': {'mean': float(np.mean(losses)), 'std': float(np.std(losses))},
                 'miou': {'mean': float(np.mean(mious)), 'std': float(np.std(mious))},
-                'val_loss': {'mean': float(np.mean(val_losses)), 'std': float(np.std(val_losses))}
+                'dice': {'mean': float(np.mean(dices)), 'std': float(np.std(dices))},
+                'pixel_accuracy': {'mean': float(np.mean(pixel_accs)), 'std': float(np.std(pixel_accs))},
+                'val_loss': {'mean': float(np.mean(val_losses)), 'std': float(np.std(val_losses))},
+                'fps': {'mean': float(np.mean(fps_list)), 'std': float(np.std(fps_list))},
+                'latency_ms': {'mean': float(np.mean(latencies)), 'std': float(np.std(latencies))}
+            },
+            'complexity': {
+                'total_params': results[0]['total_params'],
+                'model_size_mb': results[0]['model_size_mb'],
+                'memory_mb': results[0]['memory_mb'],
+                'gflops': results[0]['gflops']
             }
         }, f, indent=2)
     
     print(f"📊 Results saved to: {result_file}")
     print(f"\nLaTeX format:")
     print(f"Test Loss: ${np.mean(losses):.4f} \\pm {np.std(losses):.4f}$")
-    print(f"mIOU: ${np.mean(mious):.4f} \\pm {np.std(mious):.4f}$\n")
+    print(f"mIOU: ${np.mean(mious):.4f} \\pm {np.std(mious):.4f}$")
+    print(f"Dice: ${np.mean(dices):.4f} \\pm {np.std(dices):.4f}$")
+    print(f"FPS: ${np.mean(fps_list):.2f} \\pm {np.std(fps_list):.2f}$")
+    print(f"Latency: ${np.mean(latencies):.4f} \\pm {np.std(latencies):.4f}$ ms\n")
     
     return results
 
@@ -266,16 +290,13 @@ def main():
     if args.download:
         download_dataset(args.dataset)
     
-    # Determine number of classes based on dataset
     num_classes = 10 if args.dataset == 'floodnet' else 1
     
     if args.size is None:
         args.size = 256
     
-    # Get dataset path
     dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
     
-    # Check for special modes
     if args.verify_repro:
         verify_reproducibility(args, num_runs=2)
         return
@@ -284,7 +305,6 @@ def main():
         run_multiseed_experiments(args, seeds=args.seeds)
         return
     
-    # Normal training
     print("="*70)
     print("TRAINING CONFIGURATION")
     print("="*70)
