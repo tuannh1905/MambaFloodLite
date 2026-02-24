@@ -3,18 +3,34 @@ import torch.nn as nn
 
 
 # ---------------------------------------------------------------
+# Helper: bypass deterministic constraint cho MaxUnpool2d
+# ---------------------------------------------------------------
+
+def _max_unpool(unpool_layer, x, indices, output_size):
+    """
+    Wrapper quanh nn.MaxUnpool2d để bypass deterministic constraint.
+    max_unpool chưa được PyTorch đăng ký là deterministic dù thực tế
+    kết quả hoàn toàn deterministic (chỉ đặt giá trị vào đúng vị trí indices).
+    """
+    prev = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(False)
+    out = unpool_layer(x, indices, output_size=output_size)
+    torch.use_deterministic_algorithms(prev)
+    return out
+
+
+# ---------------------------------------------------------------
 # Initial Block
 # ---------------------------------------------------------------
 
 class InitialBlock(nn.Module):
     """
     Paper: conv branch (13 ch) + maxpool branch (3 ch) → concat → 16 ch
-    Fix: thêm BN + PReLU sau concat (thiếu trong code cũ)
+    Fix: thêm BN + PReLU sau concat
     """
     def __init__(self, in_channels=3, out_channels=16):
         super(InitialBlock, self).__init__()
 
-        # Main branch: stride=2 conv → 13 channels
         self.main_branch = nn.Conv2d(
             in_channels,
             out_channels - in_channels,
@@ -23,11 +39,7 @@ class InitialBlock(nn.Module):
             padding=1,
             bias=False
         )
-
-        # Extension branch: maxpool → 3 channels (giữ nguyên in_channels)
         self.ext_branch = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-
-        # BN + PReLU sau concat (đúng paper)
         self.batch_norm = nn.BatchNorm2d(out_channels)
         self.out_activation = nn.PReLU()
 
@@ -54,10 +66,8 @@ class DownsamplingBottleneck(nn.Module):
 
         internal_channels = out_channels // 4
 
-        # Main branch: maxpool lưu indices
         self.main_maxpool = nn.MaxPool2d(kernel_size=2, stride=2, return_indices=True)
 
-        # Extension branch
         self.ext_conv1 = nn.Sequential(
             nn.Conv2d(in_channels, internal_channels, kernel_size=2, stride=2, bias=False),
             nn.BatchNorm2d(internal_channels),
@@ -76,7 +86,6 @@ class DownsamplingBottleneck(nn.Module):
         self.ext_regul = nn.Dropout2d(p=dropout_prob)
         self.out_activation = nn.PReLU()
 
-        self.in_channels = in_channels
         self.out_channels = out_channels
 
     def forward(self, x):
@@ -111,14 +120,12 @@ class RegularBottleneck(nn.Module):
 
         internal_channels = channels // 4
 
-        # 1x1 projection
         self.ext_conv1 = nn.Sequential(
             nn.Conv2d(channels, internal_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(internal_channels),
             nn.PReLU()
         )
 
-        # Middle conv: normal / dilated / asymmetric
         if asymmetric:
             self.ext_conv2 = nn.Sequential(
                 nn.Conv2d(internal_channels, internal_channels,
@@ -139,7 +146,6 @@ class RegularBottleneck(nn.Module):
                 nn.PReLU()
             )
 
-        # 1x1 expansion
         self.ext_conv3 = nn.Sequential(
             nn.Conv2d(internal_channels, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
@@ -203,7 +209,7 @@ class UpsamplingBottleneck(nn.Module):
     def forward(self, x, max_indices, output_size):
         # Main branch: unpool dùng indices từ encoder
         main = self.main_conv(x)
-        main = self.main_unpool(main, max_indices, output_size=output_size)
+        main = _max_unpool(self.main_unpool, main, max_indices, output_size)
 
         # Extension branch
         ext = self.ext_conv1(x)
@@ -217,7 +223,7 @@ class UpsamplingBottleneck(nn.Module):
 
 
 class RegularBottleneckDecoder(nn.Module):
-    """Regular bottleneck dùng trong decoder (giống encoder nhưng không dilated/asymmetric)"""
+    """Regular bottleneck dùng trong decoder"""
     def __init__(self, channels, dropout_prob=0.1):
         super(RegularBottleneckDecoder, self).__init__()
 
