@@ -47,12 +47,15 @@ class DecoderBlock(nn.Module):
 
 def _max_unpool(x, indices, kernel_size=2, stride=2):
     """
-    Wrapper quanh F.max_unpool2d để tắt deterministic tạm thời.
-    max_unpool2d không có deterministic implementation trong PyTorch,
-    nhưng kết quả vẫn reproducible vì indices được lưu từ max_pool2d.
+    Wrapper quanh F.max_unpool2d để bypass deterministic constraint.
+    max_unpool2d chưa được PyTorch đăng ký là deterministic dù thực tế
+    kết quả hoàn toàn deterministic (chỉ đặt giá trị vào đúng vị trí indices).
     """
-    with torch.utils.deterministic_guard(False):
-        return F.max_unpool2d(x, indices, kernel_size=kernel_size, stride=stride)
+    prev = torch.are_deterministic_algorithms_enabled()
+    torch.use_deterministic_algorithms(False)
+    out = F.max_unpool2d(x, indices, kernel_size=kernel_size, stride=stride)
+    torch.use_deterministic_algorithms(prev)
+    return out
 
 
 class SegNetModel(nn.Module):
@@ -101,7 +104,7 @@ class SegNetModel(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
         )
 
-        # Final output layer (no BN, no ReLU) — kernel_size=1 đúng paper
+        # Final output layer — kernel_size=1 đúng paper
         self.decoder1_conv2 = nn.Conv2d(64, num_classes, kernel_size=1)
 
     def forward(self, x):
@@ -121,7 +124,7 @@ class SegNetModel(nn.Module):
         x5 = self.encoder5(x4_pooled)
         x5_pooled, indices5 = F.max_pool2d(x5, kernel_size=2, stride=2, return_indices=True)
 
-        # Decoder — max_unpool wrapped để bypass deterministic constraint
+        # Decoder
         d5 = _max_unpool(x5_pooled, indices5)
         d5 = self.decoder5(d5)
 
