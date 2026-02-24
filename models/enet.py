@@ -1,272 +1,382 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
+
+# ---------------------------------------------------------------
+# Initial Block
+# ---------------------------------------------------------------
 
 class InitialBlock(nn.Module):
-    def __init__(self):
+    """
+    Paper: conv branch (13 ch) + maxpool branch (3 ch) → concat → 16 ch
+    Fix: thêm BN + PReLU sau concat (thiếu trong code cũ)
+    """
+    def __init__(self, in_channels=3, out_channels=16):
         super(InitialBlock, self).__init__()
-        self.conv = nn.Conv2d(3, 13, kernel_size=3, stride=2, padding=1, bias=True)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        
+
+        # Main branch: stride=2 conv → 13 channels
+        self.main_branch = nn.Conv2d(
+            in_channels,
+            out_channels - in_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False
+        )
+
+        # Extension branch: maxpool → 3 channels (giữ nguyên in_channels)
+        self.ext_branch = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        # BN + PReLU sau concat (đúng paper)
+        self.batch_norm = nn.BatchNorm2d(out_channels)
+        self.out_activation = nn.PReLU()
+
     def forward(self, x):
-        conv_out = self.conv(x)
-        pool_out = self.pool(x)
-        return torch.cat([conv_out, pool_out], dim=1)
+        main = self.main_branch(x)
+        ext = self.ext_branch(x)
+        out = torch.cat([main, ext], dim=1)
+        out = self.batch_norm(out)
+        return self.out_activation(out)
 
 
-class BottleneckEncoder(nn.Module):
-    def __init__(self, in_channels, out_channels, downsampling=False, dilated=False, 
-                 asymmetric=False, normal=False, drate=0.1):
-        super(BottleneckEncoder, self).__init__()
-        
-        self.downsampling = downsampling
+# ---------------------------------------------------------------
+# Encoder Bottlenecks
+# ---------------------------------------------------------------
+
+class DownsamplingBottleneck(nn.Module):
+    """
+    Downsampling bottleneck: lưu max_indices để dùng cho decoder (đúng paper)
+    Main branch: maxpool + zero-padding để match channels
+    Extension branch: 2x2 conv stride=2 → 3x3 conv → 1x1 conv
+    """
+    def __init__(self, in_channels, out_channels, dropout_prob=0.01):
+        super(DownsamplingBottleneck, self).__init__()
+
         internal_channels = out_channels // 4
-        
-        # Main branch
-        if downsampling:
-            self.conv1 = nn.Conv2d(in_channels, internal_channels, kernel_size=2, 
-                                   stride=2, padding=0, bias=False)
-        else:
-            self.conv1 = nn.Conv2d(in_channels, internal_channels, kernel_size=1, 
-                                   stride=1, padding=0, bias=False)
-        
-        self.bn1 = nn.BatchNorm2d(internal_channels, momentum=0.1)
-        self.prelu1 = nn.PReLU(internal_channels)
-        
-        # Middle convolution
-        if normal:
-            self.conv2 = nn.Conv2d(internal_channels, internal_channels, kernel_size=3, 
-                                   stride=1, padding=1, bias=True)
-        elif asymmetric:
-            self.conv2a = nn.Conv2d(internal_channels, internal_channels, kernel_size=(5, 1), 
-                                    stride=1, padding=(2, 0), bias=False)
-            self.conv2b = nn.Conv2d(internal_channels, internal_channels, kernel_size=(1, 5), 
-                                    stride=1, padding=(0, 2), bias=True)
-        elif dilated:
-            self.conv2 = nn.Conv2d(internal_channels, internal_channels, kernel_size=3, 
-                                   stride=1, padding=dilated, dilation=dilated, bias=True)
-        
-        self.bn2 = nn.BatchNorm2d(internal_channels, momentum=0.1)
-        self.prelu2 = nn.PReLU(internal_channels)
-        
-        self.conv3 = nn.Conv2d(internal_channels, out_channels, kernel_size=1, 
-                               stride=1, padding=0, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channels, momentum=0.1)
-        self.dropout = nn.Dropout2d(p=drate)
-        
-        self.prelu_out = nn.PReLU(out_channels)
-        
-        # Skip connection
-        if downsampling:
-            self.pool_skip = nn.MaxPool2d(kernel_size=2, stride=2)
-            self.pad_channels = out_channels - in_channels
-        
-        self.asymmetric = asymmetric
-        self.normal = normal
-        self.dilated = dilated
-        
+
+        # Main branch: maxpool lưu indices
+        self.main_maxpool = nn.MaxPool2d(kernel_size=2, stride=2, return_indices=True)
+
+        # Extension branch
+        self.ext_conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, internal_channels, kernel_size=2, stride=2, bias=False),
+            nn.BatchNorm2d(internal_channels),
+            nn.PReLU()
+        )
+        self.ext_conv2 = nn.Sequential(
+            nn.Conv2d(internal_channels, internal_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(internal_channels),
+            nn.PReLU()
+        )
+        self.ext_conv3 = nn.Sequential(
+            nn.Conv2d(internal_channels, out_channels, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.PReLU()
+        )
+        self.ext_regul = nn.Dropout2d(p=dropout_prob)
+        self.out_activation = nn.PReLU()
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
     def forward(self, x):
-        # Skip connection
-        if self.downsampling:
-            skip = self.pool_skip(x)
-            if self.pad_channels > 0:
-                # Pad channels: (batch, channels, height, width)
-                # Create zero tensor with extra channels
-                batch, channels, height, width = skip.shape
-                padding = torch.zeros(batch, self.pad_channels, height, width, 
-                                     device=skip.device, dtype=skip.dtype)
-                skip = torch.cat([skip, padding], dim=1)
-        else:
-            skip = x
-        
         # Main branch
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.prelu1(out)
-        
-        if self.asymmetric:
-            out = self.conv2a(out)
-            out = self.conv2b(out)
-        else:
-            out = self.conv2(out)
-        
-        out = self.bn2(out)
-        out = self.prelu2(out)
-        
-        out = self.conv3(out)
-        out = self.bn3(out)
-        out = self.dropout(out)
-        
-        out = out + skip
-        out = self.prelu_out(out)
-        
-        return out
+        main, max_indices = self.main_maxpool(x)
+
+        # Zero-pad channels để match out_channels
+        n, ch, h, w = main.size()
+        pad_ch = self.out_channels - ch
+        if pad_ch > 0:
+            padding = torch.zeros(n, pad_ch, h, w, device=x.device, dtype=x.dtype)
+            main = torch.cat([main, padding], dim=1)
+
+        # Extension branch
+        ext = self.ext_conv1(x)
+        ext = self.ext_conv2(ext)
+        ext = self.ext_conv3(ext)
+        ext = self.ext_regul(ext)
+
+        out = main + ext
+        return self.out_activation(out), max_indices
 
 
-class BottleneckDecoder(nn.Module):
-    def __init__(self, in_channels, out_channels, upsampling=False, normal=False):
-        super(BottleneckDecoder, self).__init__()
-        
-        self.upsampling = upsampling
-        internal_channels = out_channels // 4
-        
-        # Skip connection
-        if upsampling:
-            self.conv_skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, 
-                                       stride=1, padding=0, bias=False)
-            self.upsample_skip = nn.Upsample(scale_factor=2, mode='nearest')
-        
-        # Main branch
-        self.conv1 = nn.Conv2d(in_channels, internal_channels, kernel_size=1, 
-                               stride=1, padding=0, bias=False)
-        self.bn1 = nn.BatchNorm2d(internal_channels, momentum=0.1)
-        self.prelu1 = nn.PReLU(internal_channels)
-        
-        if upsampling:
-            self.conv2 = nn.ConvTranspose2d(internal_channels, internal_channels, 
-                                            kernel_size=3, stride=2, padding=1, 
-                                            output_padding=1, bias=True)
-        elif normal:
-            self.conv2 = nn.Conv2d(internal_channels, internal_channels, kernel_size=3, 
-                                   stride=1, padding=1, bias=True)
-        
-        self.bn2 = nn.BatchNorm2d(internal_channels, momentum=0.1)
-        self.prelu2 = nn.PReLU(internal_channels)
-        
-        self.conv3 = nn.Conv2d(internal_channels, out_channels, kernel_size=1, 
-                               stride=1, padding=0, bias=False)
-        self.bn3 = nn.BatchNorm2d(out_channels, momentum=0.1)
-        
-        self.relu_out = nn.ReLU()
-        
-        self.normal = normal
-        
+class RegularBottleneck(nn.Module):
+    """
+    Regular bottleneck: shortcut + extension (1x1 → conv → 1x1)
+    Hỗ trợ: normal, dilated, asymmetric
+    """
+    def __init__(self, channels, kernel_size=3, padding=1,
+                 dilation=1, asymmetric=False, dropout_prob=0.1):
+        super(RegularBottleneck, self).__init__()
+
+        internal_channels = channels // 4
+
+        # 1x1 projection
+        self.ext_conv1 = nn.Sequential(
+            nn.Conv2d(channels, internal_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(internal_channels),
+            nn.PReLU()
+        )
+
+        # Middle conv: normal / dilated / asymmetric
+        if asymmetric:
+            self.ext_conv2 = nn.Sequential(
+                nn.Conv2d(internal_channels, internal_channels,
+                          kernel_size=(kernel_size, 1), padding=(padding, 0), bias=False),
+                nn.BatchNorm2d(internal_channels),
+                nn.PReLU(),
+                nn.Conv2d(internal_channels, internal_channels,
+                          kernel_size=(1, kernel_size), padding=(0, padding), bias=False),
+                nn.BatchNorm2d(internal_channels),
+                nn.PReLU()
+            )
+        else:
+            self.ext_conv2 = nn.Sequential(
+                nn.Conv2d(internal_channels, internal_channels,
+                          kernel_size=kernel_size, padding=padding,
+                          dilation=dilation, bias=False),
+                nn.BatchNorm2d(internal_channels),
+                nn.PReLU()
+            )
+
+        # 1x1 expansion
+        self.ext_conv3 = nn.Sequential(
+            nn.Conv2d(internal_channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.PReLU()
+        )
+
+        self.ext_regul = nn.Dropout2d(p=dropout_prob)
+        self.out_activation = nn.PReLU()
+
     def forward(self, x):
-        # Skip connection
-        if self.upsampling:
-            skip = self.conv_skip(x)
-            skip = self.upsample_skip(skip)
-        else:
-            skip = x
-        
+        main = x
+        ext = self.ext_conv1(x)
+        ext = self.ext_conv2(ext)
+        ext = self.ext_conv3(ext)
+        ext = self.ext_regul(ext)
+        return self.out_activation(main + ext)
+
+
+# ---------------------------------------------------------------
+# Decoder Bottlenecks
+# ---------------------------------------------------------------
+
+class UpsamplingBottleneck(nn.Module):
+    """
+    Upsampling bottleneck: dùng max_indices từ encoder (đúng paper)
+    Main branch: 1x1 conv → MaxUnpool2d
+    Extension branch: 1x1 conv → ConvTranspose2d → 1x1 conv
+    """
+    def __init__(self, in_channels, out_channels, dropout_prob=0.1):
+        super(UpsamplingBottleneck, self).__init__()
+
+        internal_channels = in_channels // 4
+
         # Main branch
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.prelu1(out)
-        
-        if self.upsampling or self.normal:
-            out = self.conv2(out)
-        
-        out = self.bn2(out)
-        out = self.prelu2(out)
-        
-        out = self.conv3(out)
-        out = self.bn3(out)
-        
-        out = out + skip
-        out = self.relu_out(out)
-        
-        return out
+        self.main_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        self.main_unpool = nn.MaxUnpool2d(kernel_size=2)
+
+        # Extension branch
+        self.ext_conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, internal_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(internal_channels),
+            nn.PReLU()
+        )
+        self.ext_tconv = nn.ConvTranspose2d(
+            internal_channels, internal_channels,
+            kernel_size=2, stride=2, bias=False
+        )
+        self.ext_tconv_bn = nn.BatchNorm2d(internal_channels)
+        self.ext_tconv_act = nn.PReLU()
+
+        self.ext_conv2 = nn.Sequential(
+            nn.Conv2d(internal_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+        self.ext_regul = nn.Dropout2d(p=dropout_prob)
+        self.out_activation = nn.PReLU()
+
+    def forward(self, x, max_indices, output_size):
+        # Main branch: unpool dùng indices từ encoder
+        main = self.main_conv(x)
+        main = self.main_unpool(main, max_indices, output_size=output_size)
+
+        # Extension branch
+        ext = self.ext_conv1(x)
+        ext = self.ext_tconv(ext, output_size=output_size)
+        ext = self.ext_tconv_bn(ext)
+        ext = self.ext_tconv_act(ext)
+        ext = self.ext_conv2(ext)
+        ext = self.ext_regul(ext)
+
+        return self.out_activation(main + ext)
 
 
-class ENET(nn.Module):
-    def __init__(self, num_classes=1):
-        super(ENET, self).__init__()
-        
-        print('. . . . .Building ENet. . . . .')
-        
-        self.initial = InitialBlock()
-        
-        # Stage 1
-        self.bottleneck1_0 = BottleneckEncoder(16, 64, downsampling=True, normal=True, drate=0.01)
-        self.bottleneck1_1 = BottleneckEncoder(64, 64, normal=True, drate=0.01)
-        self.bottleneck1_2 = BottleneckEncoder(64, 64, normal=True, drate=0.01)
-        self.bottleneck1_3 = BottleneckEncoder(64, 64, normal=True, drate=0.01)
-        self.bottleneck1_4 = BottleneckEncoder(64, 64, normal=True, drate=0.01)
-        
-        # Stage 2
-        self.bottleneck2_0 = BottleneckEncoder(64, 128, downsampling=True, normal=True)
-        self.bottleneck2_1 = BottleneckEncoder(128, 128, normal=True)
-        self.bottleneck2_2 = BottleneckEncoder(128, 128, dilated=2)
-        self.bottleneck2_3 = BottleneckEncoder(128, 128, asymmetric=True)
-        self.bottleneck2_4 = BottleneckEncoder(128, 128, dilated=4)
-        self.bottleneck2_5 = BottleneckEncoder(128, 128, normal=True)
-        self.bottleneck2_6 = BottleneckEncoder(128, 128, dilated=8)
-        self.bottleneck2_7 = BottleneckEncoder(128, 128, asymmetric=True)
-        self.bottleneck2_8 = BottleneckEncoder(128, 128, dilated=16)
-        
-        # Stage 3
-        self.bottleneck3_0 = BottleneckEncoder(128, 128, normal=True)
-        self.bottleneck3_1 = BottleneckEncoder(128, 128, dilated=2)
-        self.bottleneck3_2 = BottleneckEncoder(128, 128, asymmetric=True)
-        self.bottleneck3_3 = BottleneckEncoder(128, 128, dilated=4)
-        self.bottleneck3_4 = BottleneckEncoder(128, 128, normal=True)
-        self.bottleneck3_5 = BottleneckEncoder(128, 128, dilated=8)
-        self.bottleneck3_6 = BottleneckEncoder(128, 128, asymmetric=True)
-        self.bottleneck3_7 = BottleneckEncoder(128, 128, dilated=16)
-        
-        # Stage 4
-        self.bottleneck4_0 = BottleneckDecoder(128, 64, upsampling=True)
-        self.bottleneck4_1 = BottleneckDecoder(64, 64, normal=True)
-        self.bottleneck4_2 = BottleneckDecoder(64, 64, normal=True)
-        
-        # Stage 5
-        self.bottleneck5_0 = BottleneckDecoder(64, 16, upsampling=True)
-        self.bottleneck5_1 = BottleneckDecoder(16, 16, normal=True)
-        
-        # Final upsampling
-        self.final_conv = nn.ConvTranspose2d(16, num_classes, kernel_size=2, 
-                                             stride=2, padding=0, bias=True)
-        self.sigmoid = nn.Sigmoid()
-        
-        print('. . . . .Build Completed. . . . .')
-        
+class RegularBottleneckDecoder(nn.Module):
+    """Regular bottleneck dùng trong decoder (giống encoder nhưng không dilated/asymmetric)"""
+    def __init__(self, channels, dropout_prob=0.1):
+        super(RegularBottleneckDecoder, self).__init__()
+
+        internal_channels = channels // 4
+
+        self.ext_conv1 = nn.Sequential(
+            nn.Conv2d(channels, internal_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(internal_channels),
+            nn.PReLU()
+        )
+        self.ext_conv2 = nn.Sequential(
+            nn.Conv2d(internal_channels, internal_channels,
+                      kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(internal_channels),
+            nn.PReLU()
+        )
+        self.ext_conv3 = nn.Sequential(
+            nn.Conv2d(internal_channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.PReLU()
+        )
+        self.ext_regul = nn.Dropout2d(p=dropout_prob)
+        self.out_activation = nn.PReLU()
+
     def forward(self, x):
-        x = self.initial(x)
-        
-        # Stage 1
-        x = self.bottleneck1_0(x)
-        x = self.bottleneck1_1(x)
-        x = self.bottleneck1_2(x)
-        x = self.bottleneck1_3(x)
-        x = self.bottleneck1_4(x)
-        
-        # Stage 2
-        x = self.bottleneck2_0(x)
-        x = self.bottleneck2_1(x)
-        x = self.bottleneck2_2(x)
-        x = self.bottleneck2_3(x)
-        x = self.bottleneck2_4(x)
-        x = self.bottleneck2_5(x)
-        x = self.bottleneck2_6(x)
-        x = self.bottleneck2_7(x)
-        x = self.bottleneck2_8(x)
-        
-        # Stage 3
-        x = self.bottleneck3_0(x)
-        x = self.bottleneck3_1(x)
-        x = self.bottleneck3_2(x)
-        x = self.bottleneck3_3(x)
-        x = self.bottleneck3_4(x)
-        x = self.bottleneck3_5(x)
-        x = self.bottleneck3_6(x)
-        x = self.bottleneck3_7(x)
-        
-        # Stage 4
-        x = self.bottleneck4_0(x)
-        x = self.bottleneck4_1(x)
-        x = self.bottleneck4_2(x)
-        
-        # Stage 5
-        x = self.bottleneck5_0(x)
-        x = self.bottleneck5_1(x)
-        
-        # Final
-        x = self.final_conv(x)
-        x = self.sigmoid(x)
-        
-        return x
+        main = x
+        ext = self.ext_conv1(x)
+        ext = self.ext_conv2(ext)
+        ext = self.ext_conv3(ext)
+        ext = self.ext_regul(ext)
+        return self.out_activation(main + ext)
+
+
+# ---------------------------------------------------------------
+# ENet Model
+# ---------------------------------------------------------------
+
+class ENetModel(nn.Module):
+    def __init__(self, in_channels=3, num_classes=1):
+        """
+        ENet model for segmentation
+
+        Args:
+            in_channels : Number of input channels (default: 3 for RGB)
+            num_classes : Number of output classes
+                          - 1 for binary segmentation (output: 1 channel with sigmoid)
+                          - >=2 for multi-class (output: num_classes channels with softmax)
+
+        Input/Output:
+            Input  : [B, 3, 256, 256]
+            Output : [B, num_classes, 256, 256]  ← raw logits, NO sigmoid/softmax
+        """
+        super(ENetModel, self).__init__()
+
+        self.num_classes = num_classes
+
+        # ── Initial Block ──────────────────────────────────────────
+        # 256×256 → 128×128, 3ch → 16ch
+        self.initial_block = InitialBlock(in_channels, out_channels=16)
+
+        # ── Stage 1 - Encoder ─────────────────────────────────────
+        # 128×128 → 64×64, 16ch → 64ch
+        self.downsample1_0 = DownsamplingBottleneck(16,  64, dropout_prob=0.01)
+        self.regular1_1    = RegularBottleneck(64, padding=1, dropout_prob=0.01)
+        self.regular1_2    = RegularBottleneck(64, padding=1, dropout_prob=0.01)
+        self.regular1_3    = RegularBottleneck(64, padding=1, dropout_prob=0.01)
+        self.regular1_4    = RegularBottleneck(64, padding=1, dropout_prob=0.01)
+
+        # ── Stage 2 - Encoder ─────────────────────────────────────
+        # 64×64 → 32×32, 64ch → 128ch
+        self.downsample2_0  = DownsamplingBottleneck(64, 128, dropout_prob=0.1)
+        self.regular2_1     = RegularBottleneck(128, padding=1,  dropout_prob=0.1)
+        self.dilated2_2     = RegularBottleneck(128, dilation=2,  padding=2,  dropout_prob=0.1)
+        self.asymmetric2_3  = RegularBottleneck(128, kernel_size=5, padding=2, asymmetric=True, dropout_prob=0.1)
+        self.dilated2_4     = RegularBottleneck(128, dilation=4,  padding=4,  dropout_prob=0.1)
+        self.regular2_5     = RegularBottleneck(128, padding=1,  dropout_prob=0.1)
+        self.dilated2_6     = RegularBottleneck(128, dilation=8,  padding=8,  dropout_prob=0.1)
+        self.asymmetric2_7  = RegularBottleneck(128, kernel_size=5, padding=2, asymmetric=True, dropout_prob=0.1)
+        self.dilated2_8     = RegularBottleneck(128, dilation=16, padding=16, dropout_prob=0.1)
+
+        # ── Stage 3 - Encoder ─────────────────────────────────────
+        # 32×32, 128ch (không downsample)
+        self.regular3_0     = RegularBottleneck(128, padding=1,  dropout_prob=0.1)
+        self.dilated3_1     = RegularBottleneck(128, dilation=2,  padding=2,  dropout_prob=0.1)
+        self.asymmetric3_2  = RegularBottleneck(128, kernel_size=5, padding=2, asymmetric=True, dropout_prob=0.1)
+        self.dilated3_3     = RegularBottleneck(128, dilation=4,  padding=4,  dropout_prob=0.1)
+        self.regular3_4     = RegularBottleneck(128, padding=1,  dropout_prob=0.1)
+        self.dilated3_5     = RegularBottleneck(128, dilation=8,  padding=8,  dropout_prob=0.1)
+        self.asymmetric3_6  = RegularBottleneck(128, kernel_size=5, padding=2, asymmetric=True, dropout_prob=0.1)
+        self.dilated3_7     = RegularBottleneck(128, dilation=16, padding=16, dropout_prob=0.1)
+
+        # ── Stage 4 - Decoder ─────────────────────────────────────
+        # 32×32 → 64×64, 128ch → 64ch
+        self.upsample4_0   = UpsamplingBottleneck(128, 64, dropout_prob=0.1)
+        self.regular4_1    = RegularBottleneckDecoder(64, dropout_prob=0.1)
+        self.regular4_2    = RegularBottleneckDecoder(64, dropout_prob=0.1)
+
+        # ── Stage 5 - Decoder ─────────────────────────────────────
+        # 64×64 → 128×128, 64ch → 16ch
+        self.upsample5_0   = UpsamplingBottleneck(64, 16, dropout_prob=0.1)
+        self.regular5_1    = RegularBottleneckDecoder(16, dropout_prob=0.1)
+
+        # ── Final Upsample ─────────────────────────────────────────
+        # 128×128 → 256×256, 16ch → num_classes
+        self.transposed_conv = nn.ConvTranspose2d(
+            16, num_classes,
+            kernel_size=3, stride=2, padding=1,
+            output_padding=1, bias=False
+        )
+
+    def forward(self, x):
+        # Initial block: 256×256 → 128×128
+        input_size = x.size()
+        x = self.initial_block(x)
+
+        # Stage 1 Encoder: 128×128 → 64×64
+        stage1_size = x.size()
+        x, max_idx1 = self.downsample1_0(x)
+        x = self.regular1_1(x)
+        x = self.regular1_2(x)
+        x = self.regular1_3(x)
+        x = self.regular1_4(x)
+
+        # Stage 2 Encoder: 64×64 → 32×32
+        stage2_size = x.size()
+        x, max_idx2 = self.downsample2_0(x)
+        x = self.regular2_1(x)
+        x = self.dilated2_2(x)
+        x = self.asymmetric2_3(x)
+        x = self.dilated2_4(x)
+        x = self.regular2_5(x)
+        x = self.dilated2_6(x)
+        x = self.asymmetric2_7(x)
+        x = self.dilated2_8(x)
+
+        # Stage 3 Encoder: 32×32 (no downsample)
+        x = self.regular3_0(x)
+        x = self.dilated3_1(x)
+        x = self.asymmetric3_2(x)
+        x = self.dilated3_3(x)
+        x = self.regular3_4(x)
+        x = self.dilated3_5(x)
+        x = self.asymmetric3_6(x)
+        x = self.dilated3_7(x)
+
+        # Stage 4 Decoder: 32×32 → 64×64 (dùng max_idx2)
+        x = self.upsample4_0(x, max_idx2, output_size=stage2_size)
+        x = self.regular4_1(x)
+        x = self.regular4_2(x)
+
+        # Stage 5 Decoder: 64×64 → 128×128 (dùng max_idx1)
+        x = self.upsample5_0(x, max_idx1, output_size=stage1_size)
+        x = self.regular5_1(x)
+
+        # Final: 128×128 → 256×256
+        x = self.transposed_conv(x)
+
+        return x  # raw logits, trainer.py sẽ apply sigmoid/softmax
+
 
 def build_model(num_classes=1):
-    return ENET(num_classes=num_classes)
+    return ENetModel(in_channels=3, num_classes=num_classes)
