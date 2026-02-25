@@ -6,8 +6,31 @@ Input/output channels giữ nguyên: 128 → 256
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .propose_model.model.decoder import DecoderBlock
 from .propose_model.model.encoder import TripleBranchEncoderBlock
+
+
+# ── DecoderBlock không có CSAM (y hệt model.py) ───────────────
+class DecoderBlock_NoCSAM(nn.Module):
+    def __init__(self, in_c, skip_c, out_c, reduction=2, kernel_size=3):
+        super().__init__()
+
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+
+        hidden = (in_c + skip_c) // reduction
+
+        self.pw1  = nn.Conv2d(in_c + skip_c, hidden, kernel_size=1, bias=False)
+        self.bn   = nn.BatchNorm2d(hidden)
+        self.relu = nn.ReLU(inplace=True)
+        self.pw2  = nn.Conv2d(hidden, out_c, kernel_size=1, bias=False)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        x = torch.cat([skip, x], dim=1)
+        x = self.pw1(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.pw2(x)
+        return x
 
 
 # ── Bottleneck thay thế bằng Conv3×3 thường ───────────────────
@@ -41,10 +64,10 @@ class MambaUNet_NoEESP(nn.Module):
         # ⚠️ Thay EESPBottleneck bằng Conv thường, giữ 128→256
         self.bottleneck = PlainBottleneck(in_channels=128, out_channels=256)
 
-        self.d4 = DecoderBlock(256, 128, 128)
-        self.d3 = DecoderBlock(128,  64,  64)
-        self.d2 = DecoderBlock( 64,  32,  32)
-        self.d1 = DecoderBlock( 32,  16,  16)
+        self.d4 = DecoderBlock_NoCSAM(256, 128, 128)
+        self.d3 = DecoderBlock_NoCSAM(128,  64,  64)
+        self.d2 = DecoderBlock_NoCSAM( 64,  32,  32)
+        self.d1 = DecoderBlock_NoCSAM( 32,  16,  16)
 
         self.reduce4 = nn.Conv2d(128, num_classes, kernel_size=1)
         self.reduce3 = nn.Conv2d( 64, num_classes, kernel_size=1)
