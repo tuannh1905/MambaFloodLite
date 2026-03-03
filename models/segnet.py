@@ -50,6 +50,7 @@ def _max_unpool(x, indices, kernel_size=2, stride=2):
     Wrapper quanh F.max_unpool2d để bypass deterministic constraint.
     max_unpool2d chưa được PyTorch đăng ký là deterministic dù thực tế
     kết quả hoàn toàn deterministic (chỉ đặt giá trị vào đúng vị trí indices).
+    Note: deterministic mode is temporarily disabled for this operation only.
     """
     prev = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(False)
@@ -61,7 +62,9 @@ def _max_unpool(x, indices, kernel_size=2, stride=2):
 class SegNetModel(nn.Module):
     def __init__(self, in_channels=3, num_classes=1):
         """
-        SegNet architecture following VGG16 encoder
+        SegNet architecture following VGG16 encoder.
+        All blocks are symmetric between encoder and decoder
+        per the original paper (Badrinarayanan et al., 2017).
 
         Args:
             in_channels: Number of input channels (default: 3 for RGB)
@@ -100,11 +103,13 @@ class SegNetModel(nn.Module):
             nn.Conv2d(128,  64, kernel_size=3, padding=1), nn.BatchNorm2d(64),  nn.ReLU(inplace=True),
         )
 
+        # FIX: decoder1 now has 2 convs to match encoder1 (symmetric per paper)
         self.decoder1_conv1 = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
         )
 
-        # Final output layer — kernel_size=1 đúng paper
+        # Final output layer — kernel_size=1 per paper
         self.decoder1_conv2 = nn.Conv2d(64, num_classes, kernel_size=1)
 
     def forward(self, x):
