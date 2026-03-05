@@ -23,6 +23,8 @@ class SAMPoint(nn.Module):
         return grid.long().tolist()
 
     def forward(self, x):
+        x = F.interpolate(x, size=(1024, 1024), mode='bilinear', align_corners=False)
+
         B, C, H, W = x.shape
         device = x.device
 
