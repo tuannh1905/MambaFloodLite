@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from transformers import SamModel, SamProcessor
+import torch.nn.functional as F
 
 
 class SAMPoint(nn.Module):

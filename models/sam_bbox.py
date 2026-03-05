@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import SamModel, SamProcessor
+import torch.nn.functional as F
 
 
 class SAMBbox(nn.Module):
