@@ -62,29 +62,20 @@ class FloodSegmentationDataset(Dataset):
         img_path = os.path.join(self.images_dir, img_name)
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
-        if self.dataset_type == 'floodnet':
-            # ✅ SỬA: FloodNet cũng dùng folder labels và file mask là ảnh .jpg
-            mask_path = os.path.join(self.labels_dir, img_name)
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+           
+         # FloodVN dùng file JSON
+        base_name = os.path.splitext(img_name)[0]
+        label_path = os.path.join(self.labels_dir, base_name + '.json')
             
-            # ✅ THÊM: Kiểm tra nếu mask bị lỗi hoặc None
-            if mask is None:
-                raise ValueError(f"Không đọc được mask: {mask_path}. Kiểm tra file có tồn tại không!")
-        else:
-            # FloodVN dùng file JSON
-            base_name = os.path.splitext(img_name)[0]
-            label_path = os.path.join(self.labels_dir, base_name + '.json')
+        with open(label_path, 'r') as f:
+            label_data = json.load(f)
             
-            with open(label_path, 'r') as f:
-                label_data = json.load(f)
+        mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
             
-            mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-            
-            if 'shapes' in label_data:
-                for shape in label_data['shapes']:
-                    points = np.array(shape['points'], dtype=np.int32)
-                    cv2.fillPoly(mask, [points], 1)
+        if 'shapes' in label_data:
+            for shape in label_data['shapes']:
+                points = np.array(shape['points'], dtype=np.int32)
+                cv2.fillPoly(mask, [points], 1)
         
         transformed = self.transform(image=image, mask=mask)
         image = transformed['image'].float() / 255.0

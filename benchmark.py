@@ -39,58 +39,27 @@ def set_seed(seed):
     
 DATASETS = {
     'floodvn': {'id': '1tQYUVtSdYJ3cGn1oftmb9MeWrmu4ez7P', 'dir': 'floodvn'},
-    'floodkaggle': {'id': '1tg3N5DW27LWgJ9cTvNeIUz5xoBqSrmEs', 'dir': 'floodkaggle'},
-    'floodnet': {
-        'path': '/content/drive/MyDrive/FloodNet',
-        'dir': '/content/drive/MyDrive/FloodNet'
-    }
+    'floodkaggle': {'id': '1tg3N5DW27LWgJ9cTvNeIUz5xoBqSrmEs', 'dir': 'floodkaggle'}
 }
 
 def download_dataset(name):
-    
-    if name == 'floodnet':
-        floodnet_path = DATASETS['floodnet']['path']
+    folder = name
+    if os.path.exists(folder):
+        print(f"{name.capitalize()} exists. Skipping.")
+        return
         
-        if not os.path.exists(floodnet_path):
-            raise FileNotFoundError(
-                f"FloodNet not found at {floodnet_path}\n"
-                f"Please ensure FloodNet folder exists in Google Drive with structure:\n"
-                f"  /content/drive/MyDrive/FloodNet/\n"
-                f"    ├── train/\n"
-                f"    ├── val/\n"
-                f"    └── test/"
-            )
+    cfg = DATASETS[name]
+    url = f'https://drive.google.com/uc?id={cfg["id"]}'
+    output = f'{name}.zip'
         
-        for split in ['train', 'val', 'test']:
-            split_path = os.path.join(floodnet_path, split)
-            if not os.path.exists(split_path):
-                raise FileNotFoundError(
-                    f"Missing {split} folder in {floodnet_path}"
-                )
+    print(f"Downloading {name.capitalize()}...")
+    gdown.download(url, output, quiet=False)
         
-        print(f"✓ FloodNet found at {floodnet_path}")
-        print(f"  - train: {len(os.listdir(os.path.join(floodnet_path, 'train', 'image')))} images")
-        print(f"  - val:   {len(os.listdir(os.path.join(floodnet_path, 'val', 'image')))} images")
-        print(f"  - test:  {len(os.listdir(os.path.join(floodnet_path, 'test', 'image')))} images")
+    with zipfile.ZipFile(output, 'r') as zip_ref:
+        zip_ref.extractall(cfg['dir'])
         
-    else:
-        folder = name
-        if os.path.exists(folder):
-            print(f"{name.capitalize()} exists. Skipping.")
-            return
-        
-        cfg = DATASETS[name]
-        url = f'https://drive.google.com/uc?id={cfg["id"]}'
-        output = f'{name}.zip'
-        
-        print(f"Downloading {name.capitalize()}...")
-        gdown.download(url, output, quiet=False)
-        
-        with zipfile.ZipFile(output, 'r') as zip_ref:
-            zip_ref.extractall(cfg['dir'])
-        
-        os.remove(output)
-        print(f"✓ {name.capitalize()} ready.")
+    os.remove(output)
+    print(f"✓ {name.capitalize()} ready.")
 
 
 def verify_reproducibility(args, num_runs=2):
@@ -105,7 +74,7 @@ def verify_reproducibility(args, num_runs=2):
         
         from utils.trainer import train_segmentation
         
-        dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
+        dataset_path = args.dataset
         
         result = train_segmentation(
             model_name=args.model,
@@ -117,7 +86,7 @@ def verify_reproducibility(args, num_runs=2):
             dataset=dataset_path,
             output_path=os.path.join(args.output_path, f'repro_run{run}'),
             seed=args.seed,
-            num_classes=10 if args.dataset == 'floodnet' else 1,
+            num_classes=1,
             dataset_type=args.dataset
         )
         results.append(result)
@@ -162,7 +131,7 @@ def run_multiseed_experiments(args, seeds):
         set_seed(seed)
         from utils.trainer import train_segmentation
         
-        dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
+        dataset_path = args.dataset
         
         result = train_segmentation(
             model_name=args.model,
@@ -174,7 +143,7 @@ def run_multiseed_experiments(args, seeds):
             dataset=dataset_path,
             output_path=os.path.join(args.output_path, f'seed_{seed}'),
             seed=seed,
-            num_classes=10 if args.dataset == 'floodnet' else 1,
+            num_classes=1,
             dataset_type=args.dataset
         )
         results.append({
@@ -269,7 +238,7 @@ def main():
     parser = argparse.ArgumentParser(description='Flood Detection Training Benchmark')
     
     parser.add_argument('--dataset', type=str, default='floodvn', 
-                        choices=['floodvn', 'floodkaggle', 'floodnet'])
+                        choices=['floodvn', 'floodkaggle'])
     parser.add_argument('--model', type=str, required=True)
     parser.add_argument('--size', type=int, default=None)
     parser.add_argument('--loss', type=str, default='bce')
@@ -290,12 +259,12 @@ def main():
     if args.download:
         download_dataset(args.dataset)
     
-    num_classes = 10 if args.dataset == 'floodnet' else 1
+    num_classes = 1
     
     if args.size is None:
         args.size = 256
     
-    dataset_path = DATASETS[args.dataset]['dir'] if args.dataset == 'floodnet' else args.dataset
+    dataset_path = args.dataset
     
     if args.verify_repro:
         verify_reproducibility(args, num_runs=2)

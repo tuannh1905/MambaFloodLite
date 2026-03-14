@@ -7,7 +7,6 @@ scikit-learn
 tqdm
 gdown
 albumentations
-mamba-ssm
 numpy
 timm
 einops
