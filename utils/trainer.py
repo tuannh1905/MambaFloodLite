@@ -96,6 +96,8 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     print(f"✓ Optimizer: Adam (fused=False for determinism)")
     print(f"✓ Loss: {loss_name}")
     
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
     os.makedirs(output_path, exist_ok=True)
     save_path = os.path.join(output_path, f'{model_name}_{loss_name}_{dataset}_s{seed}.pth')
     
@@ -147,7 +149,7 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
         print(f"Epoch {epoch+1:3d}/{epochs} | "
               f"Train: {avg_train_loss:.6f} | "
               f"Val: {avg_val_loss:.6f}", end='')
-        
+        scheduler.step()
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             
