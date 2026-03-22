@@ -18,20 +18,30 @@ class AxialDW(nn.Module):
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(7, 7)):
         super().__init__()
-        conv_out = out_c - in_c
-        self.dw       = AxialDW(in_c, mixer_kernel=mixer_kernel)
-        self.bn       = nn.BatchNorm2d(in_c)
-        self.pw       = nn.Conv2d(in_c, conv_out, kernel_size=1)
+        self.same_channels = (in_c == out_c)
+        conv_out = out_c - in_c if not self.same_channels else out_c
+
+        self.dw        = AxialDW(in_c, mixer_kernel=mixer_kernel)
+        self.bn        = nn.BatchNorm2d(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
-        self.down_pw   = nn.MaxPool2d((2, 2))
-        self.bn2      = nn.BatchNorm2d(out_c)
-        self.act      = nn.GELU()
+
+        if not self.same_channels:
+            self.pw      = nn.Conv2d(in_c, conv_out, kernel_size=1)
+            self.down_pw = nn.MaxPool2d((2, 2))
+
+        self.bn2 = nn.BatchNorm2d(out_c)
+        self.act = nn.GELU()
 
     def forward(self, x):
         skip = self.bn(self.dw(x))
         pool = self.down_pool(skip)
-        conv = self.down_pw(self.pw(skip))
-        x    = self.act(self.bn2(torch.cat([pool, conv], dim=1)))
+
+        if self.same_channels:
+            x = self.act(self.bn2(pool))
+        else:
+            conv = self.down_pw(self.pw(skip))
+            x    = self.act(self.bn2(torch.cat([pool, conv], dim=1)))
+
         return x, skip
 
 
