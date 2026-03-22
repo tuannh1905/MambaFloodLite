@@ -3,7 +3,6 @@ import torch
 import numpy as np
 import random
 from torch.utils.data import Dataset, DataLoader
-from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
@@ -34,12 +33,12 @@ class FloodSegmentationDataset(Dataset):
                 A.RandomBrightnessContrast(p=0.2),
                 A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.3),
                 ToTensorV2()
-            ])
+            ], is_check_shapes=False)
         else:
             self.transform = A.Compose([
                 A.Resize(size, size),
                 ToTensorV2()
-            ])
+            ], is_check_shapes=False)
 
     def __len__(self):
         return len(self.images)
@@ -64,7 +63,12 @@ class FloodSegmentationDataset(Dataset):
         base_name = os.path.splitext(img_name)[0]
         mask_path = os.path.join(self.masks_dir, base_name + '.png')
         mask_img  = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-        mask      = (mask_img > 127).astype(np.uint8)
+
+        if mask_img.shape[:2] != image.shape[:2]:
+            mask_img = cv2.resize(mask_img, (image.shape[1], image.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST)
+
+        mask = (mask_img > 127).astype(np.uint8)
 
         transformed = self.transform(image=image, mask=mask)
         image = transformed['image'].float() / 255.0
