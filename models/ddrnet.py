@@ -100,17 +100,23 @@ class DDRNet(nn.Module):
         """
         super(DDRNet, self).__init__()
         self.num_classes = num_classes
+        self.planes = planes
 
+        # Stem
         self.stem = nn.Sequential(
             ConvBNReLU(in_channels, planes, stride=2),
             ConvBNReLU(planes, planes, stride=2),
         )
+
+        # Shared layers
         self.layer1 = self._make_layer(planes, planes, 2)
         self.layer2 = self._make_layer(planes, planes * 2, 2, stride=2)
 
-        self.high_branch = self._make_layer(planes * 2, planes * 2, 2)
-        self.low_branch = self._make_layer(planes * 2, planes * 4, 2, stride=2)
+        # Dual branches
+        self.high_branch3 = self._make_layer(planes * 2, planes * 2, 2)
+        self.low_branch3  = self._make_layer(planes * 2, planes * 4, 2, stride=2)
 
+        # Cross-resolution fusion 3
         self.compression3 = nn.Sequential(
             nn.Conv2d(planes * 4, planes * 2, 1, bias=False),
             nn.BatchNorm2d(planes * 2)
@@ -120,9 +126,11 @@ class DDRNet(nn.Module):
             nn.BatchNorm2d(planes * 4)
         )
 
-        self.high_branch2 = self._make_layer(planes * 2, planes * 2, 2)
-        self.low_branch2 = self._make_layer(planes * 4, planes * 8, 2, stride=2)
+        # Dual branches stage 4
+        self.high_branch4 = self._make_layer(planes * 2, planes * 2, 2)
+        self.low_branch4  = self._make_layer(planes * 4, planes * 8, 2, stride=2)
 
+        # Cross-resolution fusion 4
         self.compression4 = nn.Sequential(
             nn.Conv2d(planes * 8, planes * 2, 1, bias=False),
             nn.BatchNorm2d(planes * 2)
@@ -135,13 +143,22 @@ class DDRNet(nn.Module):
             nn.BatchNorm2d(planes * 8)
         )
 
-        self.dappm = DAPPM(planes * 16, planes * 4, planes * 4)
-        self.high_to_low = self._make_layer(planes * 8, planes * 16, 1, stride=2)
+        # Stage 5 low branch + DAPPM
+        self.low_branch5 = self._make_layer(planes * 8, planes * 8, 1, stride=2)
+        self.dappm = DAPPM(planes * 8, planes * 2, planes * 2)
 
-        self.final_layer = nn.Sequential(
-            ConvBNReLU(planes * 4, planes * 4),
-            nn.Conv2d(planes * 4, num_classes, 1)
+        # Align low to high channel
+        self.align = nn.Sequential(
+            nn.Conv2d(planes * 2, planes * 2, 1, bias=False),
+            nn.BatchNorm2d(planes * 2)
         )
+
+        # Final head — input: planes*2 (high) + planes*2 (low aligned) fused via add
+        self.final_layer = nn.Sequential(
+            ConvBNReLU(planes * 2, planes * 2),
+            nn.Conv2d(planes * 2, num_classes, 1)
+        )
+
         self.relu = nn.ReLU(inplace=True)
 
     def _make_layer(self, in_channels, out_channels, num_blocks, stride=1):
@@ -153,28 +170,35 @@ class DDRNet(nn.Module):
     def forward(self, x):
         size = x.size()[2:]
 
+        # Stem + shared
         x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
 
-        x_h = self.high_branch(x)
-        x_l = self.low_branch(x)
+        # Stage 3
+        x_h = self.high_branch3(x)
+        x_l = self.low_branch3(x)
 
-        x_h = self.relu(x_h + F.interpolate(self.compression3(x_l),
-                         x_h.size()[2:], mode='bilinear', align_corners=True))
+        x_h = self.relu(x_h + F.interpolate(
+            self.compression3(x_l), x_h.size()[2:], mode='bilinear', align_corners=True))
         x_l = self.relu(x_l + self.down3(x_h))
 
-        x_h = self.high_branch2(x_h)
-        x_l = self.low_branch2(x_l)
+        # Stage 4
+        x_h = self.high_branch4(x_h)
+        x_l = self.low_branch4(x_l)
 
-        x_h = self.relu(x_h + F.interpolate(self.compression4(x_l),
-                         x_h.size()[2:], mode='bilinear', align_corners=True))
+        x_h = self.relu(x_h + F.interpolate(
+            self.compression4(x_l), x_h.size()[2:], mode='bilinear', align_corners=True))
         x_l = self.relu(x_l + self.down4(x_h))
 
-        x_l = self.high_to_low(x_l)
-        x_l = self.dappm(x_l)
-        x_l = F.interpolate(x_l, x_h.size()[2:], mode='bilinear', align_corners=True)
+        # Stage 5 — low branch only
+        x_l = self.low_branch5(x_l)
+        x_l = self.dappm(x_l)                          # → planes*2 channels
+        x_l = F.interpolate(x_l, x_h.size()[2:],
+                            mode='bilinear', align_corners=True)
+        x_l = self.align(x_l)                          # planes*2 → planes*2
 
+        # Fuse: both branches are planes*2
         x = self.final_layer(x_h + x_l)
         x = F.interpolate(x, size, mode='bilinear', align_corners=True)
         return x
