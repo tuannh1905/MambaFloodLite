@@ -127,7 +127,7 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
                 loss_seg = criterion(seg_out, masks)
                 #2. tạo edge mask động
                 #dùng avg pool để tìm các pixel bị thay đổi quanh mép nước
-                avg_mask = F.avg_pool2d(masks, kernel_size=3, stride=1, padding=1)
+                avg_mask = torch.nn.functional.avg_pool2d(masks, kernel_size=3, stride=1, padding=1)
                 edge_masks = torch.abs(masks - avg_mask) 
                 edge_masks = (edge_masks > 0).float() # Nhị phân hóa thành bản đồ ranh giới
                 #3. loss phụ(detail guidance)
