@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 1. MODULE TINY-UAFM & ECA (SIÊU NHẸ)
+# 1. MODULE TINY-UAFM & ECA (LỌC NHIỄU RANH GIỚI)
 # ==============================================================================
 class ECAModule(nn.Module):
     def __init__(self, channels, k_size=3):
@@ -34,24 +34,23 @@ class TinyUAFM(nn.Module):
         ], dim=1)
         att_v = self.spatial_att(spatial_input)
         
-        # Hòa trộn có trọng số giúp lọc nhiễu địa hình
+        # Hòa trộn có trọng số giúp loại bỏ nhiễu địa hình không phải lũ
         out = x_up * att_v + x_skip * (1 - att_v)
         return self.eca(out)
 
 # ==============================================================================
-# 2. TINY-SPPM (ĐÃ TỐI ƯU 1X1 CONV)
+# 2. MODULE SPPM (BẮT BỐI CẢNH TOÀN CỤC)
 # ==============================================================================
 class SPPM(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        # Giảm hid_channels để tiết kiệm
-        hid_channels = 24 
+        # Kênh ẩn scale tự động theo đầu vào
+        hid_channels = max(in_channels // 4, 16) 
         
         self.pool1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(in_channels, hid_channels, 1, bias=False), nn.BatchNorm2d(hid_channels), nn.GELU())
         self.pool2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(in_channels, hid_channels, 1, bias=False), nn.BatchNorm2d(hid_channels), nn.GELU())
         self.pool3 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(in_channels, hid_channels, 1, bias=False), nn.BatchNorm2d(hid_channels), nn.GELU())
 
-        # CHỐT CHẶN: Dùng Conv 1x1 thay vì 3x3 để giảm tham số cực mạnh
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels + hid_channels * 3, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -66,7 +65,7 @@ class SPPM(nn.Module):
         return self.conv(torch.cat([x, x1, x2, x3], dim=1))
 
 # ==============================================================================
-# 3. CORE MODULES (GIỮ NGUYÊN LOGIC AXIAL DW)
+# 3. CORE MODULES TỪ U-LITE GỐC (AXIAL DW CONV)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -150,26 +149,26 @@ class BottleNeckBlock(nn.Module):
         return self.act(self.pw2(self.bn(x)))
 
 # ==============================================================================
-# 4. NANO-SWIFT (ĐÃ ÉP CÂN CHANNEL)
+# 4. MẠNG CHÍNH (ULITE-SWIFT-BASE)
 # ==============================================================================
-class ULite_Swift_Nano(nn.Module):
+class ULite_Swift_Base(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # CHIẾN LƯỢC FLD: Ép kênh cực hạn
-        self.e1 = EncoderBlock(16, 24)
-        self.e2 = EncoderBlock(24, 40)
-        self.e3 = EncoderBlock(40, 64)
-        self.e4 = EncoderBlock(64, 80)
+        # Cấu hình kênh tiêu chuẩn để đạt điểm ngọt ~300k tham số
+        self.e1 = EncoderBlock(16, 32)
+        self.e2 = EncoderBlock(32, 64)
+        self.e3 = EncoderBlock(64, 128)
+        self.e4 = EncoderBlock(128, 256)
 
-        self.b4 = BottleNeckBlock(80)
-        self.sppm = SPPM(80, 80)
+        self.b4 = BottleNeckBlock(256)
+        self.sppm = SPPM(256, 256)
 
-        self.d4 = DecoderBlock(80, 64)
-        self.d3 = DecoderBlock(64, 40)
-        self.d2 = DecoderBlock(40, 24)
-        self.d1 = DecoderBlock(24, 16)
+        self.d4 = DecoderBlock(256, 128)
+        self.d3 = DecoderBlock(128, 64)
+        self.d2 = DecoderBlock(64, 32)
+        self.d1 = DecoderBlock(32, 16)
 
         # Trả về raw logits, không đi qua sigmoid
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
@@ -184,15 +183,17 @@ class ULite_Swift_Nano(nn.Module):
         return x, skip1, skip2, skip3, skip4
 
     def forward(self, x):
-        # SwiftNet Interleaved Fusion
+        # Scale 0.5x (SwiftNet Interleaved Fusion)
         x_half = F.interpolate(x, scale_factor=0.5, mode='bilinear', align_corners=False)
         out_half, _, _, _, _ = self._shared_encoder_forward(x_half)
 
+        # Scale 1.0x (Ảnh gốc)
         out_full, skip1, skip2, skip3, skip4 = self._shared_encoder_forward(x)
 
         # Hòa trộn Global Context đa quy mô
         fused_context = out_full + F.interpolate(out_half, size=out_full.shape[2:], mode='bilinear', align_corners=False)
 
+        # Decoding
         d = self.d4(fused_context, skip4)
         d = self.d3(d, skip3)
         d = self.d2(d, skip2)
@@ -204,4 +205,4 @@ class ULite_Swift_Nano(nn.Module):
 # 5. HÀM TỰ ĐỘNG BUILD MODEL CHO INIT.PY
 # ==============================================================================
 def build_model(num_classes=1):
-    return ULite_Swift_Nano(num_classes=num_classes)
+    return ULite_Swift_Base(num_classes=num_classes)
