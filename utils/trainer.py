@@ -121,7 +121,22 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             optimizer.zero_grad(set_to_none=False)
             
             outputs = model(images)
-            loss = criterion(outputs, masks)
+            if isinstance(outputs, tuple) and len(outputs) == 2:
+                seg_out, detail_out = outputs
+                #1. loss chính(segmentation)
+                loss_seg = criterion(seg_out, masks)
+                #2. tạo edge mask động
+                #dùng avg pool để tìm các pixel bị thay đổi quanh mép nước
+                avg_mask = F.avg_pool2d(masks, kernel_size=3, stride=1, padding=1)
+                edge_masks = torch.abs(masks - avg_mask) 
+                edge_masks = (edge_masks > 0).float() # Nhị phân hóa thành bản đồ ranh giới
+                #3. loss phụ(detail guidance)
+                loss_detail = criterion(detail_out, edge_masks)
+                #4. tổng hợp loss: Loss_Seg + λ * Loss_Detail (Chọn λ = 0.5)
+                loss = loss_seg + 0.5 * loss_detail
+            else:
+                # Fallback cho các mô hình bình thường hoặc lúc val/test
+                loss = criterion(outputs, masks)
             
             loss.backward()
             optimizer.step()
