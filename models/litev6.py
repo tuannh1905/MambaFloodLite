@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 1. TỌA ĐỘ CHÚ Ý (COORDINATE ATTENTION)
+# 1. COORDINATE ATTENTION
 # ==============================================================================
 class CoordAtt(nn.Module):
     def __init__(self, inp, oup, reduction=32):
@@ -14,7 +14,9 @@ class CoordAtt(nn.Module):
         mip = max(8, inp // reduction)
         self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
         self.bn1 = nn.BatchNorm2d(mip)
-        self.act = nn.ReLU6(inplace=True)
+        
+        # ĐỔI: Sử dụng PReLU cho MCU thay vì Hardswish/ReLU6
+        self.act = nn.PReLU(mip)
         
         self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
         self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
@@ -38,45 +40,7 @@ class CoordAtt(nn.Module):
         return identity * a_w * a_h
 
 # ==============================================================================
-# 2. TINY-UAFM & SPPM
-# ==============================================================================
-class TinyUAFM(nn.Module):
-    def __init__(self, out_c):
-        super().__init__()
-        self.spatial_att = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x_up, x_skip):
-        # Đảm bảo an toàn kích thước trước khi nối đặc trưng
-        if x_up.shape[2:] != x_skip.shape[2:]:
-            x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
-            
-        # Tính toán alpha để lọc ranh giới
-        s_input = torch.cat([torch.mean(x_up, 1, keepdim=True), torch.max(x_skip, 1, keepdim=True)[0]], dim=1)
-        alpha = self.spatial_att(s_input)
-        
-        return x_up * alpha + x_skip * (1 - alpha)
-
-class SPPM(nn.Module):
-    def __init__(self, in_c, out_c):
-        super().__init__()
-        hid = in_c // 4
-        self.p1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(in_c, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.ReLU6(inplace=True))
-        self.p2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(in_c, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.ReLU6(inplace=True))
-        self.p3 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(in_c, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.ReLU6(inplace=True))
-        self.conv = nn.Sequential(nn.Conv2d(in_c + hid * 3, out_c, 1, bias=False), nn.BatchNorm2d(out_c), nn.ReLU6(inplace=True))
-
-    def forward(self, x):
-        size = x.size()[2:]
-        x1 = F.interpolate(self.p1(x), size, mode='bilinear', align_corners=False)
-        x2 = F.interpolate(self.p2(x), size, mode='bilinear', align_corners=False)
-        x3 = F.interpolate(self.p3(x), size, mode='bilinear', align_corners=False)
-        return self.conv(torch.cat([x, x1, x2, x3], dim=1))
-
-# ==============================================================================
-# 3. CORE MODULES (AXIAL DW & BLOCKS)
+# 2. AXIAL-D-ATTENTION BLOCK 
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -84,122 +48,138 @@ class AxialDW(nn.Module):
         h, w = mixer_kernel
         self.dw_h = nn.Conv2d(dim, dim, kernel_size=(h, 1), padding='same', groups=dim, dilation=dilation)
         self.dw_w = nn.Conv2d(dim, dim, kernel_size=(1, w), padding='same', groups=dim, dilation=dilation)
-        
+
     def forward(self, x):
         return x + self.dw_h(x) + self.dw_w(x)
 
-class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(7, 7)):
+class Axial_D_Attn(nn.Module):
+    def __init__(self, dim, mixer_kernel, dilation_rate=2):
         super().__init__()
-        self.same = (in_c == out_c)
-        self.dw = AxialDW(in_c, mixer_kernel)
-        self.bn = nn.BatchNorm2d(in_c)
-        self.pool = nn.MaxPool2d(2)
-        
-        if not self.same:
-            self.pw = nn.Conv2d(in_c, out_c - in_c, 1)
-            self.p_pool = nn.MaxPool2d(2)
-            
+        self.local_dw = AxialDW(dim, mixer_kernel, dilation=1)
+        self.context_dw = AxialDW(dim, mixer_kernel, dilation=dilation_rate)
+        self.coord_att = CoordAtt(dim, dim)
+
+    def forward(self, x):
+        fused = self.local_dw(x) + self.context_dw(x)
+        return self.coord_att(fused)
+
+# ==============================================================================
+# 3. CÁC BLOCKS CỦA ULITE 
+# ==============================================================================
+class EncoderBlock(nn.Module):
+    def __init__(self, in_c, out_c, mixer_kernel=(7, 7), dilation=2):
+        super().__init__()
+        self.same_channels = (in_c == out_c)
+        conv_out = out_c - in_c if not self.same_channels else out_c
+
+        self.dw        = Axial_D_Attn(in_c, mixer_kernel, dilation_rate=dilation)
+        self.bn        = nn.BatchNorm2d(in_c)
+        self.down_pool = nn.MaxPool2d((2, 2))
+
+        if not self.same_channels:
+            self.pw      = nn.Conv2d(in_c, conv_out, kernel_size=1)
+            self.down_pw = nn.MaxPool2d((2, 2))
+
         self.bn2 = nn.BatchNorm2d(out_c)
-        self.act = nn.ReLU6(inplace=True)
         
+        # ĐỔI: GELU -> PReLU
+        self.act = nn.PReLU(out_c)
+
     def forward(self, x):
         skip = self.bn(self.dw(x))
-        p = self.pool(skip)
-        
-        if self.same:
-            x = self.act(self.bn2(p))
-        else:
-            conv = self.p_pool(self.pw(skip))
-            x = self.act(self.bn2(torch.cat([p, conv], dim=1)))
-        return x, skip
+        pool = self.down_pool(skip)
 
-class BottleNeckBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        gc = dim // 4
-        self.pw1 = nn.Conv2d(dim, gc, 1)
-        self.dw1 = AxialDW(gc, (3, 3), 1)
-        self.dw2 = AxialDW(gc, (3, 3), 2)
-        # Dilation 5 để phủ rộng, chống gridding effect
-        self.dw3 = AxialDW(gc, (3, 3), 5) 
-        self.bn = nn.BatchNorm2d(4 * gc)
-        self.pw2 = nn.Conv2d(4 * gc, dim, 1)
-        self.act = nn.ReLU6(inplace=True)
-        
-    def forward(self, x):
-        x = self.pw1(x)
-        x = torch.cat([x, self.dw1(x), self.dw2(x), self.dw3(x)], dim=1)
-        return self.act(self.pw2(self.bn(x)))
+        if self.same_channels:
+            x = self.act(self.bn2(pool))
+        else:
+            conv = self.down_pw(self.pw(skip))
+            x    = self.act(self.bn2(torch.cat([pool, conv], dim=1)))
+
+        return x, skip
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(7, 7)):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.reduce = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else nn.Identity()
-        self.uafm = TinyUAFM(out_c)
+        gc = max(out_c // 4, 4)
+        self.up      = nn.Upsample(scale_factor=2, mode='nearest')
+        self.pw      = nn.Conv2d(in_c + out_c, out_c, kernel_size=1)
+        self.bn      = nn.BatchNorm2d(out_c)
         
-        self.pw_d = nn.Conv2d(out_c, out_c // 4, 1)
-        self.dw = AxialDW(out_c // 4, mixer_kernel)
-        self.pw_u = nn.Conv2d(out_c // 4, out_c, 1)
+        self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1)
+        self.dw      = Axial_D_Attn(gc, mixer_kernel, dilation_rate=2)
+        self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1)
         
-        self.bn = nn.BatchNorm2d(out_c)
-        self.act = nn.ReLU6(inplace=True)
-        
+        # ĐỔI: GELU -> PReLU
+        self.act     = nn.PReLU(out_c)
+
     def forward(self, x, skip):
-        x = self.uafm(self.reduce(self.up(x)), skip)
-        x = self.act(self.bn(self.pw_u(self.dw(self.pw_d(x))) + x))
+        x = self.up(x)
+        x = torch.cat([x, skip], dim=1)
+        x = self.bn(self.pw(x))
+        x = self.act(self.pw_up(self.dw(self.pw_down(x))) + x)
         return x
 
+class BottleNeckBlock(nn.Module):
+    def __init__(self, dim, max_dim=128):
+        super().__init__()
+        gc = min(dim // 4, max_dim // 4)
+        self.pw1 = nn.Conv2d(dim, gc, kernel_size=1)
+        self.dw1 = AxialDW(gc, mixer_kernel=(3, 3), dilation=1)
+        self.dw2 = AxialDW(gc, mixer_kernel=(3, 3), dilation=2)
+        self.dw3 = AxialDW(gc, mixer_kernel=(3, 3), dilation=3)
+        self.bn  = nn.BatchNorm2d(4 * gc)
+        self.pw2 = nn.Conv2d(4 * gc, dim, kernel_size=1)
+        self.coord_att = CoordAtt(dim, dim)
+        
+        # ĐỔI: GELU -> PReLU
+        self.act = nn.PReLU(dim)
+
+    def forward(self, x):
+        x = self.pw1(x)
+        x = torch.cat([x, self.dw1(x), self.dw2(x), self.dw3(x)], dim=1)
+        x = self.act(self.pw2(self.bn(x)))
+        return self.coord_att(x)
+
 # ==============================================================================
-# 4. MẠNG CHÍNH (ULITE PLUS)
+# 4. MẠNG CHÍNH (ULITE D-ATTN PRELU)
 # ==============================================================================
-class ULiteModelPlus(nn.Module):
+class ULiteModel_D_Attn(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
-        self.conv_in = nn.Conv2d(3, 16, 3, padding=1)
-        
-        self.e1 = EncoderBlock(16, 32)
-        self.e2 = EncoderBlock(32, 64)
-        self.e3 = EncoderBlock(64, 128)
-        # Ép nhẹ kênh e4 để dành tham số cho module khác
-        self.e4 = EncoderBlock(128, 160) 
 
-        self.b4 = BottleNeckBlock(160)
-        # Gom ngữ cảnh bối cảnh
-        self.sppm = SPPM(160, 160) 
-        # Định vị tọa độ
-        self.coord = CoordAtt(160, 160)
+        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        self.d4 = DecoderBlock(160, 128)
-        self.d3 = DecoderBlock(128, 64)
-        self.d2 = DecoderBlock(64, 32)
-        self.d1 = DecoderBlock(32, 16)
-        
-        # Raw Logits Output
-        self.head = nn.Conv2d(16, num_classes, 1)
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=(7, 7), dilation=2)
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=(7, 7), dilation=4)
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=(7, 7), dilation=8)
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=(7, 7), dilation=16)
+
+        self.b4 = BottleNeckBlock(256, max_dim=128)
+
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=(7, 7))
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=(7, 7))
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=(7, 7))
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=(7, 7))
+
+        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
-        
-        x, s1 = self.e1(x)
-        x, s2 = self.e2(x)
-        x, s3 = self.e3(x)
-        x, s4 = self.e4(x)
-        
-        x = self.b4(x)
-        x = self.sppm(x)
-        x = self.coord(x)
-        
-        x = self.d4(x, s4)
-        x = self.d3(x, s3)
-        x = self.d2(x, s2)
-        x = self.d1(x, s1)
-        
-        return self.head(x)
 
-# ==============================================================================
-# 5. HÀM TỰ ĐỘNG BUILD MODEL CHO INIT.PY
-# ==============================================================================
+        x, skip1 = self.e1(x)
+        x, skip2 = self.e2(x)
+        x, skip3 = self.e3(x)
+        x, skip4 = self.e4(x)
+
+        x = self.b4(x)
+
+        x = self.d4(x, skip4)
+        x = self.d3(x, skip3)
+        x = self.d2(x, skip2)
+        x = self.d1(x, skip1)
+
+        x = self.conv_out(x)
+        return x
+
 def build_model(num_classes=1):
-    return ULiteModelPlus(num_classes=num_classes)
+    return ULiteModel_D_Attn(num_classes=num_classes)
