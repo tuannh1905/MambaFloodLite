@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --- MODULE ECA (Efficient Channel Attention) ---
+# ==============================================================================
+# 1. MODULE ECA (Efficient Channel Attention)
+# ==============================================================================
 class ECAModule(nn.Module):
     def __init__(self, channels, k_size=3):
         super().__init__()
@@ -12,12 +14,15 @@ class ECAModule(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Quyết định kênh nào quan trọng (giống cơ chế lọc của UAFM)
+        # Quyết định kênh nào quan trọng
         y = self.avg_pool(x)
         y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
         y = self.sigmoid(y)
         return x * y.expand_as(x)
 
+# ==============================================================================
+# 2. CORE MODULES (Axial DW, Encoder, Decoder, Bottleneck)
+# ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
         super().__init__()
@@ -63,13 +68,13 @@ class DecoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(7, 7)):
         super().__init__()
         gc = max(out_c // 4, 4)
-        self.up      = nn.Upsample(scale_factor=2)
+        self.up      = nn.Upsample(scale_factor=2, mode='nearest')
+        
         # Kết hợp skip connection (LRC) từ U-Lite
         self.pw      = nn.Conv2d(in_c + out_c, out_c, kernel_size=1)
         self.bn      = nn.BatchNorm2d(out_c)
         
-        # --- THÊM ECA TẠI ĐÂY ---
-        # Giúp tinh chỉnh đặc trưng sau khi hòa trộn (giống tư duy UAFM trong PP-LiteSeg)
+        # --- ECA Tích hợp tại đây ---
         self.eca     = ECAModule(out_c) 
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1)
@@ -106,11 +111,15 @@ class BottleNeckBlock(nn.Module):
         x = self.act(self.pw2(self.bn(x)))
         return x
 
-class ULiteModel(nn.Module):
+# ==============================================================================
+# 3. RÁP THÀNH MẠNG HOÀN CHỈNH
+# ==============================================================================
+class ULiteECA(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
+        # 4 tầng thay vì 5 tầng
         self.e1 = EncoderBlock(16,  32,  mixer_kernel=(7, 7))
         self.e2 = EncoderBlock(32,  64,  mixer_kernel=(7, 7))
         self.e3 = EncoderBlock(64,  128, mixer_kernel=(7, 7))
@@ -123,6 +132,7 @@ class ULiteModel(nn.Module):
         self.d2 = DecoderBlock(64,  32,  mixer_kernel=(7, 7))
         self.d1 = DecoderBlock(32,  16,  mixer_kernel=(7, 7))
 
+        # Đầu ra Raw Logits
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
@@ -131,10 +141,19 @@ class ULiteModel(nn.Module):
         x, skip2 = self.e2(x)
         x, skip3 = self.e3(x)
         x, skip4 = self.e4(x)
+        
         x = self.b4(x)
+        
         x = self.d4(x, skip4)
         x = self.d3(x, skip3)
         x = self.d2(x, skip2)
         x = self.d1(x, skip1)
+        
         x = self.conv_out(x)
         return x
+
+# ==============================================================================
+# 4. HÀM TỰ ĐỘNG BUILD MODEL CHO INIT.PY
+# ==============================================================================
+def build_model(num_classes=1):
+    return ULiteECA(num_classes=num_classes)
