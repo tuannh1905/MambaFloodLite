@@ -68,7 +68,13 @@ class FloodSegmentationDataset(Dataset):
             mask_img = cv2.resize(mask_img, (image.shape[1], image.shape[0]),
                                   interpolation=cv2.INTER_NEAREST)
 
-        mask = (mask_img > 127).astype(np.uint8)
+        # floodscene: 4 class (0=bg, 85=sky, 170=building, 255=flood)
+        # chỉ lấy flood region (pixel == 255)
+        # floodkaggle: binary mask bị JPEG artifact → threshold > 127
+        if self.dataset_type == 'floodscene':
+            mask = (mask_img == 255).astype(np.uint8)
+        else:
+            mask = (mask_img > 127).astype(np.uint8)
 
         transformed = self.transform(image=image, mask=mask)
         image = transformed['image'].float() / 255.0
