@@ -231,7 +231,7 @@ class RegSegDecoder(nn.Module):
         return self.classifier(out)
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (CONTINUOUS DNAS + 128-128-8)
+# 5. MẠNG CHÍNH (CONTINUOUS DNAS + 128-128-8) - ĐÃ FIX KÍCH THƯỚC SCALE
 # ==============================================================================
 class ULiteModel_Continuous_RegSeg(nn.Module):
     def __init__(self, num_classes=1):
@@ -245,20 +245,22 @@ class ULiteModel_Continuous_RegSeg(nn.Module):
 
         self.b5 = BottleNeckBlock(256, max_dim=128) 
 
-        # ĐÃ SỬA LỖI: Truyền đúng số kênh của skip3 (64) và skip2 (32) vào Decoder
-        self.decoder = RegSegDecoder(c_16=256, c_8=64, c_4=32, num_classes=num_classes)
+        # ĐÃ SỬA: Khai báo đúng số lượng kênh của skip4 (128) và skip3 (64)
+        self.decoder = RegSegDecoder(c_16=256, c_8=128, c_4=64, num_classes=num_classes)
 
     def forward(self, x):
         x = self.conv_in(x)
 
-        x, skip1 = self.e1(x)
-        x, skip2 = self.e2(x) # f_4 (32 channels)
-        x, skip3 = self.e3(x) # f_8 (64 channels)
-        x, skip4 = self.e4(x)
+        x, skip1 = self.e1(x) # Tỉ lệ 1/1
+        x, skip2 = self.e2(x) # Tỉ lệ 1/2
+        x, skip3 = self.e3(x) # Tỉ lệ 1/4 (f_4, 64 channels)
+        x, skip4 = self.e4(x) # Tỉ lệ 1/8 (f_8, 128 channels)
 
-        f_16 = self.b5(x)     # 256 channels
+        f_16 = self.b5(x)     # Tỉ lệ 1/16 (256 channels)
 
-        out = self.decoder(f_16, skip3, skip2)
+        # ĐÃ SỬA: Truyền đúng skip4 (cho f_8) và skip3 (cho f_4) vào Decoder
+        out = self.decoder(f_16, skip4, skip3)
+        
         return out
 
 def build_model(num_classes=1):
