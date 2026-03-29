@@ -184,28 +184,28 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (EXTREME CONTEXT - BỘ 2)
+# 5. MẠNG CHÍNH (PRIME HYBRID - BỘ 3)
 # ==============================================================================
-class ULiteModel_ExtremeContext(nn.Module):
+class ULiteModel_PrimeHybrid(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # BỘ 2: EXTREME CONTEXT (Giãn nở cực hạn ở tầng sâu)
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=[1, 2, 4])
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=[1, 4, 8])
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=[1, 8, 16])
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=[1, 14, 28])
+        # BỘ 3: SỐ NGUYÊN TỐ / FIBONACCI (Chống Gridding Effect)
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=[1, 2, 3])
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=[1, 2, 5])
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=[1, 5, 11])
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=[1, 11, 23])
 
         self.b4 = BottleNeckBlock(256, max_dim=128)
 
-        # DECODER: Thu hẹp lại dần để làm mượt vùng phân đoạn
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=[1, 8, 16])
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=[1, 4, 8])
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=[1, 2, 4])
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=[1, 2, 4])
+        # DECODER: Giảm dần quy mô theo chuẩn số nguyên tố để khôi phục ảnh mịn màng
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=[1, 5, 11])
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=[1, 2, 5])
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=[1, 2, 3])
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=[1, 2, 3])
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -227,4 +227,4 @@ class ULiteModel_ExtremeContext(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_ExtremeContext(num_classes=num_classes)
+    return ULiteModel_PrimeHybrid(num_classes=num_classes)
