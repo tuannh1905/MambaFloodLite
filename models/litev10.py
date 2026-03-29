@@ -63,17 +63,11 @@ class TinyUAFM(nn.Module):
 # 2. CONTINUOUS DNAS (LÕI TỰ HỌC DILATION BẰNG GRID SAMPLE)
 # ==============================================================================
 class ContinuousAxialDW(nn.Module):
-    """
-    DNAS Core: Sử dụng F.grid_sample để học Dilation Rate (r).
-    (Đã fix lỗi Broadcasting Tensor Batch Size)
-    """
     def __init__(self, dim, mixer_kernel, initial_r=1.0):
         super().__init__()
         self.kh, self.kw = mixer_kernel
-        # Tham số r thực sự HỌC ĐƯỢC (Continuous Parameter)
         self.r = nn.Parameter(torch.tensor(float(initial_r)))
         
-        # Trọng số Depthwise
         self.weight_h = nn.Parameter(torch.Tensor(dim, 1, self.kh, 1))
         self.weight_w = nn.Parameter(torch.Tensor(dim, 1, 1, self.kw))
         nn.init.kaiming_normal_(self.weight_h, mode='fan_out', nonlinearity='relu')
@@ -85,7 +79,6 @@ class ContinuousAxialDW(nn.Module):
         k = weight.shape[2] if axis == 'h' else weight.shape[3]
         pad = k // 2
 
-        # Lưới tọa độ chuẩn hóa [-1, 1] cho hàm grid_sample
         gy, gx = torch.meshgrid(torch.linspace(-1, 1, h, device=device),
                                 torch.linspace(-1, 1, w, device=device), indexing='ij')
         base_grid = torch.stack((gx, gy), dim=-1).unsqueeze(0).expand(b, -1, -1, -1)
@@ -93,34 +86,26 @@ class ContinuousAxialDW(nn.Module):
         dy = 2.0 / (h - 1) if h > 1 else 0
         dx = 2.0 / (w - 1) if w > 1 else 0
 
-        # Khởi tạo out an toàn với kích thước của x
         out = torch.zeros_like(x)
-        
         for i, offset in enumerate(range(-pad, pad + 1)):
             if axis == 'h':
-                # FIX LỖI Ở ĐÂY: Ép w_slice về đúng chuẩn [1, Channels, 1, 1] để Broadcast với Batch
                 w_slice = weight[:, 0, i, 0].view(1, c, 1, 1)
                 shift_y, shift_x = offset * r * dy, 0.0
             else:
-                # FIX LỖI Ở ĐÂY: Ép w_slice về đúng chuẩn [1, Channels, 1, 1]
                 w_slice = weight[:, 0, 0, i].view(1, c, 1, 1)
                 shift_y, shift_x = 0.0, offset * r * dx
 
-            # Tịnh tiến tọa độ (Shift)
             grid = base_grid.clone()
             grid[..., 0] = grid[..., 0] + shift_x
             grid[..., 1] = grid[..., 1] + shift_y
             
-            # Lấy mẫu nội suy (Bilinear Interpolation)
             x_sampled = F.grid_sample(x, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-            
-            # Cộng dồn
             out = out + x_sampled * w_slice
             
         return out
 
     def forward(self, x):
-        r_val = torch.clamp(self.r, min=1.0) # Ép dilation >= 1.0
+        r_val = torch.clamp(self.r, min=1.0)
         out_h = self._shift_and_multiply(x, self.weight_h, r_val, 'h')
         out_w = self._shift_and_multiply(x, self.weight_w, r_val, 'w')
         return x + out_h + out_w
@@ -141,7 +126,6 @@ class DetailGuidance(nn.Module):
 class Axial_PFCU_Continuous(nn.Module):
     def __init__(self, dim, mixer_kernel=(5, 5), init_dilations=(4.0, 8.0)):
         super().__init__()
-        # 2 Nhánh DNAS tự động co giãn để đạt FOV > 2000
         self.branch_m = ContinuousAxialDW(dim, mixer_kernel, initial_r=init_dilations[0])
         self.branch_l = ContinuousAxialDW(dim, mixer_kernel, initial_r=init_dilations[1])
         
@@ -214,12 +198,6 @@ class BottleNeckBlock(nn.Module):
         return self.coord_att(out + spp_fused)
 
 class RegSegDecoder(nn.Module):
-    """
-    KIẾN TRÚC DECODER 128-128-8 (Bí mật của RegSeg)
-    - Tầng 1/16: 128 kênh (Từ Bottleneck)
-    - Tầng 1/8:  128 kênh (Từ Encoder 3)
-    - Tầng 1/4:  8 kênh   (Từ Encoder 2 - Chỉ dẫn đường biên)
-    """
     def __init__(self, c_16, c_8, c_4, num_classes):
         super().__init__()
         # Xử lý ngữ nghĩa sâu
@@ -260,29 +238,26 @@ class ULiteModel_Continuous_RegSeg(nn.Module):
         super().__init__()
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # ENCODER: Tham số r khởi tạo sẽ tự động dịch chuyển trong lúc train
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=(5, 5), init_dilations=(2.0, 3.0))   # Size 1/2
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=(5, 5), init_dilations=(3.0, 5.0))   # Size 1/4 (f_4)
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=(7, 7), init_dilations=(4.0, 8.0))   # Size 1/8 (f_8)
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=(7, 7), init_dilations=(10.0, 18.0)) # Size 1/16
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=(5, 5), init_dilations=(2.0, 3.0))   
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=(5, 5), init_dilations=(3.0, 5.0))   
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=(7, 7), init_dilations=(4.0, 8.0))   
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=(7, 7), init_dilations=(10.0, 18.0)) 
 
-        # BOTTLENECK: Đẩy FOV lên > 2000
-        self.b5 = BottleNeckBlock(256, max_dim=128) # Size 1/16 (f_16)
+        self.b5 = BottleNeckBlock(256, max_dim=128) 
 
-        # DECODER REGSEG (Bỏ hẳn e1, chỉ dùng f_16, f_8, f_4)
-        self.decoder = RegSegDecoder(c_16=256, c_8=128, c_4=64, num_classes=num_classes)
+        # ĐÃ SỬA LỖI: Truyền đúng số kênh của skip3 (64) và skip2 (32) vào Decoder
+        self.decoder = RegSegDecoder(c_16=256, c_8=64, c_4=32, num_classes=num_classes)
 
     def forward(self, x):
         x = self.conv_in(x)
 
         x, skip1 = self.e1(x)
-        x, skip2 = self.e2(x) # f_4
-        x, skip3 = self.e3(x) # f_8
+        x, skip2 = self.e2(x) # f_4 (32 channels)
+        x, skip3 = self.e3(x) # f_8 (64 channels)
         x, skip4 = self.e4(x)
 
-        f_16 = self.b5(x)
+        f_16 = self.b5(x)     # 256 channels
 
-        # Truyền đúng 3 cấp độ vào Decoder mới
         out = self.decoder(f_16, skip3, skip2)
         return out
 
