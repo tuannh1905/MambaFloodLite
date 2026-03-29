@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.ops as ops
 
 # ==============================================================================
 # 1. ATTENTION MODULES
@@ -43,109 +42,7 @@ class ECAModule(nn.Module):
         return x * self.sigmoid(y).expand_as(x)
 
 # ==============================================================================
-# 2. DNAS CORE: HỌC DILATION BẰNG DEFORMABLE CONV
-# ==============================================================================
-class DNAS_DeformAxialDW(nn.Module):
-    """
-    Biến Dilation thành tham số có thể đạo hàm (Differentiable Parameter).
-    Sử dụng torchvision.ops.deform_conv2d để học Dilation Rate qua gradient.
-    """
-    def __init__(self, dim, mixer_kernel, initial_dilation=1.0):
-        super().__init__()
-        self.dim = dim
-        self.kh, self.kw = mixer_kernel
-        
-        # THAM SỐ HỌC ĐƯỢC (Biến DNAS cốt lõi)
-        self.r = nn.Parameter(torch.tensor(float(initial_dilation)))
-        
-        # Trọng số Conv
-        self.weight_h = nn.Parameter(torch.Tensor(dim, 1, self.kh, 1))
-        self.weight_w = nn.Parameter(torch.Tensor(dim, 1, 1, self.kw))
-        nn.init.kaiming_normal_(self.weight_h, mode='fan_out', nonlinearity='relu')
-        nn.init.kaiming_normal_(self.weight_w, mode='fan_out', nonlinearity='relu')
-        
-    def forward(self, x):
-        b, c, h, w = x.shape
-        device = x.device
-        
-        # Chặn dưới để không bị lỗi lấy mẫu ngược
-        r_val = torch.clamp(self.r, min=1.0)
-        
-        # --- Nhánh Dọc (Vertical) ---
-        P_h = self.kh // 2
-        offset_h = torch.zeros(1, 2 * self.kh, 1, 1, device=device)
-        for i, k_pos in enumerate(range(-P_h, P_h + 1)):
-            # Tọa độ thực = k_pos * r_val. Tọa độ gốc = k_pos
-            # => Độ dời (offset) = k_pos * (r_val - 1)
-            offset_h[0, 2*i] = k_pos * (r_val - 1)  # offset_y
-            offset_h[0, 2*i + 1] = 0                # offset_x
-        
-        offset_h = offset_h.expand(b, -1, h, w)
-        out_h = ops.deform_conv2d(
-            input=x, offset=offset_h, weight=self.weight_h, 
-            padding=(P_h, 0), stride=(1, 1), groups=self.dim
-        )
-        
-        # --- Nhánh Ngang (Horizontal) ---
-        P_w = self.kw // 2
-        offset_w = torch.zeros(1, 2 * self.kw, 1, 1, device=device)
-        for i, k_pos in enumerate(range(-P_w, P_w + 1)):
-            offset_w[0, 2*i] = 0                    # offset_y
-            offset_w[0, 2*i + 1] = k_pos * (r_val - 1) # offset_x
-            
-        offset_w = offset_w.expand(b, -1, h, w)
-        out_w = ops.deform_conv2d(
-            input=x, offset=offset_w, weight=self.weight_w, 
-            padding=(0, P_w), stride=(1, 1), groups=self.dim
-        )
-        
-        return x + out_h + out_w
-
-class DetailGuidance(nn.Module):
-    """MỎ NEO (ANCHOR): Dùng Conv2d chuẩn r=1 để giữ ranh giới, không học DNAS"""
-    def __init__(self, dim):
-        super().__init__()
-        self.dg_dw_h = nn.Conv2d(dim, dim, kernel_size=(3, 1), padding='same', groups=dim, bias=False)
-        self.dg_dw_w = nn.Conv2d(dim, dim, kernel_size=(1, 3), padding='same', groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim)
-    def forward(self, x):
-        edges = self.dg_dw_h(x) + self.dg_dw_w(x)
-        return self.bn(x + edges)
-
-# ==============================================================================
-# 3. AXIAL-PFCU STRETCHED DNAS (PHONG CÁCH REGSEG)
-# ==============================================================================
-class Axial_PFCU_DNAS(nn.Module):
-    """
-    DG Anchor làm mỏ neo giữ chi tiết r=1.
-    2 Nhánh DNAS tự học Dilation Rate tối ưu qua Gradient Descent.
-    """
-    def __init__(self, dim, mixer_kernel=(5, 5), init_dilations=(4.0, 8.0)):
-        super().__init__()
-        # Nhánh Medium và Large tự học
-        self.branch_m = DNAS_DeformAxialDW(dim, mixer_kernel, initial_dilation=init_dilations[0])
-        self.branch_l = DNAS_DeformAxialDW(dim, mixer_kernel, initial_dilation=init_dilations[1])
-        
-        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
-        
-        # Mỏ neo r=1
-        self.dg_anchor = DetailGuidance(dim)
-        self.coord_att = CoordAtt(dim, dim)
-        self.act = nn.PReLU(dim)
-
-    def forward(self, x):
-        m = self.branch_m(x)
-        l = self.branch_l(x)
-        
-        fused_context = self.bn_fuse(self.pw_fuse(m + l))
-        anchor = self.dg_anchor(x)
-        
-        out = self.act(fused_context + anchor)
-        return self.coord_att(out)
-
-# ==============================================================================
-# 4. ENCODER, BOTTLENECK & DECODER
+# 2. LÕI AXIAL & TINY-UAFM
 # ==============================================================================
 class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
@@ -165,13 +62,85 @@ class TinyUAFM(nn.Module):
         out = x_up * alpha + x_skip * (1 - alpha)
         return self.eca(out)
 
+class AxialDW(nn.Module):
+    def __init__(self, dim, mixer_kernel, dilation=1):
+        super().__init__()
+        h, w = mixer_kernel
+        self.dw_h = nn.Conv2d(dim, dim, kernel_size=(h, 1), padding='same', groups=dim, dilation=dilation, bias=False)
+        self.dw_w = nn.Conv2d(dim, dim, kernel_size=(1, w), padding='same', groups=dim, dilation=dilation, bias=False)
+
+    def forward(self, x):
+        return x + self.dw_h(x) + self.dw_w(x)
+
+class DetailGuidance(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dg_dw_h = nn.Conv2d(dim, dim, kernel_size=(3, 1), padding='same', groups=dim, bias=False)
+        self.dg_dw_w = nn.Conv2d(dim, dim, kernel_size=(1, 3), padding='same', groups=dim, bias=False)
+        self.bn = nn.BatchNorm2d(dim)
+    def forward(self, x):
+        edges = self.dg_dw_h(x) + self.dg_dw_w(x)
+        return self.bn(x + edges)
+
+# ==============================================================================
+# 3. CƠ CHẾ DNAS (TỰ HỌC DILATION RATE) BẰNG SUPERNET
+# ==============================================================================
+class DNAS_Axial_Supernet(nn.Module):
+    """
+    Thuật toán DARTS: Mạng sẽ tự học trọng số alpha cho từng ứng viên dilation.
+    """
+    def __init__(self, dim, mixer_kernel, candidate_dilations):
+        super().__init__()
+        # Tạo danh sách các ứng viên AxialDW với các mức giãn nở khác nhau
+        self.candidates = nn.ModuleList([
+            AxialDW(dim, mixer_kernel, dilation=r) for r in candidate_dilations
+        ])
+        # Tham số học được (Architecture parameters)
+        self.alphas = nn.Parameter(torch.zeros(len(candidate_dilations)))
+
+    def forward(self, x):
+        # Biểu quyết trọng số (tổng các w luôn = 1)
+        weights = F.softmax(self.alphas, dim=0)
+        
+        # Dung hợp kết quả từ các ứng viên dựa trên trọng số tự học
+        out = sum(w * conv(x) for w, conv in zip(weights, self.candidates))
+        return out
+
+class Axial_PFCU_DNAS(nn.Module):
+    def __init__(self, dim, mixer_kernel=(5, 5), candidate_dilations=[4, 6, 8]):
+        super().__init__()
+        # SUPERNET: Thay thế nhánh PFCU cứng nhắc bằng mạng tự học
+        self.dnas_supernet = DNAS_Axial_Supernet(dim, mixer_kernel, candidate_dilations)
+        
+        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn_fuse = nn.BatchNorm2d(dim)
+        
+        # MỎ NEO: Luôn giữ nhánh r=1 để bảo vệ đường viền
+        self.dg_anchor = DetailGuidance(dim)
+        self.coord_att = CoordAtt(dim, dim)
+        self.act = nn.PReLU(dim)
+
+    def forward(self, x):
+        # Đặc trưng bối cảnh tự học
+        dnas_out = self.dnas_supernet(x)
+        fused_context = self.bn_fuse(self.pw_fuse(dnas_out))
+        
+        # Đặc trưng ranh giới
+        anchor = self.dg_anchor(x)
+        
+        out = self.act(fused_context + anchor)
+        return self.coord_att(out)
+
+# ==============================================================================
+# 4. ENCODER, BOTTLENECK & DECODER
+# ==============================================================================
 class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), init_dilations=(4.0, 8.0)):
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), candidate_dilations=[2, 4, 6]):
         super().__init__()
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
-        self.pfcu_dnas = Axial_PFCU_DNAS(in_c, mixer_kernel=mixer_kernel, init_dilations=init_dilations)
+        self.pfcu_dnas = Axial_PFCU_DNAS(in_c, mixer_kernel=mixer_kernel, candidate_dilations=candidate_dilations)
         self.bn = nn.BatchNorm2d(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
 
@@ -217,14 +186,14 @@ class BottleNeckBlock(nn.Module):
         return self.coord_att(out + spp_fused)
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), init_dilations=(2.0, 4.0)):
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), candidate_dilations=[2, 4]):
         super().__init__()
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
-        self.pfcu_dnas = Axial_PFCU_DNAS(gc, mixer_kernel=mixer_kernel, init_dilations=init_dilations)
+        self.pfcu_dnas = Axial_PFCU_DNAS(gc, mixer_kernel=mixer_kernel, candidate_dilations=candidate_dilations)
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         
         self.bn  = nn.BatchNorm2d(out_c)
@@ -237,32 +206,30 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (DNAS REGSEG - TỰ HỌC DILATION RATE)
+# 5. MẠNG CHÍNH (DNAS - TỰ HỌC DILATION RATE BẰNG DARTS)
 # ==============================================================================
 class ULiteModel_DNAS(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
-        
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # Khởi tạo hạt giống DNAS: Mạng sẽ tự điều chỉnh r xoay quanh các số này
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=(5, 5), init_dilations=(2.0, 3.0))
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=(5, 5), init_dilations=(3.0, 5.0))
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=(7, 7), init_dilations=(4.0, 8.0))
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=(7, 7), init_dilations=(10.0, 18.0))
+        # Cung cấp tập ứng viên cho mạng tự "đấu thầu"
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=(5, 5), candidate_dilations=[1, 2, 3])
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=(5, 5), candidate_dilations=[2, 4, 6])
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=(7, 7), candidate_dilations=[4, 6, 8, 12])
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=(7, 7), candidate_dilations=[8, 12, 18, 24])
 
         self.b4 = BottleNeckBlock(256, max_dim=128)
 
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=(7, 7), init_dilations=(4.0, 8.0))
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=(5, 5), init_dilations=(3.0, 5.0))
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=(5, 5), init_dilations=(2.0, 3.0))
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=(5, 5), init_dilations=(1.0, 2.0))
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=(7, 7), candidate_dilations=[4, 8])
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=(5, 5), candidate_dilations=[2, 4])
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=(5, 5), candidate_dilations=[1, 2])
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=(5, 5), candidate_dilations=[1, 2])
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
-
         x, skip1 = self.e1(x)
         x, skip2 = self.e2(x)
         x, skip3 = self.e3(x)
