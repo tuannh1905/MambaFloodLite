@@ -64,8 +64,8 @@ class TinyUAFM(nn.Module):
 # ==============================================================================
 class ContinuousAxialDW(nn.Module):
     """
-    Hack PyTorch: Thay thế deform_conv2d bằng F.grid_sample.
-    Giúp Gradient chảy mượt mà qua tham số r (Dilation Rate) mà không vướng lỗi groups.
+    DNAS Core: Sử dụng F.grid_sample để học Dilation Rate (r).
+    (Đã fix lỗi Broadcasting Tensor Batch Size)
     """
     def __init__(self, dim, mixer_kernel, initial_r=1.0):
         super().__init__()
@@ -85,7 +85,7 @@ class ContinuousAxialDW(nn.Module):
         k = weight.shape[2] if axis == 'h' else weight.shape[3]
         pad = k // 2
 
-        # Tạo lưới tọa độ gốc [-1, 1]
+        # Lưới tọa độ chuẩn hóa [-1, 1] cho hàm grid_sample
         gy, gx = torch.meshgrid(torch.linspace(-1, 1, h, device=device),
                                 torch.linspace(-1, 1, w, device=device), indexing='ij')
         base_grid = torch.stack((gx, gy), dim=-1).unsqueeze(0).expand(b, -1, -1, -1)
@@ -93,27 +93,34 @@ class ContinuousAxialDW(nn.Module):
         dy = 2.0 / (h - 1) if h > 1 else 0
         dx = 2.0 / (w - 1) if w > 1 else 0
 
-        out = 0
+        # Khởi tạo out an toàn với kích thước của x
+        out = torch.zeros_like(x)
+        
         for i, offset in enumerate(range(-pad, pad + 1)):
             if axis == 'h':
-                w_slice = weight[:, :, i, :].unsqueeze(2)
-                shift_y, shift_x = offset * r * dy, 0
+                # FIX LỖI Ở ĐÂY: Ép w_slice về đúng chuẩn [1, Channels, 1, 1] để Broadcast với Batch
+                w_slice = weight[:, 0, i, 0].view(1, c, 1, 1)
+                shift_y, shift_x = offset * r * dy, 0.0
             else:
-                w_slice = weight[:, :, :, i].unsqueeze(3)
-                shift_y, shift_x = 0, offset * r * dx
+                # FIX LỖI Ở ĐÂY: Ép w_slice về đúng chuẩn [1, Channels, 1, 1]
+                w_slice = weight[:, 0, 0, i].view(1, c, 1, 1)
+                shift_y, shift_x = 0.0, offset * r * dx
 
+            # Tịnh tiến tọa độ (Shift)
             grid = base_grid.clone()
-            grid[..., 0] += shift_x
-            grid[..., 1] += shift_y
+            grid[..., 0] = grid[..., 0] + shift_x
+            grid[..., 1] = grid[..., 1] + shift_y
             
-            # Lấy mẫu nội suy có thể đạo hàm
+            # Lấy mẫu nội suy (Bilinear Interpolation)
             x_sampled = F.grid_sample(x, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+            
+            # Cộng dồn
             out = out + x_sampled * w_slice
             
         return out
 
     def forward(self, x):
-        r_val = torch.clamp(self.r, min=1.0) # Đảm bảo dilation không âm
+        r_val = torch.clamp(self.r, min=1.0) # Ép dilation >= 1.0
         out_h = self._shift_and_multiply(x, self.weight_h, r_val, 'h')
         out_w = self._shift_and_multiply(x, self.weight_w, r_val, 'w')
         return x + out_h + out_w
