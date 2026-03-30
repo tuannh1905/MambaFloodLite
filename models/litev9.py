@@ -50,18 +50,22 @@ class ECAModule(nn.Module):
         return x * self.sigmoid(y).expand_as(x)
 
 # ==============================================================================
-# 2. TINY-UAFM (Dung hợp Decoder)
+# 2. TINY-UAFM (Thay thế torch.cat thô sơ trong Decoder)
 # ==============================================================================
 class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
+        # Căn chỉnh kênh trước khi dung hợp
         self.reduce_up = nn.Conv2d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
         self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
         
+        # Lọc ranh giới (Spatial Attention)
         self.spatial_att = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
             nn.Sigmoid()
         )
+        
+        # Tinh chọn kênh (Channel Attention)
         self.eca = ECAModule(out_c)
 
     def forward(self, x_up, x_skip):
@@ -71,17 +75,20 @@ class TinyUAFM(nn.Module):
         if x_up.shape[2:] != x_skip.shape[2:]:
             x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
 
+        # Tạo mặt nạ lọc dựa trên Max(Skip) và Mean(Up)
         spatial_input = torch.cat([
             torch.mean(x_up, dim=1, keepdim=True), 
             torch.max(x_skip, dim=1, keepdim=True)[0]
         ], dim=1)
         
         alpha = self.spatial_att(spatial_input)
+        
+        # Gated Fusion (Hòa trộn chủ động)
         out = x_up * alpha + x_skip * (1 - alpha)
         return self.eca(out)
 
 # ==============================================================================
-# 3. LÕI AXIAL-PFCU-DG BLOCK (Hỗ trợ tham số dilations)
+# 3. AXIAL-PFCU-DG BLOCK (Lõi đặc trưng tinh gọn - NO COORDATT)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -105,18 +112,17 @@ class DetailGuidance(nn.Module):
         return self.bn(x + edges)
 
 class Axial_PFCU_DG(nn.Module):
-    def __init__(self, dim, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
+    def __init__(self, dim, mixer_kernel=(5, 5)):
         super().__init__()
-        self.branch_r1 = AxialDW(dim, mixer_kernel, dilation=dilations[0])
-        self.branch_r2 = AxialDW(dim, mixer_kernel, dilation=dilations[1])
-        self.branch_r5 = AxialDW(dim, mixer_kernel, dilation=dilations[2])
+        self.branch_r1 = AxialDW(dim, mixer_kernel, dilation=1)
+        self.branch_r2 = AxialDW(dim, mixer_kernel, dilation=2)
+        self.branch_r5 = AxialDW(dim, mixer_kernel, dilation=5)
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         
         self.dg_shortcut = DetailGuidance(dim)
-        self.coord_att = CoordAtt(dim, dim)
-        self.act = nn.PReLU(dim) 
+        self.act = nn.PReLU(dim) # MCU optimized
 
     def forward(self, x):
         b1 = self.branch_r1(x)
@@ -126,19 +132,20 @@ class Axial_PFCU_DG(nn.Module):
         fused_context = self.bn_fuse(self.pw_fuse(b1 + b2 + b5))
         guided_details = self.dg_shortcut(x)
         
+        # ĐÃ XÓA COORDATT Ở ĐÂY, CHỈ TRẢ VỀ TENSOR SAU ACTIVATION
         out = self.act(fused_context + guided_details)
-        return self.coord_att(out)
+        return out
 
 # ==============================================================================
-# 4. ENCODER, DECODER & BOTTLENECK (SPP-Axial)
+# 4. ENCODER, DECODER & BOTTLENECK (CHỈ GIỮ COORDATT Ở BOTTLENECK)
 # ==============================================================================
 class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5)):
         super().__init__()
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
-        self.pfcu_dg   = Axial_PFCU_DG(in_c, mixer_kernel=mixer_kernel, dilations=dilations)
+        self.pfcu_dg   = Axial_PFCU_DG(in_c, mixer_kernel=mixer_kernel)
         self.bn        = nn.BatchNorm2d(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
 
@@ -166,6 +173,7 @@ class BottleNeckBlock(nn.Module):
         super().__init__()
         hid = min(dim // 4, max_dim // 4)
         
+        # SPP Gom bối cảnh 3 mức
         self.pool1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
         self.pool2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
         self.pool4 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
@@ -178,6 +186,8 @@ class BottleNeckBlock(nn.Module):
         
         self.axial_refine = AxialDW(dim, mixer_kernel=(5, 5), dilation=1)
         self.bn_refine = nn.BatchNorm2d(dim)
+        
+        # COORDATT ĐƯỢC GIỮ LẠI TẠI ĐÂY NHƯ LÀ "BỘ NÃO" CỦA MẠNG
         self.coord_att = CoordAtt(dim, dim)
 
     def forward(self, x):
@@ -192,15 +202,16 @@ class BottleNeckBlock(nn.Module):
         return self.coord_att(out + spp_fused)
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5)):
         super().__init__()
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
+        # SỬ DỤNG TINY-UAFM ĐỂ HÒA TRỘN THÔNG MINH
         self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
-        self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
+        self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel)
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         
         self.bn  = nn.BatchNorm2d(out_c)
@@ -208,34 +219,35 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
+        # Dung hợp có cổng kiểm soát (Gated-Attention Fusion)
         x = self.uafm(x, skip)
+        # Tinh chỉnh ranh giới
         x = self.act(self.bn(self.pw_up(self.pfcu_dg(self.pw_down(x))) + x))
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (LITE V8 + TỈ LỆ CHẴN SET 3)
+# 5. MẠNG CHÍNH (ULITE-BOTTLE-ATT)
 # ==============================================================================
-class ULiteModel_LiteV8_Set3(nn.Module):
+class ULiteModel_BottleAtt(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # Encoder mở rộng theo bộ Rate thứ 3: Cấu trúc chẵn / Tỉ lệ đôi
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk)
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk)
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk)
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk)
 
         self.b4 = BottleNeckBlock(256, max_dim=128)
 
-        # Decoder thu hồi đối xứng theo bộ Rate thứ 3 (Đi ngược lại)
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 8, 16))
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12))
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8))
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4))
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk)
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk)
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk)
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk)
 
+        # Raw Logits (Tương thích BCEDiceLoss)
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
@@ -256,4 +268,4 @@ class ULiteModel_LiteV8_Set3(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_LiteV8_Set3(num_classes=num_classes)
+    return ULiteModel_BottleAtt(num_classes=num_classes)
