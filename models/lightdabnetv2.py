@@ -31,12 +31,15 @@ class Conv(nn.Module):
 
 class DW_DownSamplingBlock(nn.Module):
     """
-    Downsample tuân thủ tuyệt đối quy tắc: DW cho Không gian, 1x1 cho Kênh.
+    Downsample chuẩn: DW Conv cho Không gian, 1x1 Conv cho Kênh.
+    Đã hỗ trợ trường hợp In == Out (để làm Capping).
     """
     def __init__(self, nIn, nOut):
         super().__init__()
         self.nIn = nIn
         self.nOut = nOut
+        
+        # Nếu nIn < nOut, ta tích chập ra phần dư. Nếu nIn == nOut, ta không cần giữ kênh dư
         nConv = nOut - nIn if nIn < nOut else nOut
 
         # Tích chập chiều sâu (Spatial) + 1x1 (Channel)
@@ -48,9 +51,12 @@ class DW_DownSamplingBlock(nn.Module):
 
     def forward(self, input):
         feat = self.pw_conv(self.dw_conv(input))
+        
+        # Chỉ nối MaxPool nếu thực sự cần tăng số kênh
         if self.nIn < self.nOut:
             pool = self.max_pool(input)
             feat = torch.cat([feat, pool], dim=1)
+            
         return self.bn_prelu(feat)
 
 # =========================================================================
@@ -80,7 +86,6 @@ class CoordAtt(nn.Module):
         return identity * a_w * a_h
 
 class DetailGuidance(nn.Module):
-    """ Mỏ neo giữ ranh giới tại nhánh Detail 1/4 """
     def __init__(self, dim):
         super().__init__()
         self.dg_dw_h = nn.Conv2d(dim, dim, kernel_size=(3, 1), padding='same', groups=dim, bias=False)
@@ -91,35 +96,23 @@ class DetailGuidance(nn.Module):
         return self.bn(x + self.dg_dw_h(x) + self.dg_dw_w(x))
 
 # =========================================================================
-# 3. MODULE CỐT LÕI MỚI (DAB DW MODULE)
+# 3. MODULE CỐT LÕI (DAB DW MODULE)
 # =========================================================================
 class DAB_DW_Module(nn.Module):
-    """
-    Bản nâng cấp tuân thủ quy tắc: 
-    - 1x1 Conv để trộn kênh.
-    - Dùng 100% DW Conv (groups=channels) cho Không gian.
-    """
     def __init__(self, nIn, d=1, dkSize=3):
         super().__init__()
         nMid = nIn // 2
         
         self.bn_relu_1 = BNPReLU(nIn)
-        
-        # 1. TRỘN KÊNH TRƯỚC (Bỏ Conv 3x3)
         self.conv1x1_in = Conv(nIn, nMid, 1, 1, padding=0, bn_acti=True)
 
-        # 2. XỬ LÝ KHÔNG GIAN BẰNG DEPTHWISE (groups = nMid)
-        # Nhánh 1: Không đối xứng cơ bản
         self.dconv3x1 = Conv(nMid, nMid, (dkSize, 1), 1, padding=(1, 0), groups=nMid, bn_acti=True)
         self.dconv1x3 = Conv(nMid, nMid, (1, dkSize), 1, padding=(0, 1), groups=nMid, bn_acti=True)
         
-        # Nhánh 2: Không đối xứng mở rộng (Dilated)
         self.ddconv3x1 = Conv(nMid, nMid, (dkSize, 1), 1, padding=(1 * d, 0), dilation=(d, 1), groups=nMid, bn_acti=True)
         self.ddconv1x3 = Conv(nMid, nMid, (1, dkSize), 1, padding=(0, 1 * d), dilation=(1, d), groups=nMid, bn_acti=True)
 
         self.bn_relu_2 = BNPReLU(nMid)
-        
-        # 3. TRỘN KÊNH VÀ PHỤC HỒI
         self.conv1x1_out = Conv(nMid, nIn, 1, 1, padding=0, bn_acti=False)
 
     def forward(self, input):
@@ -135,9 +128,9 @@ class DAB_DW_Module(nn.Module):
         return out + input
 
 # =========================================================================
-# 4. MẠNG CHÍNH (DABNET V2 - DUAL BRANCH)
+# 4. MẠNG CHÍNH (DABNET V2 - CAPPED)
 # =========================================================================
-class DABNet_V2(nn.Module):
+class DABNet_V2_Capped(nn.Module):
     def __init__(self, classes=1):
         super().__init__()
         
@@ -162,21 +155,26 @@ class DABNet_V2(nn.Module):
         # NHÁNH 2: SEMANTIC CONTEXT BRANCH (Đào sâu xuống 1/16)
         # ---------------------------------------------------------
         self.downsample_sem_1 = DW_DownSamplingBlock(64, 128)  # Xuống 1/8
-        self.downsample_sem_2 = DW_DownSamplingBlock(128, 256) # Xuống 1/16
         
-        # Áp dụng Hybrid DeepLab Style Dilation (Ziczac)
+        # ---> CHẶN TRẦN (CAPPING) TẠI ĐÂY: nIn=128, nOut=128 <---
+        self.downsample_sem_2 = DW_DownSamplingBlock(128, 128) # Xuống 1/16 nhưng giữ 128 kênh
+        
         dilations = [2, 4, 8, 16, 8, 4]
         self.semantic_block = nn.Sequential()
         for i, d in enumerate(dilations):
-            self.semantic_block.add_module(f"DAB_Sem_{i}", DAB_DW_Module(256, d=d))
+            # Tất cả các khối DAB giờ chỉ chạy trên 128 kênh -> Cực nhẹ
+            self.semantic_block.add_module(f"DAB_Sem_{i}", DAB_DW_Module(128, d=d))
 
         # ---------------------------------------------------------
         # FUSION MODULE
         # ---------------------------------------------------------
         self.up_sem = nn.Upsample(scale_factor=4, mode='bilinear', align_corners=False)
+        
         self.fuse_conv = nn.Sequential(
-            Conv(256 + 64, 128, 1, 1, padding=0, bn_acti=True),
-            Conv(128, 128, 3, 1, padding=1, groups=128, bn_acti=True) # DW Smooth
+            # Nhận 128 kênh từ Semantic + 64 kênh từ Detail = 192 kênh
+            Conv(128 + 64, 128, 1, 1, padding=0, bn_acti=True),
+            # DW Smooth để hòa trộn Không gian
+            Conv(128, 128, 3, 1, padding=1, groups=128, bn_acti=True) 
         )
         
         # Cú chốt hạ quyết định ranh giới
@@ -191,12 +189,12 @@ class DABNet_V2(nn.Module):
         # Xử lý nhánh Detail (1/4)
         feat_detail = self.downsample_detail(x_init)
         feat_detail = self.detail_block(feat_detail)
-        feat_detail = self.detail_guidance(feat_detail) # Mỏ neo ranh giới
+        feat_detail = self.detail_guidance(feat_detail)
         
         # Xử lý nhánh Semantic (1/16)
         feat_sem = self.downsample_sem_1(feat_detail)
         feat_sem = self.downsample_sem_2(feat_sem)
-        feat_sem = self.semantic_block(feat_sem) # Ziczac Dilation
+        feat_sem = self.semantic_block(feat_sem)
         
         # Dung hợp (Phóng 1/16 lên 1/4 để khớp với Detail)
         feat_sem_up = self.up_sem(feat_sem)
@@ -211,4 +209,4 @@ class DABNet_V2(nn.Module):
         return F.interpolate(out, size, mode='bilinear', align_corners=False)
 
 def build_model(num_classes=1):
-    return DABNet_V2(classes=num_classes)
+    return DABNet_V2_Capped(classes=num_classes)
