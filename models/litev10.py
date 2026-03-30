@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 1. ATTENTION MODULES (CoordAtt & ECA)
+# 1. ATTENTION MODULES (Chỉ giữ lại CoordAtt)
 # ==============================================================================
 class CoordAtt(nn.Module):
     def __init__(self, inp, oup, reduction=32):
@@ -37,20 +37,8 @@ class CoordAtt(nn.Module):
         
         return identity * a_w * a_h
 
-class ECAModule(nn.Module):
-    def __init__(self, channels, k_size=3):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        y = self.avg_pool(x)
-        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        return x * self.sigmoid(y).expand_as(x)
-
 # ==============================================================================
-# 2. TINY-UAFM (Dung hợp Decoder)
+# 2. TINY-UAFM (Dung hợp Decoder thuần Không gian)
 # ==============================================================================
 class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
@@ -62,7 +50,6 @@ class TinyUAFM(nn.Module):
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
             nn.Sigmoid()
         )
-        self.eca = ECAModule(out_c)
 
     def forward(self, x_up, x_skip):
         x_up = self.reduce_up(x_up)
@@ -78,10 +65,10 @@ class TinyUAFM(nn.Module):
         
         alpha = self.spatial_att(spatial_input)
         out = x_up * alpha + x_skip * (1 - alpha)
-        return self.eca(out)
+        return out
 
 # ==============================================================================
-# 3. LÕI AXIAL PFCU VỚI CƠ CHẾ MODULATED DETAIL GUIDANCE (MDG)
+# 3. LÕI AXIAL-GE-DG BLOCK (GATHER-EXPANSION STYLE)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -104,42 +91,55 @@ class DetailGuidance(nn.Module):
         edges = self.dg_dw_h(x) + self.dg_dw_w(x)
         return self.bn(x + edges)
 
-class Axial_PFCU_DG(nn.Module):
-    def __init__(self, dim, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
+class Axial_GE_DG(nn.Module):
+    def __init__(self, dim, mixer_kernel=(5, 5), dilations=(1, 2, 5), exp_ratio=1):
         super().__init__()
-        self.branch_r1 = AxialDW(dim, mixer_kernel, dilation=dilations[0])
-        self.branch_r2 = AxialDW(dim, mixer_kernel, dilation=dilations[1])
-        self.branch_r5 = AxialDW(dim, mixer_kernel, dilation=dilations[2])
+        # Tính toán kênh mở rộng
+        hid_dim = int(dim * exp_ratio)
         
-        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
+        # 1. GATHER (Gom đặc trưng cục bộ)
+        self.gather = nn.Sequential(
+            nn.Conv2d(dim, hid_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hid_dim),
+            nn.PReLU(hid_dim)
+        )
         
+        # 2. AXIAL DEPTHWISE (Xử lý đa bối cảnh trên các kênh đã gom)
+        self.branch_r1 = AxialDW(hid_dim, mixer_kernel, dilation=dilations[0])
+        self.branch_r2 = AxialDW(hid_dim, mixer_kernel, dilation=dilations[1])
+        self.branch_r5 = AxialDW(hid_dim, mixer_kernel, dilation=dilations[2])
+        
+        # 3. PROJECT (Nén đặc trưng lại)
+        self.project = nn.Sequential(
+            nn.Conv2d(hid_dim, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim)
+        )
+        
+        # 4. Mỏ neo ranh giới & Attention
         self.dg_shortcut = DetailGuidance(dim)
         self.coord_att = CoordAtt(dim, dim)
-        self.act = nn.PReLU(dim) 
+        self.act = nn.PReLU(dim)
 
     def forward(self, x):
-        b1 = self.branch_r1(x)
-        b2 = self.branch_r2(x)
-        b5 = self.branch_r5(x)
+        # Bước 1: Gom cục bộ
+        x_gather = self.gather(x)
         
-        fused_context = self.bn_fuse(self.pw_fuse(b1 + b2 + b5))
+        # Bước 2: Dilation đa quy mô
+        b1 = self.branch_r1(x_gather)
+        b2 = self.branch_r2(x_gather)
+        b5 = self.branch_r5(x_gather)
+        
+        # Bước 3: Cộng các nhánh và Nén
+        fused_context = self.project(b1 + b2 + b5)
+        
+        # Bước 4: Cộng hướng dẫn ranh giới và đưa qua Attention
         guided_details = self.dg_shortcut(x)
-        
-        # --- MODULATED DETAIL GUIDANCE (MDG) ---
-        # 1. Chuyển đổi đặc trưng ranh giới thành Mặt nạ chú ý [0, 1]
-        detail_mask = torch.sigmoid(guided_details)
-        
-        # 2. Điều biến Bối cảnh: Lọc bỏ nhiễu ở các vùng không phải ranh giới
-        modulated_context = fused_context * detail_mask
-        
-        # 3. Dung hợp Gated Context với Residual Detail
-        out = self.act(modulated_context + guided_details)
+        out = self.act(fused_context + guided_details)
         
         return self.coord_att(out)
 
 # ==============================================================================
-# 4. ENCODER, DECODER & BOTTLENECK
+# 4. ENCODER, DECODER & DW CONTEXT EMBEDDING BOTTLENECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
@@ -147,58 +147,54 @@ class EncoderBlock(nn.Module):
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
-        self.pfcu_dg   = Axial_PFCU_DG(in_c, mixer_kernel=mixer_kernel, dilations=dilations)
-        self.bn        = nn.BatchNorm2d(in_c)
+        # SỬ DỤNG KHỐI GE MỚI
+        self.ge_dg = Axial_GE_DG(in_c, mixer_kernel=mixer_kernel, dilations=dilations)
+        self.bn = nn.BatchNorm2d(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
 
         if not self.same_channels:
-            self.pw      = nn.Conv2d(in_c, conv_out, kernel_size=1, bias=False)
+            self.pw = nn.Conv2d(in_c, conv_out, kernel_size=1, bias=False)
             self.down_pw = nn.MaxPool2d((2, 2))
 
         self.bn2 = nn.BatchNorm2d(out_c)
         self.act = nn.PReLU(out_c)
 
     def forward(self, x):
-        skip = self.bn(self.pfcu_dg(x))
+        skip = self.bn(self.ge_dg(x))
         pool = self.down_pool(skip)
 
         if self.same_channels:
             x = self.act(self.bn2(pool))
         else:
             conv = self.down_pw(self.pw(skip))
-            x    = self.act(self.bn2(torch.cat([pool, conv], dim=1)))
+            x = self.act(self.bn2(torch.cat([pool, conv], dim=1)))
 
         return x, skip
 
-class BottleNeckBlock(nn.Module):
-    def __init__(self, dim, max_dim=128):
+class ContextEmbeddingBlock(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        hid = min(dim // 4, max_dim // 4)
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.conv1x1 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(inplace=True)
+        )
         
-        self.pool1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
-        self.pool2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
-        self.pool4 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
-        
-        self.spp_fuse = nn.Sequential(
-            nn.Conv2d(dim + hid * 3, dim, kernel_size=1, bias=False),
+        # Depthwise Conv siêu nhẹ
+        self.conv3x3_dw = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.BatchNorm2d(dim),
             nn.PReLU(dim)
         )
-        
-        self.axial_refine = AxialDW(dim, mixer_kernel=(5, 5), dilation=1)
-        self.bn_refine = nn.BatchNorm2d(dim)
         self.coord_att = CoordAtt(dim, dim)
 
     def forward(self, x):
-        size = x.size()[2:]
-        x1 = F.interpolate(self.pool1(x), size, mode='bilinear', align_corners=False)
-        x2 = F.interpolate(self.pool2(x), size, mode='bilinear', align_corners=False)
-        x4 = F.interpolate(self.pool4(x), size, mode='bilinear', align_corners=False)
-        
-        spp_fused = self.spp_fuse(torch.cat([x, x1, x2, x4], dim=1))
-        
-        out = self.bn_refine(self.axial_refine(spp_fused))
-        return self.coord_att(out + spp_fused)
+        global_context = self.gap(x)
+        global_context = self.conv1x1(global_context)
+        out = x + global_context
+        out = self.conv3x3_dw(out)
+        return self.coord_att(out)
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
@@ -209,45 +205,57 @@ class DecoderBlock(nn.Module):
         self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
-        self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
-        self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
+        # SỬ DỤNG KHỐI GE MỚI
+        self.ge_dg = Axial_GE_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
+        self.pw_up = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         
-        self.bn  = nn.BatchNorm2d(out_c)
+        self.bn = nn.BatchNorm2d(out_c)
         self.act = nn.PReLU(out_c)
 
     def forward(self, x, skip):
         x = self.up(x)
         x = self.uafm(x, skip)
-        x = self.act(self.bn(self.pw_up(self.pfcu_dg(self.pw_down(x))) + x))
+        x = self.act(self.bn(self.pw_up(self.ge_dg(self.pw_down(x))) + x))
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (LITE V8 + MDG + EXPONENTIAL DILATION)
+# 5. MẠNG CHÍNH (GE + DEEPLAB RATES + DW CE BOTTLENECK + AUX HEAD)
 # ==============================================================================
-class ULiteModel_LiteV8_MDG_Exp(nn.Module):
+class ULiteModel_GE_Aux(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # ENCODER: Exponential Dilation
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 1, 2))  
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 2, 4))  
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 4, 8))  
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16)) 
+        # Encoder: DeepLab Rates
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12)) # skip3 (1/4) cho Aux Head
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
 
-        self.b4 = BottleNeckBlock(256, max_dim=128)
+        # Bottleneck
+        self.b4 = ContextEmbeddingBlock(256)
 
-        # DECODER: Thu hồi Dilation
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 4, 8))
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 2, 4))
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 1, 2))
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 1, 1)) 
+        # Decoder: Đối xứng
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 8, 16))
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12))
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8))
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4))
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
+        # Aux Head cho quá trình Training
+        self.aux_head = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.PReLU(64),
+            nn.Conv2d(64, num_classes, kernel_size=1)
+        )
+
     def forward(self, x):
+        input_size = x.shape[2:] 
+        
         x = self.conv_in(x)
 
         x, skip1 = self.e1(x)
@@ -255,14 +263,20 @@ class ULiteModel_LiteV8_MDG_Exp(nn.Module):
         x, skip3 = self.e3(x)
         x, skip4 = self.e4(x)
 
-        x = self.b4(x)
+        main_feat = self.b4(x)
+        main_feat = self.d4(main_feat, skip4)
+        main_feat = self.d3(main_feat, skip3)
+        main_feat = self.d2(main_feat, skip2)
+        main_feat = self.d1(main_feat, skip1)
+        
+        main_out = self.conv_out(main_feat)
 
-        x = self.d4(x, skip4)
-        x = self.d3(x, skip3)
-        x = self.d2(x, skip2)
-        x = self.d1(x, skip1)
-
-        return self.conv_out(x)
+        if self.training:
+            aux_out = self.aux_head(skip3)
+            aux_out = F.interpolate(aux_out, size=input_size, mode='bilinear', align_corners=False)
+            return main_out, aux_out
+        
+        return main_out
 
 def build_model(num_classes=1):
-    return ULiteModel_LiteV8_MDG_Exp(num_classes=num_classes)
+    return ULiteModel_GE_Aux(num_classes=num_classes)
