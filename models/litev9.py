@@ -55,17 +55,13 @@ class ECAModule(nn.Module):
 class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
-        # Căn chỉnh kênh trước khi dung hợp
         self.reduce_up = nn.Conv2d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
         self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
         
-        # Lọc ranh giới (Spatial Attention)
         self.spatial_att = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
             nn.Sigmoid()
         )
-        
-        # Tinh chọn kênh (Channel Attention)
         self.eca = ECAModule(out_c)
 
     def forward(self, x_up, x_skip):
@@ -75,15 +71,12 @@ class TinyUAFM(nn.Module):
         if x_up.shape[2:] != x_skip.shape[2:]:
             x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
 
-        # Tạo mặt nạ lọc dựa trên Max(Skip) và Mean(Up)
         spatial_input = torch.cat([
             torch.mean(x_up, dim=1, keepdim=True), 
             torch.max(x_skip, dim=1, keepdim=True)[0]
         ], dim=1)
         
         alpha = self.spatial_att(spatial_input)
-        
-        # Gated Fusion (Hòa trộn chủ động)
         out = x_up * alpha + x_skip * (1 - alpha)
         return self.eca(out)
 
@@ -173,7 +166,6 @@ class BottleNeckBlock(nn.Module):
         super().__init__()
         hid = min(dim // 4, max_dim // 4)
         
-        # SPP Gom bối cảnh 3 mức
         self.pool1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
         self.pool2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
         self.pool4 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
@@ -205,7 +197,6 @@ class DecoderBlock(nn.Module):
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
-        # SỬ DỤNG TINY-UAFM ĐỂ HÒA TRỘN THÔNG MINH
         self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
@@ -217,35 +208,33 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
-        # Dung hợp có cổng kiểm soát (Gated-Attention Fusion)
         x = self.uafm(x, skip)
-        # Tinh chỉnh ranh giới
         x = self.act(self.bn(self.pw_up(self.pfcu_dg(self.pw_down(x))) + x))
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (LITE V8 + CUSTOM DILATION SET 2)
+# 5. MẠNG CHÍNH (LITE V8 + TỈ LỆ CHẴN SET 3)
 # ==============================================================================
-class ULiteModel_LiteV8_Set2(nn.Module):
+class ULiteModel_LiteV8_Set3(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # Encoder mở rộng theo bộ Rate thứ 2: (1, 2, 3) -> (1, 3, 5) -> (1, 5, 9) -> (1, 7, 13)
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 3))
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 3, 5))
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 5, 9))
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 7, 13))
+        # Encoder mở rộng theo bộ Rate thứ 3: Cấu trúc chẵn / Tỉ lệ đôi
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
 
         self.b4 = BottleNeckBlock(256, max_dim=128)
 
-        # Decoder thu hồi đối xứng theo bộ Rate thứ 2 (Đi ngược lại)
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 7, 13))
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 5, 9))
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 3, 5))
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 3))
+        # Decoder thu hồi đối xứng theo bộ Rate thứ 3 (Đi ngược lại)
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 8, 16))
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12))
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8))
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4))
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -267,4 +256,4 @@ class ULiteModel_LiteV8_Set2(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_LiteV8_Set2(num_classes=num_classes)
+    return ULiteModel_LiteV8_Set3(num_classes=num_classes)
