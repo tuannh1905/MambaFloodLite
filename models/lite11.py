@@ -68,7 +68,7 @@ class TinyUAFM(nn.Module):
         return out
 
 # ==============================================================================
-# 3. LÕI AXIAL-GE-DG BLOCK (GATHER-EXPANSION STYLE VỚI DEPTHWISE)
+# 3. LÕI AXIAL-GE-DG BLOCK (GATHER-EXPANSION STYLE)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -96,14 +96,15 @@ class Axial_GE_DG(nn.Module):
         super().__init__()
         hid_dim = int(dim * exp_ratio)
         
-        # 1. GATHER ĐÃ TỐI ƯU (Depthwise Separable thay vì Standard Conv)
+        # 1. GATHER (ĐÃ ÉP CÂN: Depthwise Separable Conv chuẩn)
         self.gather = nn.Sequential(
-            # Depthwise Conv (Gom không gian - Cực nhẹ)
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.PReLU(dim),
-            # Pointwise Conv (Trộn kênh và mở rộng)
+            # Bước 1: Trộn kênh (1x1 Conv) - Rất nhẹ
             nn.Conv2d(dim, hid_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hid_dim),
+            nn.PReLU(hid_dim),
+            
+            # Bước 2: Gom không gian (3x3 Depthwise Conv) - Thêm groups=hid_dim
+            nn.Conv2d(hid_dim, hid_dim, kernel_size=3, padding=1, groups=hid_dim, bias=False),
             nn.BatchNorm2d(hid_dim),
             nn.PReLU(hid_dim)
         )
@@ -180,7 +181,6 @@ class ContextEmbeddingBlock(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Depthwise Conv siêu nhẹ cho Bottleneck
         self.conv3x3_dw = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.BatchNorm2d(dim),
