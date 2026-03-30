@@ -255,4 +255,4 @@ class ULiteModel_LiteV8_NoECA(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_LiteV8_NoECA(num_classes=num_classes)
+    return ULiteModel_LiteV8_NoECA(num_classes=num_classes)c
