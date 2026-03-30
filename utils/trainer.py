@@ -82,8 +82,6 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     set_seed(seed)
     
     from losses import get_loss
-    from losses.boundary_loss import JointEdgeSegLoss
-    base_criterion = get_loss(loss_name, num_classes=num_classes)
 
     criterion = get_loss(loss_name, num_classes=num_classes)
     
@@ -121,21 +119,22 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             optimizer.zero_grad(set_to_none=False)
             
             outputs = model(images)
+            
+            # Xử lý khi mô hình trả về 2 nhánh (Main và Aux)
             if isinstance(outputs, tuple) and len(outputs) == 2:
-                seg_out, detail_out = outputs
-                #1. loss chính(segmentation)
-                loss_seg = criterion(seg_out, masks)
-                #2. tạo edge mask động
-                #dùng avg pool để tìm các pixel bị thay đổi quanh mép nước
-                avg_mask = torch.nn.functional.avg_pool2d(masks, kernel_size=3, stride=1, padding=1)
-                edge_masks = torch.abs(masks - avg_mask) 
-                edge_masks = (edge_masks > 0).float() # Nhị phân hóa thành bản đồ ranh giới
-                #3. loss phụ(detail guidance)
-                loss_detail = criterion(detail_out, edge_masks)
-                #4. tổng hợp loss: Loss_Seg + λ * Loss_Detail (Chọn λ = 0.5)
-                loss = loss_seg + 0.5 * loss_detail
+                main_out, aux_out = outputs
+                
+                # 1. Tính Loss cho nhánh chính
+                loss_main = criterion(main_out, masks)
+                
+                # 2. Tính Loss cho nhánh giám sát sâu (Auxiliary Head)
+                # Lưu ý: Aux dự đoán trực tiếp masks, KHÔNG dự đoán edge
+                loss_aux = criterion(aux_out, masks)
+                
+                # 3. Tổng hợp Loss (Trọng số 0.4 là tiêu chuẩn vàng của BiSeNet/PSPNet)
+                loss = loss_main + 0.4 * loss_aux
             else:
-                # Fallback cho các mô hình bình thường hoặc lúc val/test
+                # Fallback cho các mô hình bình thường (không có Aux)
                 loss = criterion(outputs, masks)
             
             loss.backward()
