@@ -14,7 +14,7 @@ class CoordAtt(nn.Module):
         mip = max(8, inp // reduction)
         self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn1 = nn.BatchNorm2d(mip)
-        self.act = nn.PReLU(mip)
+        self.act = nn.PReLU(mip) # Tối ưu cho MCU
         
         self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0, bias=False)
         self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0, bias=False)
@@ -43,9 +43,11 @@ class CoordAtt(nn.Module):
 class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
+        # Căn chỉnh kênh trước khi dung hợp
         self.reduce_up = nn.Conv2d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
         self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
         
+        # Lọc ranh giới (Spatial Attention)
         self.spatial_att = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
             nn.Sigmoid()
@@ -58,12 +60,15 @@ class TinyUAFM(nn.Module):
         if x_up.shape[2:] != x_skip.shape[2:]:
             x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
 
+        # Tạo mặt nạ lọc dựa trên Max(Skip) và Mean(Up)
         spatial_input = torch.cat([
             torch.mean(x_up, dim=1, keepdim=True), 
             torch.max(x_skip, dim=1, keepdim=True)[0]
         ], dim=1)
         
         alpha = self.spatial_att(spatial_input)
+        
+        # Gated Fusion (Hòa trộn chủ động)
         out = x_up * alpha + x_skip * (1 - alpha)
         return out
 
@@ -174,6 +179,7 @@ class EncoderBlock(nn.Module):
 class ContextEmbeddingBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        # 1. Global Context
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.conv1x1 = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=1, bias=False),
@@ -181,12 +187,14 @@ class ContextEmbeddingBlock(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Depthwise Conv siêu nhẹ
+        # 2. Depthwise Conv siêu nhẹ
         self.conv3x3_dw = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.BatchNorm2d(dim),
             nn.PReLU(dim)
         )
+        
+        # Giữ lại CoordAtt ở đáy mạng để định hướng cực mạnh
         self.coord_att = CoordAtt(dim, dim)
 
     def forward(self, x):
@@ -219,9 +227,9 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (GE + DEEPLAB RATES + DW CE BOTTLENECK + AUX HEAD)
+# 5. MẠNG CHÍNH (GE + DEEPLAB RATES + DW CE BOTTLENECK)
 # ==============================================================================
-class ULiteModel_GE_Aux(nn.Module):
+class ULiteModel_GE(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
@@ -231,10 +239,10 @@ class ULiteModel_GE_Aux(nn.Module):
         # Encoder: DeepLab Rates
         self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
         self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12)) # skip3 (1/4) cho Aux Head
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
         self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
 
-        # Bottleneck
+        # Bottleneck: Context Embedding siêu nhẹ
         self.b4 = ContextEmbeddingBlock(256)
 
         # Decoder: Đối xứng
@@ -245,17 +253,7 @@ class ULiteModel_GE_Aux(nn.Module):
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
-        # Aux Head cho quá trình Training
-        self.aux_head = nn.Sequential(
-            nn.Conv2d(128, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.PReLU(64),
-            nn.Conv2d(64, num_classes, kernel_size=1)
-        )
-
     def forward(self, x):
-        input_size = x.shape[2:] 
-        
         x = self.conv_in(x)
 
         x, skip1 = self.e1(x)
@@ -263,20 +261,14 @@ class ULiteModel_GE_Aux(nn.Module):
         x, skip3 = self.e3(x)
         x, skip4 = self.e4(x)
 
-        main_feat = self.b4(x)
-        main_feat = self.d4(main_feat, skip4)
-        main_feat = self.d3(main_feat, skip3)
-        main_feat = self.d2(main_feat, skip2)
-        main_feat = self.d1(main_feat, skip1)
+        x = self.b4(x)
         
-        main_out = self.conv_out(main_feat)
-
-        if self.training:
-            aux_out = self.aux_head(skip3)
-            aux_out = F.interpolate(aux_out, size=input_size, mode='bilinear', align_corners=False)
-            return main_out, aux_out
+        x = self.d4(x, skip4)
+        x = self.d3(x, skip3)
+        x = self.d2(x, skip2)
+        x = self.d1(x, skip1)
         
-        return main_out
+        return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_GE_Aux(num_classes=num_classes)
+    return ULiteModel_GE(num_classes=num_classes)
