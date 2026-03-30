@@ -88,7 +88,7 @@ class TinyUAFM(nn.Module):
         return self.eca(out)
 
 # ==============================================================================
-# 3. AXIAL-PFCU-DG BLOCK (Lõi đặc trưng tinh gọn - NO COORDATT)
+# 3. AXIAL-PFCU-DG BLOCK (Khối đặc trưng lõi)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -112,16 +112,17 @@ class DetailGuidance(nn.Module):
         return self.bn(x + edges)
 
 class Axial_PFCU_DG(nn.Module):
-    def __init__(self, dim, mixer_kernel=(5, 5)):
+    def __init__(self, dim, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
         super().__init__()
-        self.branch_r1 = AxialDW(dim, mixer_kernel, dilation=1)
-        self.branch_r2 = AxialDW(dim, mixer_kernel, dilation=2)
-        self.branch_r5 = AxialDW(dim, mixer_kernel, dilation=5)
+        self.branch_r1 = AxialDW(dim, mixer_kernel, dilation=dilations[0])
+        self.branch_r2 = AxialDW(dim, mixer_kernel, dilation=dilations[1])
+        self.branch_r5 = AxialDW(dim, mixer_kernel, dilation=dilations[2])
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         
         self.dg_shortcut = DetailGuidance(dim)
+        self.coord_att = CoordAtt(dim, dim)
         self.act = nn.PReLU(dim) # MCU optimized
 
     def forward(self, x):
@@ -132,20 +133,19 @@ class Axial_PFCU_DG(nn.Module):
         fused_context = self.bn_fuse(self.pw_fuse(b1 + b2 + b5))
         guided_details = self.dg_shortcut(x)
         
-        # ĐÃ XÓA COORDATT Ở ĐÂY, CHỈ TRẢ VỀ TENSOR SAU ACTIVATION
         out = self.act(fused_context + guided_details)
-        return out
+        return self.coord_att(out)
 
 # ==============================================================================
-# 4. ENCODER, DECODER & BOTTLENECK (CHỈ GIỮ COORDATT Ở BOTTLENECK)
+# 4. ENCODER, DECODER & CONTEXT EMBEDDING BOTTLENECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5)):
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
         super().__init__()
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
-        self.pfcu_dg   = Axial_PFCU_DG(in_c, mixer_kernel=mixer_kernel)
+        self.pfcu_dg   = Axial_PFCU_DG(in_c, mixer_kernel=mixer_kernel, dilations=dilations)
         self.bn        = nn.BatchNorm2d(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
 
@@ -168,41 +168,41 @@ class EncoderBlock(nn.Module):
 
         return x, skip
 
-class BottleNeckBlock(nn.Module):
-    def __init__(self, dim, max_dim=128):
+class ContextEmbeddingBlock(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        hid = min(dim // 4, max_dim // 4)
+        # 1. Global Context
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.conv1x1 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.ReLU(inplace=True)
+        )
         
-        # SPP Gom bối cảnh 3 mức
-        self.pool1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
-        self.pool2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
-        self.pool4 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
-        
-        self.spp_fuse = nn.Sequential(
-            nn.Conv2d(dim + hid * 3, dim, kernel_size=1, bias=False),
+        # 2. Smooth & Attention sau khi Broadcast
+        self.conv3x3 = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(dim),
             nn.PReLU(dim)
         )
         
-        self.axial_refine = AxialDW(dim, mixer_kernel=(5, 5), dilation=1)
-        self.bn_refine = nn.BatchNorm2d(dim)
-        
-        # COORDATT ĐƯỢC GIỮ LẠI TẠI ĐÂY NHƯ LÀ "BỘ NÃO" CỦA MẠNG
+        # Giữ lại CoordAtt ở đáy mạng để định hướng cực mạnh
         self.coord_att = CoordAtt(dim, dim)
 
     def forward(self, x):
-        size = x.size()[2:]
-        x1 = F.interpolate(self.pool1(x), size, mode='bilinear', align_corners=False)
-        x2 = F.interpolate(self.pool2(x), size, mode='bilinear', align_corners=False)
-        x4 = F.interpolate(self.pool4(x), size, mode='bilinear', align_corners=False)
+        # Lấy bối cảnh toàn cục (FOV vô cực)
+        global_context = self.gap(x)
+        global_context = self.conv1x1(global_context)
         
-        spp_fused = self.spp_fuse(torch.cat([x, x1, x2, x4], dim=1))
+        # Broadcast bối cảnh toàn cục vào đặc trưng cục bộ (Phép cộng)
+        out = x + global_context
         
-        out = self.bn_refine(self.axial_refine(spp_fused))
-        return self.coord_att(out + spp_fused)
+        # Làm mượt và tập trung Attention
+        out = self.conv3x3(out)
+        return self.coord_att(out)
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5)):
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
         super().__init__()
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
@@ -211,7 +211,7 @@ class DecoderBlock(nn.Module):
         self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
-        self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel)
+        self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         
         self.bn  = nn.BatchNorm2d(out_c)
@@ -226,26 +226,29 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (ULITE-BOTTLE-ATT)
+# 5. MẠNG CHÍNH (ULITE-PFCU-UAFM)
 # ==============================================================================
-class ULiteModel_BottleAtt(nn.Module):
+class ULiteModel_PFCU_UAFM(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk)
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk)
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk)
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk)
+        # Áp dụng bộ Rate DeepLab Style: (1,2,4) -> (1,4,8) -> (1,6,12) -> (1,8,16)
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
 
-        self.b4 = BottleNeckBlock(256, max_dim=128)
+        # Sử dụng Context Embedding Block thay cho SPP
+        self.b4 = ContextEmbeddingBlock(256)
 
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk)
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk)
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk)
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk)
+        # Decoder đi ngược lại theo đúng thiết kế đối xứng
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 8, 16))
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12))
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8))
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4))
 
         # Raw Logits (Tương thích BCEDiceLoss)
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
@@ -268,4 +271,4 @@ class ULiteModel_BottleAtt(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_BottleAtt(num_classes=num_classes)
+    return ULiteModel_PFCU_UAFM(num_classes=num_classes)
