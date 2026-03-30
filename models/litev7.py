@@ -37,15 +37,13 @@ class CoordAtt(nn.Module):
         
         return identity * a_w * a_h
 
-# ĐÃ XÓA BỎ ECAMODULE ĐỂ TRÁNH ĐỤNG ĐỘ ATTENTION (ATTENTION COLLISION)
-
 # ==============================================================================
-# 2. SUB-PIXEL UPSAMPLE & TINY-UAFM (Đã tối giản)
+# 2. SUB-PIXEL UPSAMPLE & TINY-UAFM
 # ==============================================================================
 class SubPixelUpsample(nn.Module):
     """
-    Học cách phóng to ảnh (x2) thay vì dùng Bilinear.
-    Tăng kênh lên 4 lần rồi dùng PixelShuffle(2) để xếp thành pixel không gian.
+    Tăng độ nét cho ranh giới ở các tầng nông.
+    Chỉ tốn rất ít tham số khi số lượng kênh (in_c) nhỏ.
     """
     def __init__(self, in_c):
         super().__init__()
@@ -60,7 +58,7 @@ class SubPixelUpsample(nn.Module):
 class TinyUAFM(nn.Module):
     """
     Chỉ tập trung làm Spatial Gated Fusion (Tạo mặt nạ chọn vùng Pixel).
-    Đã loại bỏ ECA để gradient chạy mượt hơn.
+    Đã loại bỏ ECA để tránh đụng độ Attention.
     """
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
@@ -76,7 +74,6 @@ class TinyUAFM(nn.Module):
         x_up = self.reduce_up(x_up)
         x_skip = self.reduce_skip(x_skip)
 
-        # Bilinear ở đây chỉ dùng để an toàn hóa (nếu có lỗi làm tròn chênh lệch 1 pixel)
         if x_up.shape[2:] != x_skip.shape[2:]:
             x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
 
@@ -87,7 +84,6 @@ class TinyUAFM(nn.Module):
         
         alpha = self.spatial_att(spatial_input)
         
-        # Chỉ hòa trộn Spatial, trả thẳng ra ngoài
         return x_up * alpha + x_skip * (1 - alpha)
 
 # ==============================================================================
@@ -213,12 +209,20 @@ class BottleNeckBlock(nn.Module):
         return self.coord_att(out + spp_fused)
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5)):
+    """
+    Decoder hỗ trợ Hybrid Upsample:
+    - Các tầng sâu dùng Bilinear (Tiết kiệm 300K+ Params)
+    - Các tầng nông dùng PixelShuffle (Giữ ranh giới sắc nét)
+    """
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), use_pixelshuffle=False):
         super().__init__()
         gc = max(out_c // 4, 4)
         
-        # SỬ DỤNG PIXEL-SHUFFLE THAY VÌ BILINEAR MÙ
-        self.up = SubPixelUpsample(in_c)
+        # Công tắc chọn cơ chế Upsample
+        if use_pixelshuffle:
+            self.up = SubPixelUpsample(in_c)
+        else:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
         self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
@@ -236,54 +240,55 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (LITE V8 + STEM + PIXELSHUFFLE)
+# 5. MẠNG CHÍNH (LITE V8 + HYBRID UPSAMPLE)
 # ==============================================================================
-class ULiteModel_PFCU_UAFM_V8_StemPS(nn.Module):
+class ULiteModel_V8_Hybrid(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
 
-        # 1. Khởi tạo bằng StemBlock (1/1 -> 1/2)
+        # 1. Stem Block (Hạ xuống 1/2)
         self.stem = StemBlock(in_c=3, out_c=16)
 
-        # 2. Encoder chạy trên các độ phân giải đã được nén
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk) # Input 1/2 -> Pool 1/4
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk) # Input 1/4 -> Pool 1/8
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk) # Input 1/8 -> Pool 1/16
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk) # Input 1/16 -> Pool 1/32
+        # 2. Encoder
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk) # Ra 1/4
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk) # Ra 1/8
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk) # Ra 1/16
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk) # Ra 1/32
 
-        # 3. Bottleneck ở tận đáy 1/32 (FOV cực khủng)
+        # 3. Bottleneck ở đáy 1/32
         self.b4 = BottleNeckBlock(256, max_dim=128)
 
-        # 4. Decoder với PixelShuffle
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk) # Lên 1/16
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk) # Lên 1/8
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk) # Lên 1/4
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk) # Lên 1/2
-
-        # 5. Khôi phục lại ảnh 1/1 bằng PixelShuffle lần cuối
-        self.final_up = SubPixelUpsample(16)
+        # 4. Decoder với HYBRID UPSAMPLING
+        # Tầng sâu: Bilinear (Tiết kiệm >300K tham số)
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, use_pixelshuffle=False) # Lên 1/16
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, use_pixelshuffle=False) # Lên 1/8
         
-        # 6. Đầu ra
+        # Tầng nông: PixelShuffle (Tốn cực ít tham số, khôi phục ranh giới)
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, use_pixelshuffle=True)  # Lên 1/4 (Tham số: 64*256 = ~16K)
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, use_pixelshuffle=True)  # Lên 1/2 (Tham số: 32*128 = ~4K)
+
+        # 5. Khôi phục lại ảnh 1/1 cuối cùng bằng PixelShuffle
+        self.final_up = SubPixelUpsample(16) # Tham số: 16*64 = 1K
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
-        x = self.stem(x)         # Hạ mẫu 1/2
+        x = self.stem(x)         
 
-        x, skip1 = self.e1(x)    # skip1: 1/2
-        x, skip2 = self.e2(x)    # skip2: 1/4
-        x, skip3 = self.e3(x)    # skip3: 1/8
-        x, skip4 = self.e4(x)    # skip4: 1/16
+        x, skip1 = self.e1(x)    
+        x, skip2 = self.e2(x)    
+        x, skip3 = self.e3(x)    
+        x, skip4 = self.e4(x)    
 
-        x = self.b4(x)           # Bottleneck ở 1/32
+        x = self.b4(x)           
 
-        x = self.d4(x, skip4)    # Giải mã về 1/16
-        x = self.d3(x, skip3)    # Giải mã về 1/8
-        x = self.d2(x, skip2)    # Giải mã về 1/4
-        x = self.d1(x, skip1)    # Giải mã về 1/2
+        x = self.d4(x, skip4)    
+        x = self.d3(x, skip3)    
+        x = self.d2(x, skip2)    
+        x = self.d1(x, skip1)    
 
-        x = self.final_up(x)     # Phóng to trả lại 1/1 sắc nét
+        x = self.final_up(x)     
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_PFCU_UAFM_V8_StemPS(num_classes=num_classes)
+    return ULiteModel_V8_Hybrid(num_classes=num_classes)
