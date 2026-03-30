@@ -68,7 +68,7 @@ class TinyUAFM(nn.Module):
         return out
 
 # ==============================================================================
-# 3. LÕI AXIAL-GE-DG BLOCK (TỐI ƯU HÓA DEPTHWISE GATHER)
+# 3. LÕI AXIAL-GE-DG BLOCK (GATHER-EXPANSION STYLE VỚI DEPTHWISE)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -96,14 +96,13 @@ class Axial_GE_DG(nn.Module):
         super().__init__()
         hid_dim = int(dim * exp_ratio)
         
-        # 1. GATHER ĐÃ TỐI ƯU (Depthwise Separable Convolution)
-        # Giảm số lượng tham số từ (dim*hid_dim*9) xuống còn (dim*9 + dim*hid_dim)
+        # 1. GATHER ĐÃ TỐI ƯU (Depthwise Separable thay vì Standard Conv)
         self.gather = nn.Sequential(
-            # Depthwise (Gom không gian)
+            # Depthwise Conv (Gom không gian - Cực nhẹ)
             nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.BatchNorm2d(dim),
             nn.PReLU(dim),
-            # Pointwise (Trộn kênh và mở rộng)
+            # Pointwise Conv (Trộn kênh và mở rộng)
             nn.Conv2d(dim, hid_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(hid_dim),
             nn.PReLU(hid_dim)
@@ -120,7 +119,7 @@ class Axial_GE_DG(nn.Module):
             nn.BatchNorm2d(dim)
         )
         
-        # 4. DG & Attention
+        # 4. Mỏ neo ranh giới & Attention
         self.dg_shortcut = DetailGuidance(dim)
         self.coord_att = CoordAtt(dim, dim)
         self.act = nn.PReLU(dim)
@@ -180,6 +179,8 @@ class ContextEmbeddingBlock(nn.Module):
             nn.BatchNorm2d(dim),
             nn.ReLU(inplace=True)
         )
+        
+        # Depthwise Conv siêu nhẹ cho Bottleneck
         self.conv3x3_dw = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.BatchNorm2d(dim),
@@ -216,9 +217,9 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (GE DW GATHER + DEEPLAB RATES + DW CE + AUX HEAD)
+# 5. MẠNG CHÍNH (GE DW GATHER + DEEPLAB RATES + DW CE BOTTLENECK)
 # ==============================================================================
-class ULiteModel_Final(nn.Module):
+class ULiteModel_GE(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
@@ -228,7 +229,7 @@ class ULiteModel_Final(nn.Module):
         # Encoder: DeepLab Rates
         self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
         self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12)) 
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
         self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
 
         # Bottleneck: Context Embedding siêu nhẹ
@@ -242,42 +243,22 @@ class ULiteModel_Final(nn.Module):
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
-        # NHÁNH PHỤ GIÁM SÁT SÂU (Chỉ chạy lúc Train)
-        # Nhận đầu vào từ skip3 (64 kênh)
-        self.aux_head = nn.Sequential(
-            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.PReLU(64),
-            nn.Conv2d(64, num_classes, kernel_size=1)
-        )
-
     def forward(self, x):
-        input_size = x.shape[2:] 
-        
         x = self.conv_in(x)
 
         x, skip1 = self.e1(x)
         x, skip2 = self.e2(x)
-        x, skip3 = self.e3(x) # Lấy skip3 (64 channels)
+        x, skip3 = self.e3(x)
         x, skip4 = self.e4(x)
 
-        main_feat = self.b4(x)
+        x = self.b4(x)
         
-        main_feat = self.d4(main_feat, skip4)
-        main_feat = self.d3(main_feat, skip3)
-        main_feat = self.d2(main_feat, skip2)
-        main_feat = self.d1(main_feat, skip1)
+        x = self.d4(x, skip4)
+        x = self.d3(x, skip3)
+        x = self.d2(x, skip2)
+        x = self.d1(x, skip1)
         
-        main_out = self.conv_out(main_feat)
-
-        # Trả về 2 nhánh nếu đang Train
-        if self.training:
-            aux_out = self.aux_head(skip3)
-            aux_out = F.interpolate(aux_out, size=input_size, mode='bilinear', align_corners=False)
-            return main_out, aux_out
-        
-        # Trả về 1 nhánh nếu Eval/Inference
-        return main_out
+        return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_Final(num_classes=num_classes)
+    return ULiteModel_GE(num_classes=num_classes)
