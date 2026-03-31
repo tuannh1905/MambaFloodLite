@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 1. ATTENTION MODULES & DUAL-UAFM (NÂNG CẤP)
+# 1. ATTENTION MODULES & DUAL-UAFM
 # ==============================================================================
 class CoordAtt(nn.Module):
     def __init__(self, inp, oup, reduction=32):
@@ -39,21 +39,20 @@ class CoordAtt(nn.Module):
 
 class DualUAFM(nn.Module):
     """
-    NÂNG CẤP 2: Dual-UAFM (~5K params)
-    Tích hợp Spatial Attention (Tìm vị trí) + Channel Attention (Nhận diện bản chất)
+    NÂNG CẤP: Cổng Lọc Kép (Spatial + Channel Attention)
     """
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
         self.reduce_up = nn.Conv2d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
         self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
         
-        # 1. Spatial Attention (Ranh giới ở đâu?)
+        # 1. Lọc ranh giới (Spatial Attention)
         self.spatial_att = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
             nn.Sigmoid()
         )
-        
-        # 2. Channel Attention (Đây là Nước hay Mái nhà?) - Ép cân kịch kim
+
+        # 2. Lọc ngữ nghĩa (Channel Attention)
         mip = max(8, out_c // 4)
         self.channel_att = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -70,22 +69,22 @@ class DualUAFM(nn.Module):
         if x_up.shape[2:] != x_skip.shape[2:]:
             x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
 
-        # Trích xuất gợi ý không gian
+        # Trích xuất đặc trưng không gian
         spatial_input = torch.cat([
             torch.mean(x_up, dim=1, keepdim=True), 
             torch.max(x_skip, dim=1, keepdim=True)[0]
         ], dim=1)
         
-        # Dung hợp có cổng theo Không gian
+        # Áp dụng Spatial Attention (Gated Fusion)
         alpha_s = self.spatial_att(spatial_input)
         out = x_up * alpha_s + x_skip * (1 - alpha_s)
-        
-        # Chốt chặn lọc nhiễu theo Kênh
+
+        # Áp dụng Channel Attention
         alpha_c = self.channel_att(out)
         return out * alpha_c
 
 # ==============================================================================
-# 2. LÕI AXIAL-GE-DG BLOCK (DS-GATHER BẢO TOÀN TỪ VÒNG TRƯỚC)
+# 2. LÕI AXIAL-GE-DG BLOCK (VỚI DS-GATHER)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -113,7 +112,7 @@ class Axial_GE_DG(nn.Module):
         super().__init__()
         hid_dim = int(dim * exp_ratio)
         
-        # DS-Gather giữ từ bản Recovery (Lọc thông thấp + Trộn kênh)
+        # GATHER (DS-Gather: DW 3x3 -> PW 1x1)
         self.gather = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.BatchNorm2d(dim),
@@ -151,7 +150,7 @@ class Axial_GE_DG(nn.Module):
         return self.coord_att(out)
 
 # ==============================================================================
-# 3. ENCODER, DECODER & MICRO-ASPP BOTTLENECK (NÂNG CẤP)
+# 3. ENCODER, DECODER & DW CONTEXT EMBEDDING BOTTLENECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
@@ -182,62 +181,27 @@ class EncoderBlock(nn.Module):
 
         return x, skip
 
-class MicroASPPBlock(nn.Module):
-    """
-    NÂNG CẤP 1: Micro-ASPP (~40K Params)
-    Dùng Depthwise Conv đa quy mô + Phép CỘNG (Add) để triệt tiêu tham số nén.
-    """
+class ContextEmbeddingBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        
-        # Nhánh 1: Dilation = 1 (Chi tiết cục bộ)
-        self.b1 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, dilation=1, groups=dim, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.PReLU(dim)
-        )
-        
-        # Nhánh 2: Dilation = 6 (Bối cảnh vừa)
-        self.b2 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=6, dilation=6, groups=dim, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.PReLU(dim)
-        )
-        
-        # Nhánh 3: Dilation = 12 (Bối cảnh lớn)
-        self.b3 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=12, dilation=12, groups=dim, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.PReLU(dim)
-        )
-        
-        # Nhánh 4: Global Context (Bối cảnh vô cực)
-        self.b4 = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.conv1x1 = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim),
-            nn.PReLU(dim)
+            nn.ReLU(inplace=True)
         )
-        
-        # Nén sau khi CỘNG (Mixer)
-        self.project = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
+        self.conv3x3_dw = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.BatchNorm2d(dim),
             nn.PReLU(dim)
         )
-        
         self.coord_att = CoordAtt(dim, dim)
 
     def forward(self, x):
-        feat1 = self.b1(x)
-        feat2 = self.b2(x)
-        feat3 = self.b3(x)
-        feat4 = F.interpolate(self.b4(x), size=x.shape[2:], mode='bilinear', align_corners=False)
-        
-        # CHIẾN THUẬT SIÊU NHẸ: CỘNG thay vì CAT
-        out = feat1 + feat2 + feat3 + feat4
-        
-        out = self.project(out)
+        global_context = self.gap(x)
+        global_context = self.conv1x1(global_context)
+        out = x + global_context
+        out = self.conv3x3_dw(out)
         return self.coord_att(out)
 
 class DecoderBlock(nn.Module):
@@ -246,7 +210,7 @@ class DecoderBlock(nn.Module):
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
-        # THAY THẾ BẰNG DUAL-UAFM
+        # ĐÃ THAY BẰNG DUAL-UAFM
         self.uafm = DualUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
@@ -263,25 +227,27 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 4. MẠNG CHÍNH (ULTIMATE: MICRO-ASPP + DUAL-UAFM)
+# 4. MẠNG CHÍNH (DS-GATHER + CAPPED 192 + WIDE DILATION + DUAL-UAFM)
 # ==============================================================================
-class ULiteModel_Ultimate(nn.Module):
+class ULiteModel_Recovery(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # Encoder: Giữ lại Dilation cực rộng ở e4
+        # Encoder
         self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
         self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
         self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
+        
+        # Tăng Dilation ở e4 lên (1, 12, 24) để bù đắp trường thụ cảm
         self.e4 = EncoderBlock(128, 192, mixer_kernel=mk, dilations=(1, 12, 24))
 
-        # Bottleneck: Nâng cấp lên Micro-ASPP đa quy mô
-        self.b4 = MicroASPPBlock(192)
+        # Bottleneck: Context Embedding trên 192 kênh
+        self.b4 = ContextEmbeddingBlock(192)
 
-        # Decoder: Đối xứng, dùng Dual-UAFM
+        # Decoder: Đối xứng Dilation
         self.d4 = DecoderBlock(192, 128, mixer_kernel=mk, dilations=(1, 12, 24))
         self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12))
         self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8))
@@ -307,4 +273,4 @@ class ULiteModel_Ultimate(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_Ultimate(num_classes=num_classes)
+    return ULiteModel_Recovery(num_classes=num_classes)
