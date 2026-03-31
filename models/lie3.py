@@ -217,7 +217,7 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (DS-GATHER + WIDE DILATION + MULTI-SCALE INJECTION)
+# 5. MẠNG CHÍNH (DS-GATHER + WIDE DILATION + MULTI-SCALE INJECTION) - ĐÃ FIX SIZE
 # ==============================================================================
 class ULiteModel_Injection(nn.Module):
     def __init__(self, num_classes=1):
@@ -235,21 +235,21 @@ class ULiteModel_Injection(nn.Module):
         # Bottleneck
         self.b4 = ContextEmbeddingBlock(192)
 
-        # NÂNG CẤP: Chuyển đổi màu sắc RGB (3 kênh) sang không gian đặc trưng (8 kênh) siêu rẻ
-        self.img_proj_16 = nn.Conv2d(3, 8, kernel_size=1, bias=False) # Cho d4 (1/16)
-        self.img_proj_8 = nn.Conv2d(3, 8, kernel_size=1, bias=False)  # Cho d3 (1/8)
-        self.img_proj_4 = nn.Conv2d(3, 8, kernel_size=1, bias=False)  # Cho d2 (1/4)
+        # NÂNG CẤP ĐÃ FIX: Chỉnh lại tỷ lệ cho khớp hoàn toàn với skip connections
+        self.img_proj_8 = nn.Conv2d(3, 8, kernel_size=1, bias=False)  # Cho d4 (Tỷ lệ 1/8)
+        self.img_proj_4 = nn.Conv2d(3, 8, kernel_size=1, bias=False)  # Cho d3 (Tỷ lệ 1/4)
+        self.img_proj_2 = nn.Conv2d(3, 8, kernel_size=1, bias=False)  # Cho d2 (Tỷ lệ 1/2)
         
-        self.avg_pool_16 = nn.AvgPool2d(16, stride=16)
         self.avg_pool_8 = nn.AvgPool2d(8, stride=8)
         self.avg_pool_4 = nn.AvgPool2d(4, stride=4)
+        self.avg_pool_2 = nn.AvgPool2d(2, stride=2)
 
         # Decoder: Có tham số inject_c=8 để đón nhận màu RGB đã thu nhỏ
         self.d4 = DecoderBlock(192, 128, mixer_kernel=mk, dilations=(1, 12, 24), inject_c=8)
         self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12), inject_c=8)
         self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8), inject_c=8)
         
-        # Tầng d1 cao nhất (1/2) bỏ qua tiêm ảnh vì ranh giới đã quá rõ
+        # Tầng d1 cao nhất (1/1) bỏ qua tiêm ảnh vì ranh giới đã quá rõ
         self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4), inject_c=0)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
@@ -266,14 +266,14 @@ class ULiteModel_Injection(nn.Module):
 
         x = self.b4(x)
         
-        # Bơm ảnh gốc vào Decoder (Hỗ trợ phân biệt màu đục của lũ lụt)
-        img_16 = self.img_proj_16(self.avg_pool_16(raw_img))
-        img_8 = self.img_proj_8(self.avg_pool_8(raw_img))
-        img_4 = self.img_proj_4(self.avg_pool_4(raw_img))
+        # Bơm ảnh gốc vào Decoder (Đã fix đúng kích thước)
+        img_8 = self.img_proj_8(self.avg_pool_8(raw_img)) # Khớp với skip4 (1/8)
+        img_4 = self.img_proj_4(self.avg_pool_4(raw_img)) # Khớp với skip3 (1/4)
+        img_2 = self.img_proj_2(self.avg_pool_2(raw_img)) # Khớp với skip2 (1/2)
         
-        x = self.d4(x, skip4, injected_img=img_16)
-        x = self.d3(x, skip3, injected_img=img_8)
-        x = self.d2(x, skip2, injected_img=img_4)
+        x = self.d4(x, skip4, injected_img=img_8)
+        x = self.d3(x, skip3, injected_img=img_4)
+        x = self.d2(x, skip2, injected_img=img_2)
         x = self.d1(x, skip1)
         
         return self.conv_out(x)
