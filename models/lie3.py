@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 1. ATTENTION MODULES & DUAL-UAFM
+# 1. ATTENTION MODULES (Chỉ giữ lại CoordAtt)
 # ==============================================================================
 class CoordAtt(nn.Module):
     def __init__(self, inp, oup, reduction=32):
@@ -37,28 +37,17 @@ class CoordAtt(nn.Module):
         
         return identity * a_w * a_h
 
-class DualUAFM(nn.Module):
-    """
-    NÂNG CẤP: Cổng Lọc Kép (Spatial + Channel Attention)
-    """
+# ==============================================================================
+# 2. TINY-UAFM (Dung hợp Decoder thuần Không gian)
+# ==============================================================================
+class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
         self.reduce_up = nn.Conv2d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
         self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
         
-        # 1. Lọc ranh giới (Spatial Attention)
         self.spatial_att = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
-            nn.Sigmoid()
-        )
-
-        # 2. Lọc ngữ nghĩa (Channel Attention)
-        mip = max(8, out_c // 4)
-        self.channel_att = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_c, mip, kernel_size=1, bias=False),
-            nn.PReLU(mip),
-            nn.Conv2d(mip, out_c, kernel_size=1, bias=False),
             nn.Sigmoid()
         )
 
@@ -69,22 +58,17 @@ class DualUAFM(nn.Module):
         if x_up.shape[2:] != x_skip.shape[2:]:
             x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
 
-        # Trích xuất đặc trưng không gian
         spatial_input = torch.cat([
             torch.mean(x_up, dim=1, keepdim=True), 
             torch.max(x_skip, dim=1, keepdim=True)[0]
         ], dim=1)
         
-        # Áp dụng Spatial Attention (Gated Fusion)
-        alpha_s = self.spatial_att(spatial_input)
-        out = x_up * alpha_s + x_skip * (1 - alpha_s)
-
-        # Áp dụng Channel Attention
-        alpha_c = self.channel_att(out)
-        return out * alpha_c
+        alpha = self.spatial_att(spatial_input)
+        out = x_up * alpha + x_skip * (1 - alpha)
+        return out
 
 # ==============================================================================
-# 2. LÕI AXIAL-GE-DG BLOCK (VỚI DS-GATHER)
+# 3. LÕI AXIAL-GE-DG BLOCK (VỚI DS-GATHER)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -150,7 +134,7 @@ class Axial_GE_DG(nn.Module):
         return self.coord_att(out)
 
 # ==============================================================================
-# 3. ENCODER, DECODER & DW CONTEXT EMBEDDING BOTTLENECK
+# 4. ENCODER, DECODER & DW CONTEXT EMBEDDING BOTTLENECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
@@ -205,31 +189,37 @@ class ContextEmbeddingBlock(nn.Module):
         return self.coord_att(out)
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
+    # NÂNG CẤP: Hỗ trợ tiêm ảnh gốc (img_injection)
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5), inject_c=0):
         super().__init__()
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
-        # ĐÃ THAY BẰNG DUAL-UAFM
-        self.uafm = DualUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
+        self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
-        self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
+        # Nếu có tiêm ảnh, kênh đầu vào của pw_down sẽ là out_c + inject_c
+        self.pw_down = nn.Conv2d(out_c + inject_c, gc, kernel_size=1, bias=False)
         self.ge_dg = Axial_GE_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
         self.pw_up = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         
         self.bn = nn.BatchNorm2d(out_c)
         self.act = nn.PReLU(out_c)
 
-    def forward(self, x, skip):
+    def forward(self, x, skip, injected_img=None):
         x = self.up(x)
         x = self.uafm(x, skip)
-        x = self.act(self.bn(self.pw_up(self.ge_dg(self.pw_down(x))) + x))
+        
+        # Bơm "màu gốc" vào luồng dữ liệu trước khi đi qua khối GE_DG
+        if injected_img is not None:
+            x = torch.cat([x, injected_img], dim=1)
+            
+        x = self.act(self.bn(self.pw_up(self.ge_dg(self.pw_down(x))) + (x[:, :self.pw_up.out_channels, :, :] if injected_img is not None else x)))
         return x
 
 # ==============================================================================
-# 4. MẠNG CHÍNH (DS-GATHER + CAPPED 192 + WIDE DILATION + DUAL-UAFM)
+# 5. MẠNG CHÍNH (DS-GATHER + WIDE DILATION + MULTI-SCALE INJECTION)
 # ==============================================================================
-class ULiteModel_Recovery(nn.Module):
+class ULiteModel_Injection(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
@@ -240,22 +230,33 @@ class ULiteModel_Recovery(nn.Module):
         self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
         self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
         self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
-        
-        # Tăng Dilation ở e4 lên (1, 12, 24) để bù đắp trường thụ cảm
         self.e4 = EncoderBlock(128, 192, mixer_kernel=mk, dilations=(1, 12, 24))
 
-        # Bottleneck: Context Embedding trên 192 kênh
+        # Bottleneck
         self.b4 = ContextEmbeddingBlock(192)
 
-        # Decoder: Đối xứng Dilation
-        self.d4 = DecoderBlock(192, 128, mixer_kernel=mk, dilations=(1, 12, 24))
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12))
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8))
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4))
+        # NÂNG CẤP: Chuyển đổi màu sắc RGB (3 kênh) sang không gian đặc trưng (8 kênh) siêu rẻ
+        self.img_proj_16 = nn.Conv2d(3, 8, kernel_size=1, bias=False) # Cho d4 (1/16)
+        self.img_proj_8 = nn.Conv2d(3, 8, kernel_size=1, bias=False)  # Cho d3 (1/8)
+        self.img_proj_4 = nn.Conv2d(3, 8, kernel_size=1, bias=False)  # Cho d2 (1/4)
+        
+        self.avg_pool_16 = nn.AvgPool2d(16, stride=16)
+        self.avg_pool_8 = nn.AvgPool2d(8, stride=8)
+        self.avg_pool_4 = nn.AvgPool2d(4, stride=4)
+
+        # Decoder: Có tham số inject_c=8 để đón nhận màu RGB đã thu nhỏ
+        self.d4 = DecoderBlock(192, 128, mixer_kernel=mk, dilations=(1, 12, 24), inject_c=8)
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12), inject_c=8)
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8), inject_c=8)
+        
+        # Tầng d1 cao nhất (1/2) bỏ qua tiêm ảnh vì ranh giới đã quá rõ
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4), inject_c=0)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
+        raw_img = x # Cất bức ảnh gốc (3 kênh) đi
+        
         x = self.conv_in(x)
 
         x, skip1 = self.e1(x)
@@ -265,12 +266,17 @@ class ULiteModel_Recovery(nn.Module):
 
         x = self.b4(x)
         
-        x = self.d4(x, skip4)
-        x = self.d3(x, skip3)
-        x = self.d2(x, skip2)
+        # Bơm ảnh gốc vào Decoder (Hỗ trợ phân biệt màu đục của lũ lụt)
+        img_16 = self.img_proj_16(self.avg_pool_16(raw_img))
+        img_8 = self.img_proj_8(self.avg_pool_8(raw_img))
+        img_4 = self.img_proj_4(self.avg_pool_4(raw_img))
+        
+        x = self.d4(x, skip4, injected_img=img_16)
+        x = self.d3(x, skip3, injected_img=img_8)
+        x = self.d2(x, skip2, injected_img=img_4)
         x = self.d1(x, skip1)
         
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_Recovery(num_classes=num_classes)
+    return ULiteModel_Injection(num_classes=num_classes)
