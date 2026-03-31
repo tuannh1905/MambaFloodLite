@@ -14,7 +14,7 @@ class CoordAtt(nn.Module):
         mip = max(8, inp // reduction)
         self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn1 = nn.BatchNorm2d(mip)
-        self.act = nn.PReLU(mip)
+        self.act = nn.PReLU(mip) # Tối ưu cho MCU
         
         self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0, bias=False)
         self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0, bias=False)
@@ -43,9 +43,11 @@ class CoordAtt(nn.Module):
 class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
+        # Căn chỉnh kênh trước khi dung hợp (Rất hữu ích khi in_c=192, out_c=128)
         self.reduce_up = nn.Conv2d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
         self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
         
+        # Lọc ranh giới (Spatial Attention)
         self.spatial_att = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
             nn.Sigmoid()
@@ -58,17 +60,20 @@ class TinyUAFM(nn.Module):
         if x_up.shape[2:] != x_skip.shape[2:]:
             x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
 
+        # Tạo mặt nạ lọc dựa trên Max(Skip) và Mean(Up)
         spatial_input = torch.cat([
             torch.mean(x_up, dim=1, keepdim=True), 
             torch.max(x_skip, dim=1, keepdim=True)[0]
         ], dim=1)
         
         alpha = self.spatial_att(spatial_input)
+        
+        # Gated Fusion (Hòa trộn chủ động)
         out = x_up * alpha + x_skip * (1 - alpha)
         return out
 
 # ==============================================================================
-# 3. LÕI AXIAL-GE-DG BLOCK (GATHER-EXPANSION STYLE)
+# 3. LÕI AXIAL-GE-DG BLOCK (GATHER 1x1 ĐÃ TỐI ƯU)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -94,27 +99,22 @@ class DetailGuidance(nn.Module):
 class Axial_GE_DG(nn.Module):
     def __init__(self, dim, mixer_kernel=(5, 5), dilations=(1, 2, 5), exp_ratio=1):
         super().__init__()
+        # Tính toán kênh mở rộng
         hid_dim = int(dim * exp_ratio)
         
-        # 1. GATHER (ĐÃ ÉP CÂN: Depthwise Separable Conv chuẩn)
+        # 1. GATHER (TỐI ƯU HÓA: Dùng 1x1 Conv để trộn kênh, chém bay 88% tham số)
         self.gather = nn.Sequential(
-            # Bước 1: Trộn kênh (1x1 Conv) - Rất nhẹ
-            nn.Conv2d(dim, hid_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(hid_dim),
-            nn.PReLU(hid_dim),
-            
-            # Bước 2: Gom không gian (3x3 Depthwise Conv) - Thêm groups=hid_dim
-            nn.Conv2d(hid_dim, hid_dim, kernel_size=3, padding=1, groups=hid_dim, bias=False),
+            nn.Conv2d(dim, hid_dim, kernel_size=1, bias=False), # kernel=1, bỏ padding
             nn.BatchNorm2d(hid_dim),
             nn.PReLU(hid_dim)
         )
         
-        # 2. AXIAL DEPTHWISE
+        # 2. AXIAL DEPTHWISE (Xử lý đa bối cảnh không gian trên các kênh đã gom)
         self.branch_r1 = AxialDW(hid_dim, mixer_kernel, dilation=dilations[0])
         self.branch_r2 = AxialDW(hid_dim, mixer_kernel, dilation=dilations[1])
         self.branch_r5 = AxialDW(hid_dim, mixer_kernel, dilation=dilations[2])
         
-        # 3. PROJECT
+        # 3. PROJECT (Nén đặc trưng lại bằng 1x1)
         self.project = nn.Sequential(
             nn.Conv2d(hid_dim, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim)
@@ -126,14 +126,18 @@ class Axial_GE_DG(nn.Module):
         self.act = nn.PReLU(dim)
 
     def forward(self, x):
+        # Bước 1: Gom cục bộ (Chỉ trộn kênh)
         x_gather = self.gather(x)
         
+        # Bước 2: Dilation đa quy mô (Gom không gian)
         b1 = self.branch_r1(x_gather)
         b2 = self.branch_r2(x_gather)
         b5 = self.branch_r5(x_gather)
         
+        # Bước 3: Cộng các nhánh và Nén
         fused_context = self.project(b1 + b2 + b5)
         
+        # Bước 4: Cộng hướng dẫn ranh giới và đưa qua Attention
         guided_details = self.dg_shortcut(x)
         out = self.act(fused_context + guided_details)
         
@@ -174,6 +178,7 @@ class EncoderBlock(nn.Module):
 class ContextEmbeddingBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        # 1. Global Context
         self.gap = nn.AdaptiveAvgPool2d(1)
         self.conv1x1 = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=1, bias=False),
@@ -181,11 +186,14 @@ class ContextEmbeddingBlock(nn.Module):
             nn.ReLU(inplace=True)
         )
         
+        # 2. Depthwise Conv siêu nhẹ
         self.conv3x3_dw = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
             nn.BatchNorm2d(dim),
             nn.PReLU(dim)
         )
+        
+        # Giữ lại CoordAtt ở đáy mạng để định hướng cực mạnh
         self.coord_att = CoordAtt(dim, dim)
 
     def forward(self, x):
@@ -217,9 +225,9 @@ class DecoderBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (GE DW GATHER + DEEPLAB RATES + DW CE BOTTLENECK)
+# 5. MẠNG CHÍNH (GE 1x1 + DEEPLAB RATES + DW CE BOTTLENECK + CHỈ 192 KÊNH ĐÁY)
 # ==============================================================================
-class ULiteModel_GE(nn.Module):
+class ULiteModel_GE_Capped(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
@@ -230,13 +238,15 @@ class ULiteModel_GE(nn.Module):
         self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
         self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
         self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
+        
+        # ---> CHẶN TRẦN KÊNH TẠI ĐÂY: Thay vì 256, chỉ dùng 192 kênh <---
+        self.e4 = EncoderBlock(128, 192, mixer_kernel=mk, dilations=(1, 8, 16))
 
-        # Bottleneck: Context Embedding siêu nhẹ
-        self.b4 = ContextEmbeddingBlock(256)
+        # Bottleneck: Context Embedding hoạt động trên 192 kênh
+        self.b4 = ContextEmbeddingBlock(192)
 
-        # Decoder: Đối xứng
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 8, 16))
+        # Decoder: Đối xứng, thu hồi từ 192 -> 128 -> 64 -> 32 -> 16
+        self.d4 = DecoderBlock(192, 128, mixer_kernel=mk, dilations=(1, 8, 16))
         self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12))
         self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8))
         self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4))
@@ -261,4 +271,4 @@ class ULiteModel_GE(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1):
-    return ULiteModel_GE(num_classes=num_classes)
+    return ULiteModel_GE_Capped(num_classes=num_classes)
