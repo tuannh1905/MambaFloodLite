@@ -50,7 +50,7 @@ class ECAModule(nn.Module):
         return x * self.sigmoid(y).expand_as(x)
 
 # ==============================================================================
-# 2. TINY-UAFM (Dung hợp Decoder thô sơ)
+# 2. TINY-UAFM & INVERTED RESIDUAL
 # ==============================================================================
 class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
@@ -80,8 +80,29 @@ class TinyUAFM(nn.Module):
         out = x_up * alpha + x_skip * (1 - alpha)
         return self.eca(out)
 
+class InvertedResidual(nn.Module):
+    """Khối phục hồi siêu tốc (Bỏ Dilation) dành cho is_shallow=True"""
+    def __init__(self, dim, exp_ratio=2):
+        super().__init__()
+        hid_dim = dim * exp_ratio
+        
+        self.conv = nn.Sequential(
+            nn.Conv2d(dim, hid_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hid_dim),
+            nn.PReLU(hid_dim),
+            nn.Conv2d(hid_dim, hid_dim, kernel_size=3, padding=1, groups=hid_dim, bias=False),
+            nn.BatchNorm2d(hid_dim),
+            nn.PReLU(hid_dim),
+            nn.Conv2d(hid_dim, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim)
+        )
+        self.act = nn.PReLU(dim)
+
+    def forward(self, x):
+        return self.act(x + self.conv(x))
+
 # ==============================================================================
-# 3. AXIAL-PFCU-DG BLOCK (CẢI TIẾN PRE-MIX)
+# 3. AXIAL-PFCU-DG BLOCK (Cập nhật Dilation Động)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -107,15 +128,7 @@ class DetailGuidance(nn.Module):
 class Axial_PFCU_DG(nn.Module):
     def __init__(self, dim, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
         super().__init__()
-        
-        # CẢI TIẾN 1: Lớp Pre-mix 1x1 chống mù kênh
-        self.pre_mix = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.PReLU(dim)
-        )
-        
-        # CẢI TIẾN 2: Nhận bộ Dilations động từ ngoài truyền vào
+        # Truyền tuple dilations động vào 3 nhánh
         self.branch_r1 = AxialDW(dim, mixer_kernel, dilation=dilations[0])
         self.branch_r2 = AxialDW(dim, mixer_kernel, dilation=dilations[1])
         self.branch_r5 = AxialDW(dim, mixer_kernel, dilation=dilations[2])
@@ -125,26 +138,21 @@ class Axial_PFCU_DG(nn.Module):
         
         self.dg_shortcut = DetailGuidance(dim)
         self.coord_att = CoordAtt(dim, dim)
-        self.act = nn.PReLU(dim)
+        self.act = nn.PReLU(dim) 
 
     def forward(self, x):
-        # Trộn kênh trước khi vào AxialDW
-        x_mixed = self.pre_mix(x)
-        
-        b1 = self.branch_r1(x_mixed)
-        b2 = self.branch_r2(x_mixed)
-        b5 = self.branch_r5(x_mixed)
+        b1 = self.branch_r1(x)
+        b2 = self.branch_r2(x)
+        b5 = self.branch_r5(x)
         
         fused_context = self.bn_fuse(self.pw_fuse(b1 + b2 + b5))
-        
-        # Detail Guidance vẫn lấy trực tiếp từ x thô ban đầu để giữ ranh giới sắc nét
         guided_details = self.dg_shortcut(x)
         
         out = self.act(fused_context + guided_details)
         return self.coord_att(out)
 
 # ==============================================================================
-# 4. ENCODER, DECODER & BOTTLENECK (CẢI TIẾN LIGHT-CAT)
+# 4. ENCODER, DECODER & BOTTLENECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
@@ -152,6 +160,7 @@ class EncoderBlock(nn.Module):
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
+        # Hỗ trợ Dilation Động
         self.pfcu_dg   = Axial_PFCU_DG(in_c, mixer_kernel=mixer_kernel, dilations=dilations)
         self.bn        = nn.BatchNorm2d(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
@@ -176,17 +185,13 @@ class EncoderBlock(nn.Module):
         return x, skip
 
 class BottleNeckBlock(nn.Module):
-    # CẢI TIẾN 3: max_dim hạ xuống 64 để chống phình to
-    def __init__(self, dim, max_dim=64):
+    def __init__(self, dim, max_dim=128):
         super().__init__()
-        hid = min(dim // 4, max_dim)
+        hid = min(dim // 4, max_dim // 4)
         
         self.pool1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
         self.pool2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
         self.pool4 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
-        
-        # Bổ sung Dropout2d chống overfitting cực mạnh khi đổi seed
-        self.dropout = nn.Dropout2d(0.1)
         
         self.spp_fuse = nn.Sequential(
             nn.Conv2d(dim + hid * 3, dim, kernel_size=1, bias=False),
@@ -204,15 +209,13 @@ class BottleNeckBlock(nn.Module):
         x2 = F.interpolate(self.pool2(x), size, mode='bilinear', align_corners=False)
         x4 = F.interpolate(self.pool4(x), size, mode='bilinear', align_corners=False)
         
-        # Gộp kênh (Cat) và đánh rớt ngẫu nhiên bằng Dropout
-        cat_feat = torch.cat([x, x1, x2, x4], dim=1)
-        spp_fused = self.spp_fuse(self.dropout(cat_feat))
+        spp_fused = self.spp_fuse(torch.cat([x, x1, x2, x4], dim=1))
         
         out = self.bn_refine(self.axial_refine(spp_fused))
         return self.coord_att(out + spp_fused)
 
 class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
+    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5), is_shallow=False):
         super().__init__()
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
@@ -220,7 +223,13 @@ class DecoderBlock(nn.Module):
         self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
-        self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
+        
+        # Bất đối xứng: Chọn khối theo cờ is_shallow
+        if is_shallow:
+            self.core_block = InvertedResidual(gc, exp_ratio=2)
+        else:
+            self.core_block = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
+            
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         
         self.bn  = nn.BatchNorm2d(out_c)
@@ -229,11 +238,11 @@ class DecoderBlock(nn.Module):
     def forward(self, x, skip):
         x = self.up(x)
         x = self.uafm(x, skip)
-        x = self.act(self.bn(self.pw_up(self.pfcu_dg(self.pw_down(x))) + x))
+        x = self.act(self.bn(self.pw_up(self.core_block(self.pw_down(x))) + x))
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (CẢI TIẾN DILATION ĐỘNG)
+# 5. MẠNG CHÍNH (TELESCOPE ENCODER + MAGNIFIER DECODER)
 # ==============================================================================
 class ULiteModel_PFCU_UAFM(nn.Module):
     def __init__(self, num_classes=1):
@@ -242,19 +251,22 @@ class ULiteModel_PFCU_UAFM(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # CẢI TIẾN 2: Dilation Động cho Encoder (Nhìn xa)
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 3, 5))
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 3, 5))
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 4, 8))
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 4, 8))
+        # ENCODER: "Kính viễn vọng" (Tăng dần Dilation để bao quát bối cảnh)
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
 
-        self.b4 = BottleNeckBlock(256, max_dim=64)
+        self.b4 = BottleNeckBlock(256, max_dim=128)
 
-        # CẢI TIẾN 2: Dilation Động cho Decoder (Vẽ nét)
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 2, 3))
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 2, 3))
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 1, 2))
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 1, 2))
+        # DECODER: "Kính lúp" (Thu hẹp Dilation, triệt tiêu Dilation ở tầng nông)
+        # d4, d3: Vẫn giữ lại chút bối cảnh cục bộ
+        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 2, 3), is_shallow=False)
+        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 2, 3), is_shallow=False)
+        
+        # d2, d1: Triệt tiêu Dilation, dồn lực phục hồi pixel (is_shallow=True)
+        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 1, 1), is_shallow=True)
+        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 1, 1), is_shallow=True)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
