@@ -259,9 +259,14 @@ class BiSeNetV2(nn.Module):
         feat_head = self.bga(feat_d, feat_s)
         logits = self.head(feat_head)
 
-        # Trả về chỉ logits chính nếu không phải train để khớp với trainer.py
-        if self.aux_mode == 'train':
-            return logits # Có thể mở rộng trả về tuple nếu trainer hỗ trợ Aux Loss
+        # Trả về tuple 5 tensor khi train để trainer tính Loss Aux
+        if self.training and self.aux_mode == 'train':
+            logits_aux2 = self.aux2(feat2)
+            logits_aux3 = self.aux3(feat3)
+            logits_aux4 = self.aux4(feat4)
+            logits_aux5_4 = self.aux5_4(feat5_4)
+            return logits, logits_aux2, logits_aux3, logits_aux4, logits_aux5_4
+            
         return logits
 
     def init_weights(self):
@@ -285,6 +290,5 @@ class BiSeNetV2(nn.Module):
                 child.load_state_dict(state[name], strict=True)
 
 def build_model(num_classes=1):
-    # Luôn khởi tạo ở chế độ 'eval' để output trả về tensor duy nhất 
-    # (Trừ khi bạn muốn viết thêm logic cho Auxiliary Loss trong trainer.py)
-    return BiSeNetV2(n_classes=num_classes, aux_mode='eval')
+    # Khởi tạo với aux_mode='train' để tương thích với trainer
+    return BiSeNetV2(n_classes=num_classes, aux_mode='train')

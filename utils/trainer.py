@@ -120,21 +120,16 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             
             outputs = model(images)
             
-            # Xử lý khi mô hình trả về 2 nhánh (Main và Aux)
-            if isinstance(outputs, tuple) and len(outputs) == 2:
-                main_out, aux_out = outputs
+            # Xử lý thông minh: Chấp nhận mọi mô hình có từ 1 đến N nhánh Aux
+            if isinstance(outputs, tuple):
+                # 1. Nhánh chính luôn nằm ở index 0
+                loss = criterion(outputs[0], masks)
                 
-                # 1. Tính Loss cho nhánh chính
-                loss_main = criterion(main_out, masks)
-                
-                # 2. Tính Loss cho nhánh giám sát sâu (Auxiliary Head)
-                # Lưu ý: Aux dự đoán trực tiếp masks, KHÔNG dự đoán edge
-                loss_aux = criterion(aux_out, masks)
-                
-                # 3. Tổng hợp Loss (Trọng số 0.4 là tiêu chuẩn vàng của BiSeNet/PSPNet)
-                loss = loss_main + 0.4 * loss_aux
+                # 2. Duyệt qua tất cả các nhánh Aux còn lại và cộng dồn Loss (trọng số 0.4)
+                for aux_out in outputs[1:]:
+                    loss += 0.4 * criterion(aux_out, masks)
             else:
-                # Fallback cho các mô hình bình thường (không có Aux)
+                # Fallback cho các mô hình bình thường không có nhánh Aux
                 loss = criterion(outputs, masks)
             
             loss.backward()
