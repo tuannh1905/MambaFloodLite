@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 1. ATTENTION MODULES (Chỉ giữ lại CoordAtt)
+# 1. ATTENTION MODULES (CoordAtt & ECA)
 # ==============================================================================
 class CoordAtt(nn.Module):
     def __init__(self, inp, oup, reduction=32):
@@ -37,19 +37,36 @@ class CoordAtt(nn.Module):
         
         return identity * a_w * a_h
 
+class ECAModule(nn.Module):
+    def __init__(self, channels, k_size=3):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+        return x * self.sigmoid(y).expand_as(x)
+
 # ==============================================================================
-# 2. TINY-UAFM (Dung hợp Decoder - Thuần túy Không gian)
+# 2. TINY-UAFM (Thay thế torch.cat thô sơ trong Decoder)
 # ==============================================================================
 class TinyUAFM(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
+        # Căn chỉnh kênh trước khi dung hợp
         self.reduce_up = nn.Conv2d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
         self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
         
+        # Lọc ranh giới (Spatial Attention)
         self.spatial_att = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
             nn.Sigmoid()
         )
+        
+        # Tinh chọn kênh (Channel Attention)
+        self.eca = ECAModule(out_c)
 
     def forward(self, x_up, x_skip):
         x_up = self.reduce_up(x_up)
@@ -58,17 +75,20 @@ class TinyUAFM(nn.Module):
         if x_up.shape[2:] != x_skip.shape[2:]:
             x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
 
+        # Tạo mặt nạ lọc dựa trên Max(Skip) và Mean(Up)
         spatial_input = torch.cat([
             torch.mean(x_up, dim=1, keepdim=True), 
             torch.max(x_skip, dim=1, keepdim=True)[0]
         ], dim=1)
         
         alpha = self.spatial_att(spatial_input)
+        
+        # Gated Fusion (Hòa trộn chủ động)
         out = x_up * alpha + x_skip * (1 - alpha)
-        return out
+        return self.eca(out)
 
 # ==============================================================================
-# 3. LÕI AXIAL-PFCU-DG BLOCK
+# 3. AXIAL-PFCU-DG BLOCK (Khối đặc trưng lõi)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -94,6 +114,7 @@ class DetailGuidance(nn.Module):
 class Axial_PFCU_DG(nn.Module):
     def __init__(self, dim, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
         super().__init__()
+        # Truyền tuple dilations động từ ngoài vào
         self.branch_r1 = AxialDW(dim, mixer_kernel, dilation=dilations[0])
         self.branch_r2 = AxialDW(dim, mixer_kernel, dilation=dilations[1])
         self.branch_r5 = AxialDW(dim, mixer_kernel, dilation=dilations[2])
@@ -103,7 +124,7 @@ class Axial_PFCU_DG(nn.Module):
         
         self.dg_shortcut = DetailGuidance(dim)
         self.coord_att = CoordAtt(dim, dim)
-        self.act = nn.PReLU(dim) 
+        self.act = nn.PReLU(dim) # MCU optimized
 
     def forward(self, x):
         b1 = self.branch_r1(x)
@@ -117,7 +138,7 @@ class Axial_PFCU_DG(nn.Module):
         return self.coord_att(out)
 
 # ==============================================================================
-# 4. ENCODER, DECODER & DW CONTEXT EMBEDDING BOTTLENECK
+# 4. ENCODER, DECODER & BOTTLENECK (SPP-Axial)
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
@@ -148,38 +169,36 @@ class EncoderBlock(nn.Module):
 
         return x, skip
 
-class ContextEmbeddingBlock(nn.Module):
-    def __init__(self, dim):
+class BottleNeckBlock(nn.Module):
+    def __init__(self, dim, max_dim=128):
         super().__init__()
-        # 1. Global Context
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.conv1x1 = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.ReLU(inplace=True)
-        )
+        hid = min(dim // 4, max_dim // 4)
         
-        # 2. ĐÃ FIX LỖI THAM SỐ KHỔNG LỒ: Dùng Depthwise Convolution (groups=dim)
-        self.conv3x3_dw = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False),
+        # SPP Gom bối cảnh 3 mức
+        self.pool1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
+        self.pool2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
+        self.pool4 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.PReLU(hid))
+        
+        self.spp_fuse = nn.Sequential(
+            nn.Conv2d(dim + hid * 3, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim),
             nn.PReLU(dim)
         )
         
-        # Giữ lại CoordAtt ở đáy mạng để định hướng cực mạnh
+        self.axial_refine = AxialDW(dim, mixer_kernel=(5, 5), dilation=1)
+        self.bn_refine = nn.BatchNorm2d(dim)
         self.coord_att = CoordAtt(dim, dim)
 
     def forward(self, x):
-        # Lấy bối cảnh toàn cục (FOV vô cực)
-        global_context = self.gap(x)
-        global_context = self.conv1x1(global_context)
+        size = x.size()[2:]
+        x1 = F.interpolate(self.pool1(x), size, mode='bilinear', align_corners=False)
+        x2 = F.interpolate(self.pool2(x), size, mode='bilinear', align_corners=False)
+        x4 = F.interpolate(self.pool4(x), size, mode='bilinear', align_corners=False)
         
-        # Broadcast bối cảnh toàn cục vào đặc trưng cục bộ (Phép cộng)
-        out = x + global_context
+        spp_fused = self.spp_fuse(torch.cat([x, x1, x2, x4], dim=1))
         
-        # Làm mượt (siêu nhẹ) và tập trung Attention
-        out = self.conv3x3_dw(out)
-        return self.coord_att(out)
+        out = self.bn_refine(self.axial_refine(spp_fused))
+        return self.coord_att(out + spp_fused)
 
 class DecoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
@@ -187,6 +206,7 @@ class DecoderBlock(nn.Module):
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
+        # SỬ DỤNG TINY-UAFM ĐỂ HÒA TRỘN THÔNG MINH
         self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
@@ -198,12 +218,14 @@ class DecoderBlock(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
+        # Dung hợp có cổng kiểm soát (Gated-Attention Fusion)
         x = self.uafm(x, skip)
+        # Tinh chỉnh ranh giới
         x = self.act(self.bn(self.pw_up(self.pfcu_dg(self.pw_down(x))) + x))
         return x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (LITE V8 + DEEPLAB RATES + DW CONTEXT EMBEDDING)
+# 5. MẠNG CHÍNH (ULITE-PFCU-UAFM)
 # ==============================================================================
 class ULiteModel_PFCU_UAFM(nn.Module):
     def __init__(self, num_classes=1):
@@ -212,21 +234,21 @@ class ULiteModel_PFCU_UAFM(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # Áp dụng bộ Rate DeepLab Style: (1,2,4) -> (1,4,8) -> (1,6,12) -> (1,8,16)
+        # Encoder: Dilation mở rộng dần (1,2,4) -> (1,4,8) -> (1,6,12) -> (1,8,16)
         self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 4))
         self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 4, 8))
         self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
         self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
 
-        # Sử dụng DW Context Embedding Block thay cho SPP
-        self.b4 = ContextEmbeddingBlock(256)
+        self.b4 = BottleNeckBlock(256, max_dim=128)
 
-        # Decoder đi ngược lại theo đúng thiết kế đối xứng
+        # Decoder: Đối xứng Dilation để thu hồi dần ranh giới
         self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 8, 16))
         self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 6, 12))
         self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 4, 8))
         self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, dilations=(1, 2, 4))
 
+        # Raw Logits (Tương thích BCEDiceLoss)
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
