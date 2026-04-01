@@ -14,7 +14,7 @@ class CoordAtt(nn.Module):
         mip = max(8, inp // reduction)
         self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn1 = nn.BatchNorm2d(mip)
-        self.act = nn.PReLU(mip) # Tối ưu cho MCU
+        self.act = nn.PReLU(mip)
         
         self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0, bias=False)
         self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0, bias=False)
@@ -81,9 +81,6 @@ class TinyUAFM(nn.Module):
         return self.eca(out)
 
 class AuxHead(nn.Module):
-    """
-    Nhánh giám sát phụ siêu nhẹ (Deep Supervision).
-    """
     def __init__(self, in_chan, num_classes):
         super().__init__()
         self.head = nn.Sequential(
@@ -102,7 +99,7 @@ class AuxHead(nn.Module):
         return F.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
 
 # ==============================================================================
-# 3. AXIAL-PFCU-DG BLOCK (Khối đặc trưng lõi)
+# 3. AXIAL-PFCU-DG BLOCK
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -151,7 +148,7 @@ class Axial_PFCU_DG(nn.Module):
         return self.coord_att(out)
 
 # ==============================================================================
-# 4. ENCODER, DECODER & BOTTLENECK (SPP-Axial)
+# 4. ENCODER, DECODER & BOTTLENECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5), dilations=(1, 2, 5)):
@@ -218,7 +215,8 @@ class DecoderBlock(nn.Module):
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
-        self.uafm = TinyUAFM(in_c=in_c, skip_c=in_c, out_c=out_c)
+        # ✓ SỬA LỖI Ở ĐÂY: skip_c = out_c để mạng hiểu đúng số kênh của nhánh skip
+        self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
@@ -244,19 +242,17 @@ class ULiteModel_PFCU_UAFM(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # Cố định toàn bộ Dilation rate về (1, 2, 5)
         self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk, dilations=(1, 2, 5))
         self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk, dilations=(1, 2, 5))
         self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 2, 5))
         self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 2, 5))
 
         if self.aux_mode == 'train':
-            self.aux3 = AuxHead(64, num_classes)
-            self.aux4 = AuxHead(128, num_classes)
+            self.aux3 = AuxHead(64, num_classes)   # skip3 có 64 kênh
+            self.aux4 = AuxHead(128, num_classes)  # skip4 có 128 kênh
 
         self.b4 = BottleNeckBlock(256, max_dim=128)
 
-        # Cố định toàn bộ Dilation rate về (1, 2, 5)
         self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, dilations=(1, 2, 5))
         self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, dilations=(1, 2, 5))
         self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, dilations=(1, 2, 5))
