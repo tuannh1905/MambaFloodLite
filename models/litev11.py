@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 1. ATTENTION MODULES & TINY-UAFM
+# 1. ATTENTION MODULES
 # ==============================================================================
 class CoordAtt(nn.Module):
     def __init__(self, inp, oup, reduction=32):
@@ -14,7 +14,7 @@ class CoordAtt(nn.Module):
         mip = max(8, inp // reduction)
         self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn1 = nn.BatchNorm2d(mip)
-        self.act = nn.PReLU(mip) 
+        self.act = nn.PReLU(mip)
         
         self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0, bias=False)
         self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0, bias=False)
@@ -37,48 +37,8 @@ class CoordAtt(nn.Module):
         
         return identity * a_w * a_h
 
-class ECAModule(nn.Module):
-    def __init__(self, channels, k_size=3):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        y = self.avg_pool(x)
-        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        return x * self.sigmoid(y).expand_as(x)
-
-class TinyUAFM(nn.Module):
-    def __init__(self, in_c, skip_c, out_c):
-        super().__init__()
-        self.reduce_up = nn.Conv2d(in_c, out_c, 1, bias=False) if in_c != out_c else nn.Identity()
-        self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
-        
-        self.spatial_att = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False),
-            nn.Sigmoid()
-        )
-        self.eca = ECAModule(out_c)
-
-    def forward(self, x_up, x_skip):
-        x_up = self.reduce_up(x_up)
-        x_skip = self.reduce_skip(x_skip)
-
-        if x_up.shape[2:] != x_skip.shape[2:]:
-            x_up = F.interpolate(x_up, size=x_skip.shape[2:], mode='bilinear', align_corners=False)
-
-        spatial_input = torch.cat([
-            torch.mean(x_up, dim=1, keepdim=True), 
-            torch.max(x_skip, dim=1, keepdim=True)[0]
-        ], dim=1)
-        
-        alpha = self.spatial_att(spatial_input)
-        out = x_up * alpha + x_skip * (1 - alpha)
-        return self.eca(out)
-
 # ==============================================================================
-# 2. KHỐI ĐẶC TRƯNG LÕI (ĐÃ NÂNG CẤP PRE-MIX)
+# 2. LÕI AXIAL-PFCU-DG BLOCK (Cho nhánh Semantic)
 # ==============================================================================
 class AxialDW(nn.Module):
     def __init__(self, dim, mixer_kernel, dilation=1):
@@ -102,19 +62,8 @@ class DetailGuidance(nn.Module):
         return self.bn(x + edges)
 
 class Axial_PFCU_DG(nn.Module):
-    """
-    PHASE 3: "Pre-mix" - Trộn kênh bằng 1x1 trước khi đưa vào 3 nhánh AxialDW
-    """
     def __init__(self, dim, mixer_kernel=(5, 5)):
         super().__init__()
-        
-        # Lớp Pre-mix siêu mỏng (Pointwise 1x1)
-        self.pre_mix = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.PReLU(dim)
-        )
-        
         self.branch_r1 = AxialDW(dim, mixer_kernel, dilation=1)
         self.branch_r2 = AxialDW(dim, mixer_kernel, dilation=2)
         self.branch_r5 = AxialDW(dim, mixer_kernel, dilation=5)
@@ -124,15 +73,12 @@ class Axial_PFCU_DG(nn.Module):
         
         self.dg_shortcut = DetailGuidance(dim)
         self.coord_att = CoordAtt(dim, dim)
-        self.act = nn.PReLU(dim) 
+        self.act = nn.PReLU(dim)
 
     def forward(self, x):
-        # Trộn kênh trước
-        x_mixed = self.pre_mix(x)
-        
-        b1 = self.branch_r1(x_mixed)
-        b2 = self.branch_r2(x_mixed)
-        b5 = self.branch_r5(x_mixed)
+        b1 = self.branch_r1(x)
+        b2 = self.branch_r2(x)
+        b5 = self.branch_r5(x)
         
         fused_context = self.bn_fuse(self.pw_fuse(b1 + b2 + b5))
         guided_details = self.dg_shortcut(x)
@@ -140,39 +86,6 @@ class Axial_PFCU_DG(nn.Module):
         out = self.act(fused_context + guided_details)
         return self.coord_att(out)
 
-# ==============================================================================
-# 3. KHỐI INVERTED RESIDUAL (CHO DECODER BẤT ĐỐI XỨNG)
-# ==============================================================================
-class InvertedResidual(nn.Module):
-    """
-    PHASE 2: Khối siêu nhẹ dùng cho d1, d2 (Bỏ Dilation). 
-    Expansion Ratio = 2 để ép cân.
-    """
-    def __init__(self, dim, exp_ratio=2):
-        super().__init__()
-        hid_dim = dim * exp_ratio
-        
-        self.conv = nn.Sequential(
-            # Mở rộng (1x1)
-            nn.Conv2d(dim, hid_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(hid_dim),
-            nn.PReLU(hid_dim),
-            # Chiều sâu (3x3 Không gian cục bộ - Không Dilation)
-            nn.Conv2d(hid_dim, hid_dim, kernel_size=3, padding=1, groups=hid_dim, bias=False),
-            nn.BatchNorm2d(hid_dim),
-            nn.PReLU(hid_dim),
-            # Thu hồi (1x1)
-            nn.Conv2d(hid_dim, dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim)
-        )
-        self.act = nn.PReLU(dim)
-
-    def forward(self, x):
-        return self.act(x + self.conv(x))
-
-# ==============================================================================
-# 4. ENCODER, BẤT ĐỐI XỨNG DECODER & ADDITIVE BOTTLENECK
-# ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5)):
         super().__init__()
@@ -199,23 +112,16 @@ class EncoderBlock(nn.Module):
         else:
             conv = self.down_pw(self.pw(skip))
             x    = self.act(self.bn2(torch.cat([pool, conv], dim=1)))
-
-        return x, skip
+        return x
 
 class AdditiveBottleNeck(nn.Module):
-    """
-    PHASE 1: Additive SPP (~30K Params)
-    Dùng phép CỘNG (Add) để triệt tiêu ma trận nối kênh khổng lồ.
-    """
+    """Giữ nguyên Bottleneck nhưng dùng cơ chế Cộng (Additive) siêu nhẹ"""
     def __init__(self, dim):
         super().__init__()
-        
-        # Ép về thẳng dim (256) ngay tại các nhánh Pooling
         self.pool1 = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(dim, dim, 1, bias=False), nn.BatchNorm2d(dim), nn.PReLU(dim))
         self.pool2 = nn.Sequential(nn.AdaptiveAvgPool2d(2), nn.Conv2d(dim, dim, 1, bias=False), nn.BatchNorm2d(dim), nn.PReLU(dim))
         self.pool4 = nn.Sequential(nn.AdaptiveAvgPool2d(4), nn.Conv2d(dim, dim, 1, bias=False), nn.BatchNorm2d(dim), nn.PReLU(dim))
         
-        # Thay vì nén 448->256, ta chỉ cần hòa trộn nhẹ nhàng 256->256 sau khi CỘNG
         self.spp_fuse = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim),
@@ -232,87 +138,146 @@ class AdditiveBottleNeck(nn.Module):
         x2 = F.interpolate(self.pool2(x), size, mode='bilinear', align_corners=False)
         x4 = F.interpolate(self.pool4(x), size, mode='bilinear', align_corners=False)
         
-        # CỘNG thay vì CAT
+        # Additive SPP
         spp_fused = self.spp_fuse(x + x1 + x2 + x4)
         
         out = self.bn_refine(self.axial_refine(spp_fused))
         return self.coord_att(out + spp_fused)
 
-class DecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, mixer_kernel=(5, 5), is_shallow=False):
+# ==============================================================================
+# 3. NHÁNH CHI TIẾT (DETAIL PATH) VÀ BỘ TRỘN (BGA)
+# ==============================================================================
+class DetailBranch(nn.Module):
+    """
+    Cặp mắt cận cảnh: Trích xuất góc nhìn nông, dừng lại ở 1/8.
+    Giữ các mép nước cực kỳ sắc nét.
+    """
+    def __init__(self):
         super().__init__()
-        gc = max(out_c // 4, 4)
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
-        self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
-        
-        self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
-        
-        # PHASE 2: Bất đối xứng (Asymmetric)
-        if is_shallow:
-            # Ở các tầng nông (d1, d2), dùng Inverted Residual siêu tốc, bỏ Dilation
-            self.core_block = InvertedResidual(gc, exp_ratio=2)
-        else:
-            # Ở các tầng sâu (d3, d4), giữ nguyên PFCU để gom bối cảnh
-            self.core_block = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel)
-            
-        self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
-        
-        self.bn  = nn.BatchNorm2d(out_c)
-        self.act = nn.PReLU(out_c)
+        self.S1 = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False), # 1/2
+            nn.BatchNorm2d(32),
+            nn.PReLU(32),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.PReLU(32)
+        )
+        self.S2 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False), # 1/4
+            nn.BatchNorm2d(64),
+            nn.PReLU(64)
+        )
+        self.S3 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False), # 1/8
+            nn.BatchNorm2d(128),
+            nn.PReLU(128)
+        )
 
-    def forward(self, x, skip):
-        x = self.up(x)
-        x = self.uafm(x, skip)
-        x = self.act(self.bn(self.pw_up(self.core_block(self.pw_down(x))) + x))
-        return x
+    def forward(self, x):
+        return self.S3(self.S2(self.S1(x)))
+
+class BilateralGuidedAggregation(nn.Module):
+    """
+    Trạm kiểm soát BGA: Dùng Detail Mask để hướng dẫn Semantic Path.
+    """
+    def __init__(self, detail_c=128, semantic_c=256, out_c=128):
+        super().__init__()
+        # Căn chỉnh kênh và phóng to nhánh Semantic từ 1/16 lên 1/8
+        self.sem_project = nn.Sequential(
+            nn.Conv2d(semantic_c, detail_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(detail_c),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        
+        # Nhánh Detail tự tạo mặt nạ ranh giới (Mask)
+        self.detail_gate = nn.Sequential(
+            nn.Conv2d(detail_c, detail_c, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(detail_c),
+            nn.Sigmoid()
+        )
+        
+        # Dung hợp
+        self.fuse = nn.Sequential(
+            nn.Conv2d(detail_c * 2, out_c, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.PReLU(out_c),
+            CoordAtt(out_c, out_c) # Chốt chặn Attention cuối cùng
+        )
+
+    def forward(self, detail_feat, semantic_feat):
+        # 1. Chuẩn bị ngữ nghĩa
+        sem_up = self.sem_project(semantic_feat)
+        
+        # 2. Chi tiết tạo cổng (Gate)
+        gate = self.detail_gate(detail_feat)
+        
+        # 3. Ngữ nghĩa đi qua cổng (Chỉ đổ màu vào vùng có ranh giới)
+        sem_guided = sem_up * gate
+        
+        # 4. Gộp chung lại
+        out = torch.cat([detail_feat, sem_guided], dim=1)
+        return self.fuse(out)
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (LITEV8 - ĐỘT PHÁ)
+# 4. MẠNG CHÍNH (BILATERAL-PFCU)
 # ==============================================================================
-class ULiteModel_Breakthrough(nn.Module):
+class Bilateral_PFCU(nn.Module):
     def __init__(self, num_classes=1):
         super().__init__()
         mk = (5, 5)
 
+        # ---------------------------------------------------
+        # LUỒNG 1: NHÁNH CHI TIẾT (Dừng ở 1/8)
+        # ---------------------------------------------------
+        self.detail_path = DetailBranch() # Output: 128 channels, 1/8 resolution
+
+        # ---------------------------------------------------
+        # LUỒNG 2: NHÁNH NGỮ NGHĨA (Xuống tận 1/16)
+        # ---------------------------------------------------
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-
-        # Encoder (Giữ nguyên PFCU để nén bối cảnh)
-        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk)
-        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk)
-        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk)
-        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk)
-
-        # Bottleneck: Additive SPP siêu nhẹ (~30K Params)
-        self.b4 = AdditiveBottleNeck(256)
-
-        # Decoder: Thiết kế Bất đối xứng (Asymmetric)
-        # d4, d3 ở độ phân giải 1/16, 1/8 -> Dùng PFCU (is_shallow=False)
-        self.d4 = DecoderBlock(256, 128, mixer_kernel=mk, is_shallow=False)
-        self.d3 = DecoderBlock(128, 64,  mixer_kernel=mk, is_shallow=False)
         
-        # d2, d1 ở độ phân giải 1/4, 1/2 (Ảnh rất to) -> Dùng Inverted Residual siêu tốc (is_shallow=True)
-        self.d2 = DecoderBlock(64,  32,  mixer_kernel=mk, is_shallow=True)
-        self.d1 = DecoderBlock(32,  16,  mixer_kernel=mk, is_shallow=True)
+        # Encoder hạ mẫu từ từ
+        self.e1 = EncoderBlock(16,  32,  mixer_kernel=mk) # 1/2
+        self.e2 = EncoderBlock(32,  64,  mixer_kernel=mk) # 1/4
+        self.e3 = EncoderBlock(64,  128, mixer_kernel=mk) # 1/8
+        self.e4 = EncoderBlock(128, 256, mixer_kernel=mk) # 1/16
 
-        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
+        # Bottleneck ở đáy mạng
+        self.b4 = AdditiveBottleNeck(256) # Output: 256 channels, 1/16 resolution
+
+        # ---------------------------------------------------
+        # BỘ TRỘN VÀ PHÂN LOẠI
+        # ---------------------------------------------------
+        self.bga = BilateralGuidedAggregation(detail_c=128, semantic_c=256, out_c=128)
+        
+        # Đầu ra (Nhận 128 channels từ BGA)
+        self.conv_out = nn.Sequential(
+            nn.Dropout2d(0.1),
+            nn.Conv2d(128, num_classes, kernel_size=1)
+        )
 
     def forward(self, x):
-        x = self.conv_in(x)
+        input_size = x.size()[2:]
 
-        x, skip1 = self.e1(x)
-        x, skip2 = self.e2(x)
-        x, skip3 = self.e3(x)
-        x, skip4 = self.e4(x)
+        # 1. Nhánh Detail
+        feat_detail = self.detail_path(x)
 
-        x = self.b4(x)
+        # 2. Nhánh Semantic
+        feat_sem = self.conv_in(x)
+        feat_sem = self.e1(feat_sem)
+        feat_sem = self.e2(feat_sem)
+        feat_sem = self.e3(feat_sem)
+        feat_sem = self.e4(feat_sem)
+        feat_sem = self.b4(feat_sem)
 
-        x = self.d4(x, skip4)
-        x = self.d3(x, skip3)
-        x = self.d2(x, skip2)
-        x = self.d1(x, skip1)
+        # 3. Dung hợp tại BGA
+        fused = self.bga(detail_feat=feat_detail, semantic_feat=feat_sem)
 
-        return self.conv_out(x)
+        # 4. Phân loại và Phóng to về kích thước gốc (từ 1/8 lên 1/1)
+        out = self.conv_out(fused)
+        out = F.interpolate(out, size=input_size, mode='bilinear', align_corners=False)
+
+        return out
 
 def build_model(num_classes=1):
-    return ULiteModel_Breakthrough(num_classes=num_classes)
+    return Bilateral_PFCU(num_classes=num_classes)
