@@ -120,14 +120,21 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             
             outputs = model(images)
             
+            # -------------------------------------------------------------
+            # KIỂM TRA MÔ HÌNH ĐỂ ĐẶT TRỌNG SỐ AUX (AUX_WEIGHT)
+            # - LiteV8: Dùng 1.0 để phạt gắt, ép học sâu.
+            # - BiSeNetV2 / Fast-SCNN: Giữ nguyên 0.4 (Tiêu chuẩn gốc).
+            # -------------------------------------------------------------
+            aux_weight = 1.0 if 'litev8' in model_name.lower() else 0.4
+            
             # Xử lý thông minh: Chấp nhận mọi mô hình có từ 1 đến N nhánh Aux
             if isinstance(outputs, tuple):
                 # 1. Nhánh chính luôn nằm ở index 0
                 loss = criterion(outputs[0], masks)
                 
-                # 2. Duyệt qua tất cả các nhánh Aux còn lại và cộng dồn Loss (trọng số 0.4)
+                # 2. Duyệt qua tất cả các nhánh Aux còn lại và cộng dồn Loss
                 for aux_out in outputs[1:]:
-                    loss += 0.4 * criterion(aux_out, masks)
+                    loss += aux_weight * criterion(aux_out, masks)
             else:
                 # Fallback cho các mô hình bình thường không có nhánh Aux
                 loss = criterion(outputs, masks)
