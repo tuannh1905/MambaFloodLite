@@ -82,23 +82,19 @@ class TinyUAFM(nn.Module):
 
 class AuxHead(nn.Module):
     """
-    Nhánh giám sát phụ (Deep Supervision) siêu nhẹ.
-    Dùng Depthwise Separable Conv để tiết kiệm tham số.
+    ✓ ĐÃ FIX: Khôi phục lại class AuxHead bị thiếu
+    Nhánh giám sát phụ siêu nhẹ (Deep Supervision).
     """
     def __init__(self, in_chan, num_classes):
         super().__init__()
         self.head = nn.Sequential(
-            # DW lọc không gian
             nn.Conv2d(in_chan, in_chan, kernel_size=3, padding=1, groups=in_chan, bias=False),
             nn.BatchNorm2d(in_chan),
             nn.PReLU(in_chan),
-            # PW hạ kênh về 64 cho nhẹ
             nn.Conv2d(in_chan, 64, kernel_size=1, bias=False),
             nn.BatchNorm2d(64),
             nn.PReLU(64),
-            # Dropout chống Overfit cực mạnh
             nn.Dropout2d(0.1),
-            # Phân loại
             nn.Conv2d(64, num_classes, kernel_size=1)
         )
 
@@ -223,7 +219,8 @@ class DecoderBlock(nn.Module):
         gc = max(out_c // 4, 4)
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         
-        self.uafm = TinyUAFM(in_c=in_c, skip_c=out_c, out_c=out_c)
+        # ✓ ĐÃ FIX LỖI TENSOR MISMATCH: skip_c phải bằng in_c
+        self.uafm = TinyUAFM(in_c=in_c, skip_c=in_c, out_c=out_c)
         
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel, dilations=dilations)
@@ -254,7 +251,6 @@ class ULiteModel_PFCU_UAFM(nn.Module):
         self.e3 = EncoderBlock(64,  128, mixer_kernel=mk, dilations=(1, 6, 12))
         self.e4 = EncoderBlock(128, 256, mixer_kernel=mk, dilations=(1, 8, 16))
 
-        # Cắm Aux Head vào e3 (nhận 128 kênh) và e4 (nhận 256 kênh)
         if self.aux_mode == 'train':
             self.aux3 = AuxHead(128, num_classes)
             self.aux4 = AuxHead(256, num_classes)
@@ -269,7 +265,7 @@ class ULiteModel_PFCU_UAFM(nn.Module):
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
-        target_size = x.shape[2:] # Lấy kích thước ảnh gốc cho Aux Head
+        target_size = x.shape[2:] 
         
         x = self.conv_in(x)
 
@@ -287,15 +283,12 @@ class ULiteModel_PFCU_UAFM(nn.Module):
 
         logits_main = self.conv_out(x)
         
-        # Nếu đang train và bật aux_mode -> Trả về 3 nhánh Loss
         if self.training and self.aux_mode == 'train':
             logits_aux3 = self.aux3(skip3, target_size)
             logits_aux4 = self.aux4(skip4, target_size)
             return logits_main, logits_aux3, logits_aux4
             
-        # Nếu đang Validate/Inference -> Chỉ trả 1 nhánh chính
         return logits_main
 
 def build_model(num_classes=1):
-    # Khởi tạo kèm cờ aux_mode='train' để Trainer nhận được Tuple 3 Loss
     return ULiteModel_PFCU_UAFM(num_classes=num_classes, aux_mode='train')
