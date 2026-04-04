@@ -148,72 +148,18 @@ class EncoderBlock(nn.Module):
             x = self.act(self.bn2(torch.cat([pool_feat, pool_pw], dim=1)))
             return x, skip
 
-class BottleNeckBlock_Static(nn.Module):
-    """
-    Tính toán sẵn tham số Pooling trong __init__ dựa trên input_size.
-    Đảm bảo 100% C++ Static Allocation, không có luồng điều khiển động (If-else) ở forward.
-    """
-    def __init__(self, dim, max_dim=128, input_size=256):
-        super().__init__()
-        hid = min(dim // 4, max_dim // 4)
-        
-        # Vì ảnh đã qua 4 lớp MaxPool (chia 2^4 = 16)
-        feat_size = input_size // 16 
-        
-        # Tính toán kernel động theo input size, NHƯNG chốt tĩnh thành hằng số (int)
-        k1 = feat_size           # Gom từ feat_size -> 1x1
-        k2 = feat_size // 2      # Gom từ feat_size -> 2x2
-        k3 = feat_size // 4      # Gom từ feat_size -> 4x4
-        
-        self._sf1, self._sf2, self._sf3 = k1, k2, k3
-        
-        # Sử dụng AvgPool2d cứng truyền thống thay cho Adaptive
-        self.pool1 = nn.Sequential(
-            nn.AvgPool2d(kernel_size=k1, stride=k1), 
-            nn.Conv2d(dim, hid, 1, bias=False),
-            nn.BatchNorm2d(hid), nn.ReLU6(inplace=True)
-        )
-        self.pool2 = nn.Sequential(
-            nn.AvgPool2d(kernel_size=k2, stride=k2), 
-            nn.Conv2d(dim, hid, 1, bias=False),
-            nn.BatchNorm2d(hid), nn.ReLU6(inplace=True)
-        )
-        self.pool3 = nn.Sequential(
-            nn.AvgPool2d(kernel_size=k3, stride=k3), 
-            nn.Conv2d(dim, hid, 1, bias=False),
-            nn.BatchNorm2d(hid), nn.ReLU6(inplace=True)
-        )
-        
-        self.spp_fuse = nn.Sequential(
-            nn.Conv2d(dim + hid * 3, dim, 1, bias=False),
-            nn.BatchNorm2d(dim), nn.ReLU6(inplace=True)
-        )
-        self.axial_refine = AxialDW(dim, mixer_kernel=(5, 5), dilation=1)
-        self.bn_refine = nn.BatchNorm2d(dim)
-        self.se = ECABlock(dim)
-
-    def forward(self, x):
-        # Dùng scale_factor tĩnh (số nguyên) -> ONNX Trace hoàn hảo
-        x1 = F.interpolate(self.pool1(x), scale_factor=self._sf1, mode='nearest')
-        x2 = F.interpolate(self.pool2(x), scale_factor=self._sf2, mode='nearest')
-        x3 = F.interpolate(self.pool3(x), scale_factor=self._sf3, mode='nearest')
-        
-        spp = self.spp_fuse(torch.cat([x, x1, x2, x3], dim=1))
-        out = self.bn_refine(self.axial_refine(spp))
-        return self.se(out) + x
-
 class DecoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel=(5, 5)):
         super().__init__()
         gc = max(out_c // 4, 4)
-        
-        self.up = NearestUpsample(in_c, scale_factor=2)
+
+        self.up   = NearestUpsample(in_c, scale_factor=2)
         self.uafm = TinyUAFM_v2(in_c=in_c, skip_c=in_c, out_c=out_c)
-        
+
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.pfcu_dg = Axial_PFCU_DG(gc, mixer_kernel=mixer_kernel)
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
-        
+
         self.bn  = nn.BatchNorm2d(out_c)
         self.act = nn.ReLU6(inplace=True)
 
@@ -222,13 +168,80 @@ class DecoderBlock(nn.Module):
         x = self.uafm(x, skip)
         x = self.act(self.bn(self.pw_up(self.pfcu_dg(self.pw_down(x))) + x))
         return x
+class BottleNeckBlock_Static(nn.Module):
+    """
+    If-else chỉ chạy MỘT LẦN trong __init__ khi build model.
+    forward() không có bất kỳ nhánh động nào → ONNX trace hoàn hảo.
+    
+    256×256 → feat_size=16: pool1(k=16→1×1), pool2(k=8→2×2), pool3(k=4→4×4)
+    128×128 → feat_size=8:  pool1(k=8→1×1),  pool2(k=4→2×2),  pool3(k=2→4×4)
+    """
+    def __init__(self, dim, max_dim=128, input_size=256):
+        super().__init__()
+        hid = min(dim // 4, max_dim // 4)
 
-# ==============================================================================
-# 5. MẠNG CHÍNH (FINAL MCU-READY)
-# ==============================================================================
+        # ✓ if-else chạy tại __init__ time, không phải forward time
+        # Mọi giá trị k1/k2/k3/sf1/sf2/sf3 đều là Python int thuần
+        feat_size = input_size // 16  # 256→16, 128→8
+
+        k1, k2, k3 = feat_size, feat_size // 2, feat_size // 4
+
+        if input_size == 128:
+            # 8×8 bottleneck: k=(8,4,2), scale=(8,4,2)
+            assert k3 >= 2, "input_size quá nhỏ cho 3-scale SPP"
+        elif input_size == 256:
+            # 16×16 bottleneck: k=(16,8,4), scale=(16,8,4)
+            pass
+        else:
+            raise ValueError(
+                f"input_size={input_size} chưa được hỗ trợ. "
+                f"Dùng 128 hoặc 256."
+            )
+
+        # Lưu scale_factor tĩnh — Python int, bake vào ONNX graph
+        self._sf1 = int(k1)
+        self._sf2 = int(k2)
+        self._sf3 = int(k3)
+
+        # AvgPool2d kernel cứng — 0 dynamic dispatch, MCU cấp phát RAM tĩnh
+        self.pool1 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=k1, stride=k1),  # feat→1×1
+            nn.Conv2d(dim, hid, 1, bias=False),
+            nn.BatchNorm2d(hid), nn.ReLU6(inplace=True)
+        )
+        self.pool2 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=k2, stride=k2),  # feat→2×2
+            nn.Conv2d(dim, hid, 1, bias=False),
+            nn.BatchNorm2d(hid), nn.ReLU6(inplace=True)
+        )
+        self.pool3 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=k3, stride=k3),  # feat→4×4
+            nn.Conv2d(dim, hid, 1, bias=False),
+            nn.BatchNorm2d(hid), nn.ReLU6(inplace=True)
+        )
+
+        self.spp_fuse = nn.Sequential(
+            nn.Conv2d(dim + hid * 3, dim, 1, bias=False),
+            nn.BatchNorm2d(dim), nn.ReLU6(inplace=True)
+        )
+        self.axial_refine = AxialDW(dim, mixer_kernel=(5, 5), dilation=1)
+        self.bn_refine    = nn.BatchNorm2d(dim)
+        self.se           = ECABlock(dim)
+
+    def forward(self, x):
+        # ✓ Không có H/W runtime, không có if-else, không có dynamic shape
+        # self._sf1/2/3 là hằng số đã chốt từ __init__
+        x1 = F.interpolate(self.pool1(x), scale_factor=self._sf1, mode='nearest')
+        x2 = F.interpolate(self.pool2(x), scale_factor=self._sf2, mode='nearest')
+        x3 = F.interpolate(self.pool3(x), scale_factor=self._sf3, mode='nearest')
+
+        spp = self.spp_fuse(torch.cat([x, x1, x2, x3], dim=1))
+        out = self.bn_refine(self.axial_refine(spp))
+        return self.se(out) + x
+
+
 class ULiteModel_MCU(nn.Module):
-    # ✓ Thêm input_size vào __init__
-    def __init__(self, num_classes=1, input_size=256): 
+    def __init__(self, num_classes=1, input_size=256):
         super().__init__()
         mk = (5, 5)
 
@@ -239,7 +252,7 @@ class ULiteModel_MCU(nn.Module):
         self.e3 = EncoderBlock(64,  128, mixer_kernel=mk)
         self.e4 = EncoderBlock(128, 256, mixer_kernel=mk)
 
-        # ✓ Chuyền input_size vào BottleNeck
+        # ✓ input_size truyền vào đây → BottleNeck tự chọn kernel đúng
         self.b4 = BottleNeckBlock_Static(256, max_dim=128, input_size=input_size)
 
         self.d4 = DecoderBlock(256, 128, mixer_kernel=mk)
@@ -251,21 +264,17 @@ class ULiteModel_MCU(nn.Module):
 
     def forward(self, x):
         x = self.conv_in(x)
-
         x, skip1 = self.e1(x)
         x, skip2 = self.e2(x)
         x, skip3 = self.e3(x)
         x, skip4 = self.e4(x)
-
         x = self.b4(x)
-
         x = self.d4(x, skip4)
         x = self.d3(x, skip3)
         x = self.d2(x, skip2)
         x = self.d1(x, skip1)
-
         return self.conv_out(x)
 
-# ✓ Đón input_size từ file __init__.py mà bạn vừa sửa
+
 def build_model(num_classes=1, input_size=256):
     return ULiteModel_MCU(num_classes=num_classes, input_size=input_size)
