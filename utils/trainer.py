@@ -42,7 +42,7 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     set_seed(seed)
     
     from models import get_model
-    model = get_model(model_name, num_classes=num_classes, seed=seed)
+    model = get_model(model_name, num_classes=num_classes, seed=seed, input_size = size)
     model = model.to(device)
     model = model.float()
     
