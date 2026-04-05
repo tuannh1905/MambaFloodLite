@@ -29,7 +29,7 @@ class EncoderBlock(nn.Module):
 class DecoderBlock(nn.Module):
     def __init__(self, in_c, out_c, mixer_kernel = (7, 7)):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2)
+        self.up = nn.Upsample(scale_factor=2) # Mặc định là mode='nearest', rất thân thiện MCU
         self.pw = nn.Conv2d(in_c + out_c, out_c,kernel_size=1)
         self.bn = nn.BatchNorm2d(out_c)
         self.dw = AxialDW(out_c, mixer_kernel = (7, 7))
@@ -63,8 +63,13 @@ class BottleNeckBlock(nn.Module):
         return x
 
 class ULiteModel(nn.Module):
-    def __init__(self, num_classes=1):
+    # ✓ ĐÃ SỬA: Thêm tham số input_size
+    def __init__(self, num_classes=1, input_size=256):
         super().__init__()
+        
+        # ✓ KIỂM TRA TOÁN HỌC: Mạng có 5 EncoderBlock, mỗi block MaxPool giảm 2 lần -> 2^5 = 32
+        if input_size % 32 != 0:
+            raise ValueError(f"ULite yêu cầu input_size chia hết cho 32. Kích thước {input_size} không hợp lệ.")
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=7, padding='same')
         self.e1 = EncoderBlock(16, 32)
@@ -100,5 +105,6 @@ class ULiteModel(nn.Module):
         x = self.conv_out(x)
         return x
 
-def build_model(num_classes=1):
-    return ULiteModel(num_classes=num_classes)
+# ✓ ĐÃ SỬA: Hàm build_model nhận thêm tham số input_size
+def build_model(num_classes=1, input_size=256):
+    return ULiteModel(num_classes=num_classes, input_size=input_size)
