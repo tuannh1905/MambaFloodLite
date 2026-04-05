@@ -81,10 +81,15 @@ class EDABlock(nn.Module):
 
 
 class EDANetModel(nn.Module):
-    def __init__(self, in_channels=3, num_classes=1, k=40, num_b1=5, num_b2=8):
+    # ✓ ĐÃ SỬA: Thêm tham số input_size
+    def __init__(self, in_channels=3, num_classes=1, k=40, num_b1=5, num_b2=8, input_size=256):
         super(EDANetModel, self).__init__()
         
         self.num_classes = num_classes
+        
+        # ✓ KIỂM TRA TOÁN HỌC: EDANet hạ sample 3 lần (stride=2) -> 2^3 = 8
+        if input_size % 8 != 0:
+            raise ValueError(f"EDANet yêu cầu input_size chia hết cho 8. Kích thước {input_size} không hợp lệ.")
         
         self.stage1 = DownsamplingBlock(in_channels, 15)
         
@@ -116,6 +121,6 @@ class EDANetModel(nn.Module):
         
         return x
 
-
-def build_model(num_classes=1):
-    return EDANetModel(in_channels=3, num_classes=num_classes)
+# ✓ ĐÃ SỬA: Hàm build_model nhận thêm tham số input_size
+def build_model(num_classes=1, input_size=256):
+    return EDANetModel(in_channels=3, num_classes=num_classes, input_size=input_size)
