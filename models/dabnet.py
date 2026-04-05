@@ -123,8 +123,14 @@ class InputInjection(nn.Module):
 # MẠNG CHÍNH
 # =========================================================================
 class DABNet(nn.Module):
-    def __init__(self, classes=1, block_1=3, block_2=6):
+    # ✓ ĐÃ SỬA: Thêm tham số input_size
+    def __init__(self, classes=1, block_1=3, block_2=6, input_size=256):
         super().__init__()
+        
+        # ✓ KIỂM TRA TOÁN HỌC: Mạng downsample 3 lần -> 2^3 = 8
+        if input_size % 8 != 0:
+            raise ValueError(f"DABNet yêu cầu input_size chia hết cho 8. Kích thước {input_size} không hợp lệ.")
+
         self.init_conv = nn.Sequential(
             Conv(3, 32, 3, 2, padding=1, bn_acti=True),
             Conv(32, 32, 3, 1, padding=1, bn_acti=True),
@@ -183,8 +189,9 @@ class DABNet(nn.Module):
 # =========================================================================
 # HÀM BUILD MODEL CHUẨN TEMPLATE
 # =========================================================================
-def build_model(num_classes=1):
+# ✓ ĐÃ SỬA: Hàm build_model nhận thêm tham số input_size
+def build_model(num_classes=1, input_size=256):
     """
     Khởi tạo mạng DABNet với cấu trúc gốc (3 khối Block 1, 6 khối Block 2)
     """
-    return DABNet(classes=num_classes, block_1=3, block_2=6)
+    return DABNet(classes=num_classes, block_1=3, block_2=6, input_size=input_size)
