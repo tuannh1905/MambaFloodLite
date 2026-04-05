@@ -99,16 +99,19 @@ class EESPNet(nn.Module):
 
 
 # =================================================================================
-# PHẦN 3: ESPNetv2 SEGMENTATION NETWORK (GIỮ NGUYÊN 100% LOGIC CỦA BẠN)
+# PHẦN 3: ESPNetv2 SEGMENTATION NETWORK
 # =================================================================================
 class ESPNetv2Segmentation(nn.Module):
     '''
     This class defines the ESPNetv2 architecture for Semantic Segmentation.
-    [ĐÃ SỬA]: Thay đổi params ở __init__ từ (args) sang (classes, dataset, scale) 
-    để khớp với hàm build_model.
     '''
-    def __init__(self, classes=1, dataset='pascal', scale=2.0):
+    # ✓ SỬA TẠI ĐÂY: Thêm input_size để tương thích với build_model framework
+    def __init__(self, classes=1, dataset='pascal', scale=2.0, input_size=256):
         super().__init__()
+        
+        # ✓ KIỂM TRA TOÁN HỌC: Mạng downsample 4 lần (l1, l2_0, l3_0, l4_0) -> 2^4 = 16
+        if input_size % 16 != 0:
+            raise ValueError(f"ESPNetv2 yêu cầu input_size chia hết cho 16. Kích thước {input_size} không hợp lệ.")
 
         # =============================================================
         #                        BASE NETWORK
@@ -216,9 +219,10 @@ class ESPNetv2Segmentation(nn.Module):
 # =================================================================================
 # PHẦN 4: TEMPLATE BUILD MODEL
 # =================================================================================
-def build_model(num_classes=1):
+# ✓ SỬA TẠI ĐÂY: Hàm build_model giờ nhận tham số input_size
+def build_model(num_classes=1, input_size=256):
     '''
     Khởi tạo mô hình ESPNetv2 với cấu hình scale s=2.0 
     để đảm bảo số lượng tham số đạt mức chuẩn ~2.1M như thiết kế gốc.
     '''
-    return ESPNetv2Segmentation(classes=num_classes, dataset='floodvn', scale=2.0)
+    return ESPNetv2Segmentation(classes=num_classes, dataset='floodvn', scale=2.0, input_size=input_size)
