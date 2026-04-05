@@ -60,7 +60,7 @@ def _max_unpool(x, indices, kernel_size=2, stride=2):
 
 
 class SegNetModel(nn.Module):
-    def __init__(self, in_channels=3, num_classes=1):
+    def __init__(self, in_channels=3, num_classes=1, input_size=256):
         """
         SegNet architecture following VGG16 encoder.
         All blocks are symmetric between encoder and decoder
@@ -69,12 +69,15 @@ class SegNetModel(nn.Module):
         Args:
             in_channels: Number of input channels (default: 3 for RGB)
             num_classes: Number of output classes
-                        - 1 for binary segmentation (output: 1 channel with sigmoid)
-                        - >=2 for multi-class (output: num_classes channels with softmax)
+            input_size: Input image size (MUST be divisible by 32 due to 5 MaxPool layers)
         """
         super(SegNetModel, self).__init__()
 
         self.num_classes = num_classes
+        
+        # ✓ KIỂM TRA TOÁN HỌC: SegNet có 5 lớp MaxPool (2^5 = 32)
+        if input_size % 32 != 0:
+            raise ValueError(f"SegNet yêu cầu input_size chia hết cho 32. Kích thước {input_size} sẽ gây lỗi Unpool.")
 
         # Encoder (following VGG16 architecture)
         self.encoder1 = EncoderBlock(in_channels, 64,  num_convs=2)
@@ -149,13 +152,8 @@ class SegNetModel(nn.Module):
         return output
 
 
-def build_model(num_classes=1):
+def build_model(num_classes=1, input_size=256):
     """
-    Build SegNet model
-
-    Args:
-        num_classes: Number of output classes
-                    - 1 for binary segmentation
-                    - >1 for multi-class segmentation
+    Build SegNet model tương thích với file __init__.py mới
     """
-    return SegNetModel(in_channels=3, num_classes=num_classes)
+    return SegNetModel(in_channels=3, num_classes=num_classes, input_size=input_size)
