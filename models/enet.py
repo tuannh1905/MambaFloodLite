@@ -262,30 +262,28 @@ class RegularBottleneckDecoder(nn.Module):
 # ---------------------------------------------------------------
 
 class ENetModel(nn.Module):
-    def __init__(self, in_channels=3, num_classes=1):
+    # ✓ ĐÃ SỬA: Thêm tham số input_size
+    def __init__(self, in_channels=3, num_classes=1, input_size=256):
         """
         ENet model for segmentation
 
         Args:
             in_channels : Number of input channels (default: 3 for RGB)
             num_classes : Number of output classes
-                          - 1 for binary segmentation (output: 1 channel with sigmoid)
-                          - >=2 for multi-class (output: num_classes channels with softmax)
-
-        Input/Output:
-            Input  : [B, 3, 256, 256]
-            Output : [B, num_classes, 256, 256]  ← raw logits, NO sigmoid/softmax
+            input_size  : Kích thước ảnh đầu vào.
         """
         super(ENetModel, self).__init__()
 
         self.num_classes = num_classes
+        
+        # ✓ KIỂM TRA TOÁN HỌC: ENet downsample 3 lần (InitialBlock, Stage1, Stage2) -> 2^3 = 8
+        if input_size % 8 != 0:
+            raise ValueError(f"ENet yêu cầu input_size chia hết cho 8. Kích thước {input_size} không hợp lệ.")
 
         # ── Initial Block ──────────────────────────────────────────
-        # 256×256 → 128×128, 3ch → 16ch
         self.initial_block = InitialBlock(in_channels, out_channels=16)
 
         # ── Stage 1 - Encoder ─────────────────────────────────────
-        # 128×128 → 64×64, 16ch → 64ch
         self.downsample1_0 = DownsamplingBottleneck(16,  64, dropout_prob=0.01)
         self.regular1_1    = RegularBottleneck(64, padding=1, dropout_prob=0.01)
         self.regular1_2    = RegularBottleneck(64, padding=1, dropout_prob=0.01)
@@ -293,7 +291,6 @@ class ENetModel(nn.Module):
         self.regular1_4    = RegularBottleneck(64, padding=1, dropout_prob=0.01)
 
         # ── Stage 2 - Encoder ─────────────────────────────────────
-        # 64×64 → 32×32, 64ch → 128ch
         self.downsample2_0  = DownsamplingBottleneck(64, 128, dropout_prob=0.1)
         self.regular2_1     = RegularBottleneck(128, padding=1,  dropout_prob=0.1)
         self.dilated2_2     = RegularBottleneck(128, dilation=2,  padding=2,  dropout_prob=0.1)
@@ -305,7 +302,6 @@ class ENetModel(nn.Module):
         self.dilated2_8     = RegularBottleneck(128, dilation=16, padding=16, dropout_prob=0.1)
 
         # ── Stage 3 - Encoder ─────────────────────────────────────
-        # 32×32, 128ch (không downsample)
         self.regular3_0     = RegularBottleneck(128, padding=1,  dropout_prob=0.1)
         self.dilated3_1     = RegularBottleneck(128, dilation=2,  padding=2,  dropout_prob=0.1)
         self.asymmetric3_2  = RegularBottleneck(128, kernel_size=5, padding=2, asymmetric=True, dropout_prob=0.1)
@@ -316,18 +312,15 @@ class ENetModel(nn.Module):
         self.dilated3_7     = RegularBottleneck(128, dilation=16, padding=16, dropout_prob=0.1)
 
         # ── Stage 4 - Decoder ─────────────────────────────────────
-        # 32×32 → 64×64, 128ch → 64ch
         self.upsample4_0   = UpsamplingBottleneck(128, 64, dropout_prob=0.1)
         self.regular4_1    = RegularBottleneckDecoder(64, dropout_prob=0.1)
         self.regular4_2    = RegularBottleneckDecoder(64, dropout_prob=0.1)
 
         # ── Stage 5 - Decoder ─────────────────────────────────────
-        # 64×64 → 128×128, 64ch → 16ch
         self.upsample5_0   = UpsamplingBottleneck(64, 16, dropout_prob=0.1)
         self.regular5_1    = RegularBottleneckDecoder(16, dropout_prob=0.1)
 
         # ── Final Upsample ─────────────────────────────────────────
-        # 128×128 → 256×256, 16ch → num_classes
         self.transposed_conv = nn.ConvTranspose2d(
             16, num_classes,
             kernel_size=3, stride=2, padding=1,
@@ -335,11 +328,9 @@ class ENetModel(nn.Module):
         )
 
     def forward(self, x):
-        # Initial block: 256×256 → 128×128
         input_size = x.size()
         x = self.initial_block(x)
 
-        # Stage 1 Encoder: 128×128 → 64×64
         stage1_size = x.size()
         x, max_idx1 = self.downsample1_0(x)
         x = self.regular1_1(x)
@@ -347,7 +338,6 @@ class ENetModel(nn.Module):
         x = self.regular1_3(x)
         x = self.regular1_4(x)
 
-        # Stage 2 Encoder: 64×64 → 32×32
         stage2_size = x.size()
         x, max_idx2 = self.downsample2_0(x)
         x = self.regular2_1(x)
@@ -359,7 +349,6 @@ class ENetModel(nn.Module):
         x = self.asymmetric2_7(x)
         x = self.dilated2_8(x)
 
-        # Stage 3 Encoder: 32×32 (no downsample)
         x = self.regular3_0(x)
         x = self.dilated3_1(x)
         x = self.asymmetric3_2(x)
@@ -369,20 +358,18 @@ class ENetModel(nn.Module):
         x = self.asymmetric3_6(x)
         x = self.dilated3_7(x)
 
-        # Stage 4 Decoder: 32×32 → 64×64 (dùng max_idx2)
         x = self.upsample4_0(x, max_idx2, output_size=stage2_size)
         x = self.regular4_1(x)
         x = self.regular4_2(x)
 
-        # Stage 5 Decoder: 64×64 → 128×128 (dùng max_idx1)
         x = self.upsample5_0(x, max_idx1, output_size=stage1_size)
         x = self.regular5_1(x)
 
-        # Final: 128×128 → 256×256
         x = self.transposed_conv(x)
 
-        return x  # raw logits, trainer.py sẽ apply sigmoid/softmax
+        return x  # raw logits
 
 
-def build_model(num_classes=1):
-    return ENetModel(in_channels=3, num_classes=num_classes)
+# ✓ ĐÃ SỬA: Hàm build_model nhận thêm input_size
+def build_model(num_classes=1, input_size=256):
+    return ENetModel(in_channels=3, num_classes=num_classes, input_size=input_size)
