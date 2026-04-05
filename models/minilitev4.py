@@ -17,16 +17,18 @@ import torch.nn.functional as F
 class ECABlock(nn.Module):
     def __init__(self, channels, k_size=3):
         super().__init__()
-        # ✓ ĐÃ SỬA CHUẨN: Dùng Conv2d thay cho Conv1d để MCU NPU tương thích 100%
         self.conv = nn.Conv2d(1, 1, kernel_size=(1, k_size), padding=(0, k_size//2), bias=False)
         self.hardsigmoid = nn.Hardsigmoid() 
 
     def forward(self, x):
-        B, C, _, _ = x.shape
-        # Dùng mean tĩnh và ép shape về (B, 1, 1, C) để vừa vặn với Conv2d
-        y = torch.mean(x, dim=[2, 3], keepdim=True).reshape(B, 1, 1, C)              
+        _, C, _, _ = x.shape # Có thể bỏ nhận biến B luôn
+        
+        # ✓ ĐÃ SỬA: Dùng -1 thay vì B để tránh sinh ra Dynamic Batch Axis trong ONNX
+        y = torch.mean(x, dim=[2, 3], keepdim=True).reshape(-1, 1, 1, C)              
         y = self.hardsigmoid(self.conv(y))                     
-        y = y.reshape(B, C, 1, 1) 
+        
+        # ✓ ĐÃ SỬA: Tương tự, dùng -1 khi trả về shape gốc
+        y = y.reshape(-1, C, 1, 1) 
         return x * y
 
 # ==============================================================================
