@@ -9,6 +9,8 @@ import torch.nn.functional as F
 # - NEAREST UPSAMPLE: Loại bỏ Bilinear.
 # - ✓ ĐÃ CẬP NHẬT: Thay Sigmoid bằng Hardsigmoid để NPU dịch bit (siêu nhanh).
 # - ✓ ĐÃ CẬP NHẬT: Thay AdaptiveAvgPool2d(1) bằng torch.mean() chống lỗi biên dịch.
+# - ✓ ĐÃ CẬP NHẬT: Xóa bỏ abs() trong TinyUAFM_v2, thay bằng torch.max() (CBAM style).
+# - ✓ ĐÃ CẬP NHẬT: Dùng biến 'B' explicit trong ECABlock để chốt Static Tensor Arena.
 # ==============================================================================
 
 # ==============================================================================
@@ -21,14 +23,13 @@ class ECABlock(nn.Module):
         self.hardsigmoid = nn.Hardsigmoid() 
 
     def forward(self, x):
-        _, C, _, _ = x.shape # Có thể bỏ nhận biến B luôn
+        # ✓ ĐÃ FIX: Giữ B explicit để ONNX Tracer nung nó thành hằng số (VD: 1)
+        B, C, _, _ = x.shape 
         
-        # ✓ ĐÃ SỬA: Dùng -1 thay vì B để tránh sinh ra Dynamic Batch Axis trong ONNX
-        y = torch.mean(x, dim=[2, 3], keepdim=True).reshape(-1, 1, 1, C)              
+        y = torch.mean(x, dim=[2, 3], keepdim=True).reshape(B, 1, 1, C)              
         y = self.hardsigmoid(self.conv(y))                     
         
-        # ✓ ĐÃ SỬA: Tương tự, dùng -1 khi trả về shape gốc
-        y = y.reshape(-1, C, 1, 1) 
+        y = y.reshape(B, C, 1, 1) 
         return x * y
 
 # ==============================================================================
@@ -52,11 +53,11 @@ class TinyUAFM_v2(nn.Module):
         
         self.alpha_conv = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False), 
-            nn.Hardsigmoid() # ✓ THAY Sigmoid
+            nn.Hardsigmoid() 
         )
         self.beta_conv = nn.Sequential(
             nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False), 
-            nn.Hardsigmoid() # ✓ THAY Sigmoid
+            nn.Hardsigmoid() 
         )
         self.channel_att = ECABlock(out_c)
 
@@ -65,8 +66,8 @@ class TinyUAFM_v2(nn.Module):
         x_skip = self.reduce_skip(x_skip)
         
         spatial_input = torch.cat([
-            torch.mean(x_up,         dim=1, keepdim=True),
-            torch.mean(x_skip.abs(), dim=1, keepdim=True)
+            torch.mean(x_up, dim=1, keepdim=True),
+            torch.max(x_skip, dim=1, keepdim=True)[0] 
         ], dim=1)
         
         alpha = self.alpha_conv(spatial_input)
@@ -79,25 +80,20 @@ class TinyUAFM_v2(nn.Module):
 # 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
 # ==============================================================================
 class SquareDW(nn.Module):
-    """
-    ✓ ĐÃ THÊM BN: Giúp ổn định huấn luyện.
-    ✓ BN FOLDING 100%: BN đứng ngay sau Conv2d nên Compiler sẽ gộp hoàn toàn trên MCU.
-    ✓ BỎ RESIDUAL (x+): Tránh lỗi cộng dồn 3x ở khối Multi-Scale bên ngoài.
-    """
     def __init__(self, dim, kernel_size):
         super().__init__()
         padding = kernel_size // 2
         self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim) # Ý tưởng thêm BN cực kỳ xuất sắc!
+        self.bn = nn.BatchNorm2d(dim) 
 
     def forward(self, x):
-        return self.bn(self.dw(x)) # Conv -> BN -> Fold!
+        return self.bn(self.dw(x)) 
 
 class DetailGuidance(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim) # Conv -> BN: Tự động Fold!
+        self.bn = nn.BatchNorm2d(dim) 
         
     def forward(self, x):
         return x + self.bn(self.dw(x))
@@ -110,7 +106,7 @@ class MultiScale_PFCU_DG(nn.Module):
         self.branch_7 = SquareDW(dim, kernel_size=7)
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim) # Conv -> BN: Tự động Fold!
+        self.bn_fuse = nn.BatchNorm2d(dim) 
         
         self.dg_shortcut = DetailGuidance(dim)
         self.eca = ECABlock(dim) 
@@ -118,7 +114,6 @@ class MultiScale_PFCU_DG(nn.Module):
 
     def forward(self, x):
         b3, b5, b7 = self.branch_3(x), self.branch_5(x), self.branch_7(x)
-        # Các branch giờ là Conv thuần, cộng lại rồi qua PW -> BN: Gộp an toàn!
         fused_context = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
         guided_details = self.dg_shortcut(x)
         return self.eca(self.act(fused_context + guided_details))
@@ -137,19 +132,18 @@ class EncoderBlock(nn.Module):
 
         if not self.same_channels:
             self.pw      = nn.Conv2d(in_c, conv_out, kernel_size=1, bias=False)
-            self.bn_pw   = nn.BatchNorm2d(conv_out) # ✓ ĐÃ FIX: Chuyển BN vào đây để Fold với PW
+            self.bn_pw   = nn.BatchNorm2d(conv_out) 
             self.down_pw = nn.MaxPool2d((2, 2))
 
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x):
-        # ✓ ĐÃ FIX: Xóa các lớp BN đặt sai chỗ (sau MaxPool, Concat, Mul)
         feat = self.pfcu_dg(x) 
 
         if self.same_channels:
             return self.act(self.down_pool(feat)), feat
         else:
-            feat_pw = self.bn_pw(self.pw(feat)) # Conv -> BN: Tự động Fold!
+            feat_pw = self.bn_pw(self.pw(feat)) 
             skip = torch.cat([feat, feat_pw], dim=1) 
             
             pool_feat = self.down_pool(feat)
@@ -175,7 +169,6 @@ class DecoderBlock(nn.Module):
     def forward(self, x, skip):
         x = self.up(x)
         x = self.uafm(x, skip)
-        # ✓ ĐÃ FIX: Chuyển '+ x' ra ĐẰNG SAU self.bn để Conv -> BN được Fold.
         out = self.bn(self.pw_up(self.pfcu_dg(self.pw_down(x))))
         return self.act(out + x)
 
@@ -205,7 +198,6 @@ class BottleNeckBlock_Static(nn.Module):
             nn.BatchNorm2d(dim), nn.ReLU6(inplace=True)
         )
         
-        # ✓ ĐÃ FIX: Chỉ dùng SquareDW (vì bên trong nó đã có sẵn BN)
         self.square_refine = SquareDW(dim, kernel_size=5)
         self.se = ECABlock(dim)
 
@@ -215,10 +207,7 @@ class BottleNeckBlock_Static(nn.Module):
         x3 = F.interpolate(self.pool3(x), scale_factor=self._sf3, mode='nearest')
 
         spp = self.spp_fuse(torch.cat([x, x1, x2, x3], dim=1))
-        
-        # ✓ ĐÃ FIX: Không còn Double BN. Sạch sẽ và tối ưu 100%!
         out = self.square_refine(spp)
-        
         return self.se(out) + x
 
 # ==============================================================================
