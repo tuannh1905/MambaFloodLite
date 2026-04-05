@@ -237,8 +237,14 @@ class SegmentHead(nn.Module):
         return self.conv_out(feat)
 
 class BiSeNetV2(nn.Module):
-    def __init__(self, n_classes, aux_mode='train'):
+    # ✓ ĐÃ SỬA: Thêm tham số input_size
+    def __init__(self, n_classes, aux_mode='train', input_size=256):
         super(BiSeNetV2, self).__init__()
+        
+        # ✓ KIỂM TRA TOÁN HỌC: Mạng downsample sâu nhất 5 lần ở Segment Branch -> 2^5 = 32
+        if input_size % 32 != 0:
+            raise ValueError(f"BiSeNetV2 yêu cầu input_size chia hết cho 32. Kích thước {input_size} không hợp lệ.")
+
         self.aux_mode = aux_mode
         self.detail = DetailBranch()
         self.segment = SegmentBranch()
@@ -289,6 +295,7 @@ class BiSeNetV2(nn.Module):
             if name in state.keys():
                 child.load_state_dict(state[name], strict=True)
 
-def build_model(num_classes=1):
+# ✓ ĐÃ SỬA: Hàm build_model nhận thêm tham số input_size
+def build_model(num_classes=1, input_size=256):
     # Khởi tạo với aux_mode='train' để tương thích với trainer
-    return BiSeNetV2(n_classes=num_classes, aux_mode='train')
+    return BiSeNetV2(n_classes=num_classes, aux_mode='train', input_size=input_size)
