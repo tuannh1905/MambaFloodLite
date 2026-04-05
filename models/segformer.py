@@ -143,6 +143,7 @@ class LinearMLP(nn.Module):
 
 
 class SegFormerModel(nn.Module):
+    # ✓ ĐÃ SỬA: Đổi img_size thành input_size để khớp chuẩn project
     def __init__(self, in_channels=3, num_classes=1,
                  embed_dims=[64, 128, 320, 512],
                  num_heads=[1, 2, 5, 8],
@@ -151,20 +152,25 @@ class SegFormerModel(nn.Module):
                  mlp_ratios=[4, 4, 4, 4],
                  drop_path_rate=0.1,
                  decoder_embed_dim=256,
-                 img_size=256):
+                 input_size=256):
 
         super(SegFormerModel, self).__init__()
 
         self.num_classes = num_classes
+        
+        # ✓ KIỂM TRA TOÁN HỌC: Mạng downsample 4 lần (stride = 4, 2, 2, 2 -> 32)
+        if input_size % 32 != 0:
+            raise ValueError(f"SegFormer yêu cầu input_size chia hết cho 32. Kích thước {input_size} không hợp lệ.")
+
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
 
-        self.patch_embed1 = OverlapPatchEmbed(img_size=img_size,       patch_size=7, stride=4,
+        self.patch_embed1 = OverlapPatchEmbed(img_size=input_size,       patch_size=7, stride=4,
                                               in_chans=in_channels,    embed_dim=embed_dims[0])
-        self.patch_embed2 = OverlapPatchEmbed(img_size=img_size // 4,  patch_size=3, stride=2,
+        self.patch_embed2 = OverlapPatchEmbed(img_size=input_size // 4,  patch_size=3, stride=2,
                                               in_chans=embed_dims[0],  embed_dim=embed_dims[1])
-        self.patch_embed3 = OverlapPatchEmbed(img_size=img_size // 8,  patch_size=3, stride=2,
+        self.patch_embed3 = OverlapPatchEmbed(img_size=input_size // 8,  patch_size=3, stride=2,
                                               in_chans=embed_dims[1],  embed_dim=embed_dims[2])
-        self.patch_embed4 = OverlapPatchEmbed(img_size=img_size // 16, patch_size=3, stride=2,
+        self.patch_embed4 = OverlapPatchEmbed(img_size=input_size // 16, patch_size=3, stride=2,
                                               in_chans=embed_dims[2],  embed_dim=embed_dims[3])
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
@@ -250,8 +256,8 @@ class SegFormerModel(nn.Module):
 
         return x
 
-
-def build_model(num_classes=1):
+# ✓ ĐÃ SỬA: Hàm build_model nhận thêm input_size
+def build_model(num_classes=1, input_size=256):
     return SegFormerModel(
         in_channels=3,
         num_classes=num_classes,
@@ -262,5 +268,5 @@ def build_model(num_classes=1):
         mlp_ratios=[4, 4, 4, 4],
         drop_path_rate=0.1,
         decoder_embed_dim=256,
-        img_size=256,
+        input_size=input_size, 
     )
