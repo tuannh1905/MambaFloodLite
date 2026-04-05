@@ -1,21 +1,22 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn import init
+from torch.nn import functional as F
 
-
+# =================================================================================
+# PHẦN 1: CÁC LỚP BỔ TRỢ
+# =================================================================================
 def conv3x3(in_channels, out_channels, stride=1, bias=False):
     return nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, 
-                    padding=1, bias=bias)
-
+                     padding=1, bias=bias)
 
 def conv1x1(in_channels, out_channels, stride=1, bias=False):
     return nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, 
-                    padding=0, bias=bias)
-
+                     padding=0, bias=bias)
 
 class ConvBNAct(nn.Sequential):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, dilation=1, groups=1,
-                    bias=False, act_type='relu', **kwargs):
+                 bias=False, act_type='relu', **kwargs):
         if isinstance(kernel_size, list) or isinstance(kernel_size, tuple):
             padding = ((kernel_size[0] - 1) // 2 * dilation, (kernel_size[1] - 1) // 2 * dilation)
         elif isinstance(kernel_size, int):    
@@ -25,7 +26,6 @@ class ConvBNAct(nn.Sequential):
             nn.BatchNorm2d(out_channels),
             Activation(act_type, **kwargs)
         )
-
 
 class Activation(nn.Module):
     def __init__(self, act_type, **kwargs):
@@ -46,14 +46,12 @@ class Activation(nn.Module):
     def forward(self, x):
         return self.activation(x)
 
-
 class SegHead(nn.Sequential):
     def __init__(self, in_channels, num_class, act_type, hid_channels=128):
         super(SegHead, self).__init__(
             ConvBNAct(in_channels, hid_channels, 3, act_type=act_type),
             conv1x1(hid_channels, num_class)
         )
-
 
 class AttentionRefinementModule(nn.Module):
     def __init__(self, channels):
@@ -67,7 +65,6 @@ class AttentionRefinementModule(nn.Module):
         x_pool = self.conv(x_pool)
         x = x * x_pool
         return x
-
 
 class FeatureFusionModule(nn.Module):
     def __init__(self, in_channels, out_channels, act_type):
@@ -90,7 +87,6 @@ class FeatureFusionModule(nn.Module):
         x_pool = x * x_pool
         x = x + x_pool
         return x
-
 
 class STDCModule(nn.Module):
     def __init__(self, in_channels, out_channels, stride, act_type):
@@ -116,7 +112,6 @@ class STDCModule(nn.Module):
         x4 = self.block4(x3)
         return torch.cat([x1, x2, x3, x4], dim=1)
 
-
 class LaplacianConv(nn.Module):
     def __init__(self, device):
         super(LaplacianConv, self).__init__()
@@ -132,11 +127,19 @@ class LaplacianConv(nn.Module):
         lbl = torch.cat([lbl_1x, lbl_2x, lbl_4x], dim=1)
         return lbl
 
-
+# =================================================================================
+# PHẦN 2: BASE NETWORK (STDC Model)
+# =================================================================================
 class STDCModel(nn.Module):
+    # ✓ ĐÃ SỬA: Thêm input_size=256
     def __init__(self, num_class=1, n_channel=3, encoder_type='stdc1', use_detail_head=False, use_aux=False, 
-                    act_type='relu'):
+                 act_type='relu', input_size=256):
         super(STDCModel, self).__init__()
+        
+        # ✓ KIỂM TRA TOÁN HỌC: Mạng downsample 5 lần (stage 1->5 đều có stride=2) -> 2^5 = 32
+        if input_size % 32 != 0:
+            raise ValueError(f"STDCModel yêu cầu input_size chia hết cho 32. Kích thước {input_size} không hợp lệ.")
+
         repeat_times_hub = {'stdc1': [1,1,1], 'stdc2': [3,4,2]}
         if encoder_type not in repeat_times_hub.keys():
             raise ValueError('Unsupported encoder type.\n')
@@ -215,5 +218,9 @@ class STDCModel(nn.Module):
             return x
 
 
-def build_model(num_classes=1, encoder_type='stdc1'):
-    return STDCModel(num_class=num_classes, n_channel=3, encoder_type=encoder_type)
+# =================================================================================
+# PHẦN 3: TEMPLATE BUILD MODEL
+# =================================================================================
+# ✓ ĐÃ SỬA: Hàm build_model nhận thêm input_size
+def build_model(num_classes=1, encoder_type='stdc1', input_size=256):
+    return STDCModel(num_class=num_classes, n_channel=3, encoder_type=encoder_type, input_size=input_size)
