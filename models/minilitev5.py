@@ -11,7 +11,8 @@ import torch.nn.functional as F
 # - ✓ ĐÃ CẬP NHẬT: Thay AdaptiveAvgPool2d(1) bằng torch.mean() chống lỗi biên dịch.
 # - ✓ ĐÃ CẬP NHẬT: Xóa bỏ abs() trong TinyUAFM_v2, thay bằng torch.max() (CBAM style).
 # - ✓ ĐÃ CẬP NHẬT: Dùng biến 'B' explicit trong ECABlock để chốt Static Tensor Arena.
-# - ✓ ĐÃ CẬP NHẬT (NEW): Dùng LightDecoderBlock (1 nhánh 5x5) thay cho PFCU ở Decoder.
+# - ✓ ĐÃ CẬP NHẬT: Dùng LightDecoderBlock (1 nhánh 5x5) thay cho PFCU ở Decoder.
+# - ✓ ĐÃ CẬP NHẬT (NEW): Dùng permute() thay vì reshape() trong ECABlock để an toàn cho ONNX export.
 # ==============================================================================
 
 # ==============================================================================
@@ -21,13 +22,18 @@ class ECABlock(nn.Module):
     def __init__(self, channels, k_size=3):
         super().__init__()
         self.conv = nn.Conv2d(1, 1, kernel_size=(1, k_size), padding=(0, k_size//2), bias=False)
-        self.hardsigmoid = nn.Hardsigmoid() 
+        self.hardsigmoid = nn.Hardsigmoid()
 
     def forward(self, x):
-        B, C, _, _ = x.shape 
-        y = torch.mean(x, dim=[2, 3], keepdim=True).reshape(B, 1, 1, C)              
-        y = self.hardsigmoid(self.conv(y))                     
-        y = y.reshape(B, C, 1, 1) 
+        B, C, _, _ = x.shape
+        # Lấy trung bình toàn bộ không gian -> [B, C, 1, 1]
+        y = torch.mean(x, dim=[2, 3], keepdim=True)
+        # Đảo trục an toàn cho ONNX: [B, C, 1, 1] -> [B, 1, 1, C]
+        y = y.permute(0, 2, 3, 1)
+        # Quét Conv2d qua trục C
+        y = self.hardsigmoid(self.conv(y))
+        # Trả về shape cũ: [B, 1, 1, C] -> [B, C, 1, 1]
+        y = y.permute(0, 3, 1, 2)
         return x * y
 
 # ==============================================================================
@@ -150,10 +156,6 @@ class EncoderBlock(nn.Module):
             return x, skip
 
 class LightDecoderBlock(nn.Module):
-    """
-    ✓ TỐI ƯU HÓA DECODER: Bỏ MultiScale_PFCU_DG.
-    Chỉ dùng 1 nhánh SquareDW 5x5 + ECA để tinh chỉnh không gian một cách nhẹ nhàng.
-    """
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
@@ -161,15 +163,12 @@ class LightDecoderBlock(nn.Module):
         self.up   = NearestUpsample(in_c, scale_factor=2)
         self.uafm = TinyUAFM_v2(in_c=in_c, skip_c=in_c, out_c=out_c)
 
-        # Ép kênh xuống để xử lý nhẹ nhàng
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
-        # ✓ ĐÃ THAY THẾ: Thay PFCU bằng 1 nhánh DW 5x5 duy nhất
         self.refine_spatial = SquareDW(gc, kernel_size=5)
-        self.eca = ECABlock(gc) # Vẫn giữ ECA để lọc kênh
+        self.eca = ECABlock(gc)
         
-        # Bung kênh trở lại
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         self.bn_up  = nn.BatchNorm2d(out_c)
         
@@ -178,15 +177,12 @@ class LightDecoderBlock(nn.Module):
     def forward(self, x, skip):
         x = self.up(x)
         
-        # 1. Kết hợp đặc trưng (Fusion)
         fused = self.uafm(x, skip)
         
-        # 2. Tinh chỉnh không gian (Spatial Refinement) siêu nhẹ
         feat = self.act(self.bn_down(self.pw_down(fused)))
         feat = self.refine_spatial(feat)
         feat = self.eca(feat)
         
-        # 3. Trả về và cộng Shortcut
         out = self.bn_up(self.pw_up(feat))
         return self.act(out + fused)
 
@@ -247,7 +243,6 @@ class PicoUNet(nn.Module):
 
         self.b4 = BottleNeckBlock_Static(256, max_dim=128, input_size=input_size)
 
-        # ✓ ĐÃ SỬA: Chuyển toàn bộ Decoder thành LightDecoderBlock siêu nhẹ
         self.d4 = LightDecoderBlock(256, 128)
         self.d3 = LightDecoderBlock(128, 64)
         self.d2 = LightDecoderBlock(64,  32)
