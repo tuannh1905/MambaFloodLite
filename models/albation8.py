@@ -3,10 +3,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
+# LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
+# - MULTI-SCALE SQUARE DW: Dùng (3x3, 5x5, 7x7) thay chập chéo để tối ưu NPU.
+# - NEAREST UPSAMPLE: Loại bỏ Bilinear.
+# - ✓ ĐÃ CẬP NHẬT: Thay Sigmoid bằng Hardsigmoid để NPU dịch bit (siêu nhanh).
+# - ✓ ĐÃ CẬP NHẬT: Thay AdaptiveAvgPool2d(1) bằng torch.mean() chống lỗi biên dịch.
+# - ✓ ĐÃ CẬP NHẬT: Xóa bỏ abs() trong TinyUAFM_v2, thay bằng torch.max() (CBAM style).
+# - ✓ ĐÃ CẬP NHẬT (NEW 1): Dùng permute() thay vì reshape() trong ECABlock_PC.
+# ==============================================================================
+
+# ==============================================================================
 # ABLATION STUDY: MẠNG THUẦN TÚY (PC VERSION - NO MCU OPTIMIZATION)
 # - CHỈNH SỬA 1: Thay Hardsigmoid bằng Sigmoid.
 # - CHỈNH SỬA 2: Thay Nearest Upsample bằng Bilinear Upsample.
 # - CHỈNH SỬA 3: Dùng AdaptiveAvgPool2d thay vì tính pool size tĩnh trong SPP.
+# - DECODER: Dùng Decoder nặng (PFCU_DG_PC) giống phong cách DL truyền thống.
 # ==============================================================================
 
 # ==============================================================================
@@ -21,9 +32,10 @@ class ECABlock_PC(nn.Module):
 
     def forward(self, x):
         B, C, _, _ = x.shape 
-        y = torch.mean(x, dim=[2, 3], keepdim=True).reshape(B, 1, 1, C)              
+        y = torch.mean(x, dim=[2, 3], keepdim=True)              
+        y = y.permute(0, 2, 3, 1) # An toàn cho ONNX
         y = self.sigmoid(self.conv(y))                     
-        y = y.reshape(B, C, 1, 1) 
+        y = y.permute(0, 3, 1, 2) 
         return x * y
 
 # ==============================================================================

@@ -3,13 +3,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# ABLATION STUDY: BỎ TINY-UAFM_V2
-# - CHỈNH SỬA: Thay TinyUAFM_v2 bằng Concat + Conv1x1 truyền thống.
-# - GIỮ LẠI: MultiScale_PFCU_DG, SPP Bottleneck, Hardsigmoid, Static Tensor.
+# LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
+# - BOTTLE-NECK TĨNH: Không dùng AdaptiveAvgPool2d, tính trước kernel trong __init__.
+# - MULTI-SCALE SQUARE DW: Dùng (3x3, 5x5, 7x7) thay chập chéo để tối ưu NPU.
+# - NEAREST UPSAMPLE: Loại bỏ Bilinear.
+# - ✓ ĐÃ CẬP NHẬT: Thay Sigmoid bằng Hardsigmoid để NPU dịch bit (siêu nhanh).
+# - ✓ ĐÃ CẬP NHẬT: Thay AdaptiveAvgPool2d(1) bằng torch.mean() chống lỗi biên dịch.
+# - ✓ ĐÃ CẬP NHẬT: Xóa bỏ abs() trong TinyUAFM_v2, thay bằng torch.max() (CBAM style).
+# - ✓ ĐÃ CẬP NHẬT: Dùng biến 'B' explicit trong ECABlock để chốt Static Tensor Arena.
+# - ✓ ĐÃ CẬP NHẬT (NEW 1): Dùng permute() thay vì reshape() trong ECABlock.
+# - ✓ ĐÃ CẬP NHẬT (NEW 2): Dùng LightDecoderBlock (bản kết hợp SimpleConcatFusion).
 # ==============================================================================
 
 # ==============================================================================
-# 1. ATTENTION MODULES (ECA) - Vẫn giữ cho SPP Bottleneck và MultiScale
+# ABLATION STUDY: BỎ TINY-UAFM_V2
+# - CHỈNH SỬA: Thay TinyUAFM_v2 bằng Concat + Conv1x1 truyền thống.
+# - DECODER: Dùng LightDecoderBlock siêu nhẹ (1 nhánh 5x5).
+# - GIỮ LẠI: MultiScale_PFCU_DG (ở Encoder), SPP Bottleneck tĩnh, Nearest Upsample.
+# ==============================================================================
+
+# ==============================================================================
+# 1. ATTENTION MODULES (ECA)
 # ==============================================================================
 class ECABlock(nn.Module):
     def __init__(self, channels, k_size=3):
@@ -19,9 +33,10 @@ class ECABlock(nn.Module):
 
     def forward(self, x):
         B, C, _, _ = x.shape 
-        y = torch.mean(x, dim=[2, 3], keepdim=True).reshape(B, 1, 1, C)              
+        y = torch.mean(x, dim=[2, 3], keepdim=True)              
+        y = y.permute(0, 2, 3, 1) # An toàn cho ONNX
         y = self.hardsigmoid(self.conv(y))                     
-        y = y.reshape(B, C, 1, 1) 
+        y = y.permute(0, 3, 1, 2) 
         return x * y
 
 # ==============================================================================
@@ -45,7 +60,6 @@ class SimpleConcatFusion(nn.Module):
     """
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
-        # Trộn 2 feature map lại rồi dùng Conv 1x1 để ép về số kênh mong muốn
         self.fuse_conv = nn.Sequential(
             nn.Conv2d(in_c + skip_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c),
@@ -53,11 +67,8 @@ class SimpleConcatFusion(nn.Module):
         )
 
     def forward(self, x_up, x_skip):
-        # Nối theo chiều kênh (Channel dimension)
         fused = torch.cat([x_up, x_skip], dim=1)
         return self.fuse_conv(fused)
-
-# (Đã XÓA class TinyUAFM_v2)
 
 # ==============================================================================
 # 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
@@ -134,29 +145,43 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
-class DecoderBlock(nn.Module):
+class LightDecoderBlock_NoUAFM(nn.Module):
+    """
+    ✓ ABLATION DECODER: Thay TinyUAFM_v2 bằng SimpleConcatFusion.
+    Vẫn dùng LightDecoderBlock (DW 5x5 + ECA) để nhất quán kiến trúc chuẩn.
+    """
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
         self.up   = NearestUpsample(in_c, scale_factor=2)
         
-        # ✓ ĐÃ THAY THẾ: Dùng SimpleConcatFusion thay cho TinyUAFM_v2
+        # ✓ ĐÃ THAY THẾ: Dùng SimpleConcatFusion
         self.fusion = SimpleConcatFusion(in_c=in_c, skip_c=in_c, out_c=out_c)
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
-        self.pfcu_dg = MultiScale_PFCU_DG(gc)
+        self.bn_down = nn.BatchNorm2d(gc)
+        
+        self.refine_spatial = SquareDW(gc, kernel_size=5)
+        self.eca = ECABlock(gc) 
+        
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
-
-        self.bn  = nn.BatchNorm2d(out_c)
+        self.bn_up  = nn.BatchNorm2d(out_c)
+        
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x, skip):
         x = self.up(x)
-        # ✓ ĐÃ THAY THẾ: Truyền vào SimpleConcatFusion
-        x = self.fusion(x, skip)
-        out = self.bn(self.pw_up(self.pfcu_dg(self.pw_down(x))))
-        return self.act(out + x)
+        
+        # ✓ ĐÃ THAY THẾ: Truyền vào khối SimpleConcatFusion
+        fused = self.fusion(x, skip)
+        
+        feat = self.act(self.bn_down(self.pw_down(fused)))
+        feat = self.refine_spatial(feat)
+        feat = self.eca(feat)
+        
+        out = self.bn_up(self.pw_up(feat))
+        return self.act(out + fused)
 
 class BottleNeckBlock_Static(nn.Module):
     def __init__(self, dim, max_dim=128, input_size=256):
@@ -203,6 +228,9 @@ class PicoUNet_Ablation_NoUAFM(nn.Module):
     def __init__(self, num_classes=1, input_size=256):
         super().__init__()
         
+        if input_size % 16 != 0:
+            raise ValueError(f"PicoUNet yêu cầu input_size chia hết cho 16.")
+
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
         self.e1 = EncoderBlock(16,  32)
@@ -212,10 +240,11 @@ class PicoUNet_Ablation_NoUAFM(nn.Module):
 
         self.b4 = BottleNeckBlock_Static(256, max_dim=128, input_size=input_size)
 
-        self.d4 = DecoderBlock(256, 128)
-        self.d3 = DecoderBlock(128, 64)
-        self.d2 = DecoderBlock(64,  32)
-        self.d1 = DecoderBlock(32,  16)
+        # ✓ ĐÃ ĐỔI SANG BẢN ABLATION MỚI
+        self.d4 = LightDecoderBlock_NoUAFM(256, 128)
+        self.d3 = LightDecoderBlock_NoUAFM(128, 64)
+        self.d2 = LightDecoderBlock_NoUAFM(64,  32)
+        self.d1 = LightDecoderBlock_NoUAFM(32,  16)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
