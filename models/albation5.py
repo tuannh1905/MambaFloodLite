@@ -9,38 +9,16 @@ import torch.nn.functional as F
 # - NEAREST UPSAMPLE: Loại bỏ Bilinear.
 # - ✓ ĐÃ CẬP NHẬT: Thay Sigmoid bằng Hardsigmoid để NPU dịch bit (siêu nhanh).
 # - ✓ ĐÃ CẬP NHẬT: Thay AdaptiveAvgPool2d(1) bằng torch.mean() chống lỗi biên dịch.
-# - ✓ ĐÃ CẬP NHẬT: Xóa bỏ abs() trong TinyUAFM_v2, thay bằng torch.max() (CBAM style).
-# - ✓ ĐÃ CẬP NHẬT: Dùng biến 'B' explicit trong ECABlock để chốt Static Tensor Arena.
-# - ✓ ĐÃ CẬP NHẬT (NEW 1): Dùng permute() thay vì reshape() trong ECABlock.
-# - ✓ ĐÃ CẬP NHẬT (NEW 2): Dùng LightDecoderBlock siêu nhẹ ở Decoder.
 # ==============================================================================
 
 # ==============================================================================
-# ABLATION STUDY: UAFM MEAN-ONLY (ATTENTION KHUYẾT)
-# - CHỈNH SỬA: Trong UAFM, spatial_input chỉ dùng torch.mean (bỏ torch.max).
-# - DECODER: Dùng LightDecoderBlock siêu nhẹ.
-# - GIỮ LẠI: MultiScale_PFCU_DG, SPP Bottleneck tĩnh.
+# ABLATION STUDY 3: BỎ HOÀN TOÀN ECA ATTENTION (No ECA)
+# - CHỈNH SỬA: Xóa bỏ mọi khối ECABlock tại Encoder, Bottleneck và Decoder.
+# - GIỮ LẠI: Multi-Scale (Encoder), Detail Guidance, SPP tĩnh, Conv 5x5 (Decoder).
 # ==============================================================================
 
 # ==============================================================================
-# 1. ATTENTION MODULES (ECA)
-# ==============================================================================
-class ECABlock(nn.Module):
-    def __init__(self, channels, k_size=3):
-        super().__init__()
-        self.conv = nn.Conv2d(1, 1, kernel_size=(1, k_size), padding=(0, k_size//2), bias=False)
-        self.hardsigmoid = nn.Hardsigmoid() 
-
-    def forward(self, x):
-        B, C, _, _ = x.shape 
-        y = torch.mean(x, dim=[2, 3], keepdim=True)              
-        y = y.permute(0, 2, 3, 1) # An toàn cho ONNX
-        y = self.hardsigmoid(self.conv(y))                     
-        y = y.permute(0, 3, 1, 2) 
-        return x * y
-
-# ==============================================================================
-# 2. NEAREST UPSAMPLE & TINY-UAFM (BẢN ABLATION)
+# 1. NEAREST UPSAMPLE & SIMPLE FUSION (BASELINE MỚI)
 # ==============================================================================
 class NearestUpsample(nn.Module):
     def __init__(self, channels, scale_factor=2):
@@ -52,42 +30,21 @@ class NearestUpsample(nn.Module):
     def forward(self, x):
         return self.bn(self.refine(self.up(x)))
 
-class TinyUAFM_MeanOnly(nn.Module):
-    """
-    ✓ ABLATION: Attention Khuyết.
-    Chỉ dùng Mean Pooling, bỏ Max Pooling để chứng minh tầm quan trọng của CBAM pattern.
-    """
+class SimpleConcatFusion(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
-        self.reduce_up   = nn.Conv2d(in_c,   out_c, 1, bias=False) if in_c   != out_c else nn.Identity()
-        self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
-        
-        # Sửa in_channels của conv2d từ 2 (mean+max) xuống 1 (chỉ có mean)
-        self.alpha_conv = nn.Sequential(
-            nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False), 
-            nn.Hardsigmoid() 
+        self.fuse_conv = nn.Sequential(
+            nn.Conv2d(in_c + skip_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU6(inplace=True)
         )
-        self.beta_conv = nn.Sequential(
-            nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False), 
-            nn.Hardsigmoid() 
-        )
-        self.channel_att = ECABlock(out_c)
 
     def forward(self, x_up, x_skip):
-        x_up   = self.reduce_up(x_up)
-        x_skip = self.reduce_skip(x_skip)
-        
-        # ✓ ĐÃ SỬA: Chỉ dùng torch.mean (1 kênh không gian)
-        spatial_input = torch.mean(x_up, dim=1, keepdim=True)
-        
-        alpha = self.alpha_conv(spatial_input)
-        beta  = self.beta_conv(spatial_input)
-        
-        out = x_up * alpha + x_skip * beta
-        return self.channel_att(out)
+        fused = torch.cat([x_up, x_skip], dim=1)
+        return self.fuse_conv(fused)
 
 # ==============================================================================
-# 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
+# 2. SQUARE-PFCU-DG BLOCK (KHÔNG CÓ ECA)
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size):
@@ -108,7 +65,10 @@ class DetailGuidance(nn.Module):
     def forward(self, x):
         return x + self.bn(self.dw(x))
 
-class MultiScale_PFCU_DG(nn.Module):
+class MultiScale_PFCU_DG_NoECA(nn.Module):
+    """
+    ✓ ABLATION ENCODER: Bỏ khối ECA. Dữ liệu sau khi cộng bù đi thẳng qua ReLU6.
+    """
     def __init__(self, dim):
         super().__init__()
         self.branch_3 = SquareDW(dim, kernel_size=3)
@@ -119,25 +79,28 @@ class MultiScale_PFCU_DG(nn.Module):
         self.bn_fuse = nn.BatchNorm2d(dim) 
         
         self.dg_shortcut = DetailGuidance(dim)
-        self.eca = ECABlock(dim) 
+        # Đã xóa self.eca = ECABlock(dim)
+        
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x):
         b3, b5, b7 = self.branch_3(x), self.branch_5(x), self.branch_7(x)
         fused_context = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
         guided_details = self.dg_shortcut(x)
-        return self.eca(self.act(fused_context + guided_details))
+        
+        # ✓ ĐÃ THAY THẾ: Trả về trực tiếp sau ReLU6
+        return self.act(fused_context + guided_details)
 
 # ==============================================================================
-# 4. ENCODER, DECODER & BOTTLE-NECK TĨNH
+# 3. ENCODER, DECODER & BOTTLE-NECK TĨNH (KHÔNG CÓ ECA)
 # ==============================================================================
-class EncoderBlock(nn.Module):
+class EncoderBlock_NoECA(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
-        self.pfcu_dg   = MultiScale_PFCU_DG(in_c)
+        self.pfcu_dg   = MultiScale_PFCU_DG_NoECA(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
 
         if not self.same_channels:
@@ -161,24 +124,22 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
-class LightDecoderBlock_MeanOnly(nn.Module):
+class LightDecoderBlock_NoECA(nn.Module):
     """
-    ✓ ABLATION DECODER: Dùng TinyUAFM_MeanOnly.
-    Bản thân Decoder vẫn siêu nhẹ (DW 5x5 + ECA).
+    ✓ ABLATION DECODER: Bỏ khối ECA sau bước DW Conv 5x5.
     """
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
         self.up   = NearestUpsample(in_c, scale_factor=2)
-        # ✓ ĐÃ ĐỔI SANG BẢN ABLATION KHUYẾT MAX POOL
-        self.uafm = TinyUAFM_MeanOnly(in_c=in_c, skip_c=in_c, out_c=out_c)
+        self.fusion = SimpleConcatFusion(in_c=in_c, skip_c=in_c, out_c=out_c)
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
         self.refine_spatial = SquareDW(gc, kernel_size=5)
-        self.eca = ECABlock(gc) 
+        # Đã xóa self.eca = ECABlock(gc)
         
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         self.bn_up  = nn.BatchNorm2d(out_c)
@@ -187,16 +148,19 @@ class LightDecoderBlock_MeanOnly(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
-        fused = self.uafm(x, skip)
+        fused = self.fusion(x, skip)
         
         feat = self.act(self.bn_down(self.pw_down(fused)))
         feat = self.refine_spatial(feat)
-        feat = self.eca(feat)
+        # ✓ ĐÃ THAY THẾ: Bỏ qua bước lọc feat = self.eca(feat)
         
         out = self.bn_up(self.pw_up(feat))
         return self.act(out + fused)
 
-class BottleNeckBlock_Static(nn.Module):
+class BottleNeckBlock_Static_NoECA(nn.Module):
+    """
+    ✓ ABLATION BOTTLENECK: Bỏ khối tự chú ý ECA sau khi fuse nhánh SPP.
+    """
     def __init__(self, dim, max_dim=128, input_size=256):
         super().__init__()
         hid = min(dim // 4, max_dim // 4)
@@ -223,7 +187,7 @@ class BottleNeckBlock_Static(nn.Module):
         )
         
         self.square_refine = SquareDW(dim, kernel_size=5)
-        self.se = ECABlock(dim)
+        # Đã xóa self.se = ECABlock(dim)
 
     def forward(self, x):
         x1 = F.interpolate(self.pool1(x), scale_factor=self._sf1, mode='nearest')
@@ -232,12 +196,14 @@ class BottleNeckBlock_Static(nn.Module):
 
         spp = self.spp_fuse(torch.cat([x, x1, x2, x3], dim=1))
         out = self.square_refine(spp)
-        return self.se(out) + x
+        
+        # ✓ ĐÃ THAY THẾ: Trả về trực tiếp out + x
+        return out + x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH
+# 4. MẠNG CHÍNH: ABLATION KHÔNG ECA ATTENTION
 # ==============================================================================
-class PicoUNet_Ablation_MeanOnly(nn.Module):
+class PicoUNet_Ablation_NoECA(nn.Module):
     def __init__(self, num_classes=1, input_size=256):
         super().__init__()
         
@@ -246,18 +212,18 @@ class PicoUNet_Ablation_MeanOnly(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        self.e1 = EncoderBlock(16,  32)
-        self.e2 = EncoderBlock(32,  64)
-        self.e3 = EncoderBlock(64,  128)
-        self.e4 = EncoderBlock(128, 256)
+        # Sử dụng các khối đã bị loại bỏ ECA
+        self.e1 = EncoderBlock_NoECA(16,  32)
+        self.e2 = EncoderBlock_NoECA(32,  64)
+        self.e3 = EncoderBlock_NoECA(64,  128)
+        self.e4 = EncoderBlock_NoECA(128, 256)
 
-        self.b4 = BottleNeckBlock_Static(256, max_dim=128, input_size=input_size)
+        self.b4 = BottleNeckBlock_Static_NoECA(256, max_dim=128, input_size=input_size)
 
-        # ✓ ĐÃ ĐỔI SANG BẢN ABLATION MỚI
-        self.d4 = LightDecoderBlock_MeanOnly(256, 128)
-        self.d3 = LightDecoderBlock_MeanOnly(128, 64)
-        self.d2 = LightDecoderBlock_MeanOnly(64,  32)
-        self.d1 = LightDecoderBlock_MeanOnly(32,  16)
+        self.d4 = LightDecoderBlock_NoECA(256, 128)
+        self.d3 = LightDecoderBlock_NoECA(128, 64)
+        self.d2 = LightDecoderBlock_NoECA(64,  32)
+        self.d1 = LightDecoderBlock_NoECA(32,  16)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -279,4 +245,4 @@ class PicoUNet_Ablation_MeanOnly(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=256):
-    return PicoUNet_Ablation_MeanOnly(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_Ablation_NoECA(num_classes=num_classes, input_size=input_size)

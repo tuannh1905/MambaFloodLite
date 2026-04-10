@@ -11,14 +11,14 @@ import torch.nn.functional as F
 # - ✓ ĐÃ CẬP NHẬT: Thay AdaptiveAvgPool2d(1) bằng torch.mean() chống lỗi biên dịch.
 # - ✓ ĐÃ CẬP NHẬT: Xóa bỏ abs() trong TinyUAFM_v2, thay bằng torch.max() (CBAM style).
 # - ✓ ĐÃ CẬP NHẬT: Dùng biến 'B' explicit trong ECABlock để chốt Static Tensor Arena.
-# - ✓ ĐÃ CẬP NHẬT (NEW 1): Dùng permute() thay vì reshape() trong ECABlock để an toàn cho ONNX export.
-# - ✓ ĐÃ CẬP NHẬT (NEW 2): Dùng LightDecoderBlock siêu nhẹ ở Decoder.
+# - ✓ ĐÃ CẬP NHẬT: Dùng permute() thay vì reshape() trong ECABlock.
+# - ✓ ĐÃ CẬP NHẬT: Dùng LightDecoderBlock (bản kết hợp SimpleConcatFusion).
 # ==============================================================================
 
 # ==============================================================================
-# ABLATION STUDY: TRƯỜNG HỢP A (BỎ MULTI-SCALE)
-# - CHỈNH SỬA: Cắt bỏ nhánh 5x5 và 7x7 trong khối PFCU-DG (cả Encoder & Decoder).
-# - GIỮ LẠI: Nhánh 3x3, Detail Guidance, TinyUAFM_v2, SPP Bottleneck, SPP SPP.
+# ABLATION STUDY 5: BỎ DETAIL GUIDANCE (No DG)
+# - CHỈNH SỬA: Xóa bỏ nhánh cộng bù chi tiết (DetailGuidance) ở khối Encoder.
+# - GIỮ LẠI: Multi-Scale (Encoder), SimpleConcatFusion (Decoder), SPP tĩnh, ECA.
 # ==============================================================================
 
 # ==============================================================================
@@ -33,13 +33,13 @@ class ECABlock(nn.Module):
     def forward(self, x):
         B, C, _, _ = x.shape 
         y = torch.mean(x, dim=[2, 3], keepdim=True)              
-        y = y.permute(0, 2, 3, 1) # [B, C, 1, 1] -> [B, 1, 1, C]
+        y = y.permute(0, 2, 3, 1) # An toàn cho ONNX
         y = self.hardsigmoid(self.conv(y))                     
-        y = y.permute(0, 3, 1, 2) # [B, 1, 1, C] -> [B, C, 1, 1]
+        y = y.permute(0, 3, 1, 2) 
         return x * y
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & TINY-UAFM_V2
+# 2. NEAREST UPSAMPLE & SIMPLE FUSION (BASELINE MỚI)
 # ==============================================================================
 class NearestUpsample(nn.Module):
     def __init__(self, channels, scale_factor=2):
@@ -51,39 +51,21 @@ class NearestUpsample(nn.Module):
     def forward(self, x):
         return self.bn(self.refine(self.up(x)))
 
-class TinyUAFM_v2(nn.Module):
+class SimpleConcatFusion(nn.Module):
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
-        self.reduce_up   = nn.Conv2d(in_c,   out_c, 1, bias=False) if in_c   != out_c else nn.Identity()
-        self.reduce_skip = nn.Conv2d(skip_c, out_c, 1, bias=False) if skip_c != out_c else nn.Identity()
-        
-        self.alpha_conv = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False), 
-            nn.Hardsigmoid() 
+        self.fuse_conv = nn.Sequential(
+            nn.Conv2d(in_c + skip_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU6(inplace=True)
         )
-        self.beta_conv = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=3, padding=1, bias=False), 
-            nn.Hardsigmoid() 
-        )
-        self.channel_att = ECABlock(out_c)
 
     def forward(self, x_up, x_skip):
-        x_up   = self.reduce_up(x_up)
-        x_skip = self.reduce_skip(x_skip)
-        
-        spatial_input = torch.cat([
-            torch.mean(x_up, dim=1, keepdim=True),
-            torch.max(x_skip, dim=1, keepdim=True)[0] 
-        ], dim=1)
-        
-        alpha = self.alpha_conv(spatial_input)
-        beta  = self.beta_conv(spatial_input)
-        
-        out = x_up * alpha + x_skip * beta
-        return self.channel_att(out)
+        fused = torch.cat([x_up, x_skip], dim=1)
+        return self.fuse_conv(fused)
 
 # ==============================================================================
-# 3. SINGLE-SCALE PFCU-DG BLOCK (ABLATION A)
+# 3. PFCU BLOCK (BỎ DETAIL GUIDANCE)
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size):
@@ -95,50 +77,43 @@ class SquareDW(nn.Module):
     def forward(self, x):
         return self.bn(self.dw(x)) 
 
-class DetailGuidance(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim) 
-        
-    def forward(self, x):
-        return x + self.bn(self.dw(x))
-
-class SingleScale_PFCU_DG(nn.Module):
+class MultiScale_PFCU_NoDG(nn.Module):
     """
-    ✓ ABLATION A: Bỏ nhánh 5x5 và 7x7. Chỉ giữ lại 3x3 và Detail Guidance.
+    ✓ ABLATION ENCODER: Giữ nguyên Đa tỷ lệ (3x3, 5x5, 7x7) nhưng bỏ Detail Guidance.
+    Không cộng bù đầu vào x, đặc trưng đi thẳng vào ECA.
     """
     def __init__(self, dim):
         super().__init__()
-        # Chỉ giữ lại 1 nhánh duy nhất (3x3)
         self.branch_3 = SquareDW(dim, kernel_size=3)
+        self.branch_5 = SquareDW(dim, kernel_size=5)
+        self.branch_7 = SquareDW(dim, kernel_size=7)
         
-        # Lớp PW Fuse vẫn được giữ lại để tổng hợp 
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim) 
         
-        # Detail Guidance vẫn được giữ nguyên
-        self.dg_shortcut = DetailGuidance(dim)
+        # Đã xóa self.dg_shortcut
+        
         self.eca = ECABlock(dim) 
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x):
-        b3 = self.branch_3(x)
-        fused_context = self.bn_fuse(self.pw_fuse(b3))
-        guided_details = self.dg_shortcut(x)
-        return self.eca(self.act(fused_context + guided_details))
+        b3, b5, b7 = self.branch_3(x), self.branch_5(x), self.branch_7(x)
+        fused_context = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
+        
+        # ✓ ĐÃ THAY THẾ: Không cộng guided_details nữa
+        return self.eca(self.act(fused_context))
 
 # ==============================================================================
 # 4. ENCODER, DECODER & BOTTLE-NECK TĨNH
 # ==============================================================================
-class EncoderBlock(nn.Module):
+class EncoderBlock_NoDG(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
-        # ✓ ĐÃ ĐỔI SANG BẢN ABLATION: SingleScale_PFCU_DG
-        self.pfcu_dg   = SingleScale_PFCU_DG(in_c)
+        # ✓ ĐÃ THAY THẾ: Dùng khối Ablation không có Detail Guidance
+        self.pfcu_dg   = MultiScale_PFCU_NoDG(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
 
         if not self.same_channels:
@@ -162,24 +137,19 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
-class LightDecoderBlock_Ablation_A(nn.Module):
-    """
-    ✓ ABLATION DECODER A: Bản Decoder nhẹ nhưng dùng SingleScale_PFCU_DG 
-    để tinh chỉnh không gian, đảm bảo toàn mạng không còn Multi-scale.
-    """
+class LightDecoderBlock_NoUAFM(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
         self.up   = NearestUpsample(in_c, scale_factor=2)
-        self.uafm = TinyUAFM_v2(in_c=in_c, skip_c=in_c, out_c=out_c)
+        self.fusion = SimpleConcatFusion(in_c=in_c, skip_c=in_c, out_c=out_c)
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
-        # ✓ ĐÃ THAY THẾ: Dùng SingleScale_PFCU_DG thay vì SquareDW 5x5
-        self.refine_spatial = SingleScale_PFCU_DG(gc)
-        # Bỏ ECA riêng ở đây vì SingleScale_PFCU_DG đã có ECA bên trong
+        self.refine_spatial = SquareDW(gc, kernel_size=5)
+        self.eca = ECABlock(gc) 
         
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         self.bn_up  = nn.BatchNorm2d(out_c)
@@ -188,11 +158,11 @@ class LightDecoderBlock_Ablation_A(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
-        
-        fused = self.uafm(x, skip)
+        fused = self.fusion(x, skip)
         
         feat = self.act(self.bn_down(self.pw_down(fused)))
-        feat = self.refine_spatial(feat) # Đã bao gồm ECA
+        feat = self.refine_spatial(feat)
+        feat = self.eca(feat)
         
         out = self.bn_up(self.pw_up(feat))
         return self.act(out + fused)
@@ -236,9 +206,9 @@ class BottleNeckBlock_Static(nn.Module):
         return self.se(out) + x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH
+# 5. MẠNG CHÍNH: ABLATION KHÔNG DETAIL GUIDANCE
 # ==============================================================================
-class PicoUNet_Ablation_A(nn.Module):
+class PicoUNet_Ablation_NoDG(nn.Module):
     def __init__(self, num_classes=1, input_size=256):
         super().__init__()
         
@@ -247,18 +217,18 @@ class PicoUNet_Ablation_A(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        self.e1 = EncoderBlock(16,  32)
-        self.e2 = EncoderBlock(32,  64)
-        self.e3 = EncoderBlock(64,  128)
-        self.e4 = EncoderBlock(128, 256)
+        # ✓ ĐÃ THAY THẾ: Dùng bản Encoder không có Detail Guidance
+        self.e1 = EncoderBlock_NoDG(16,  32)
+        self.e2 = EncoderBlock_NoDG(32,  64)
+        self.e3 = EncoderBlock_NoDG(64,  128)
+        self.e4 = EncoderBlock_NoDG(128, 256)
 
         self.b4 = BottleNeckBlock_Static(256, max_dim=128, input_size=input_size)
 
-        # ✓ ĐÃ SỬA: Dùng LightDecoderBlock_Ablation_A
-        self.d4 = LightDecoderBlock_Ablation_A(256, 128)
-        self.d3 = LightDecoderBlock_Ablation_A(128, 64)
-        self.d2 = LightDecoderBlock_Ablation_A(64,  32)
-        self.d1 = LightDecoderBlock_Ablation_A(32,  16)
+        self.d4 = LightDecoderBlock_NoUAFM(256, 128)
+        self.d3 = LightDecoderBlock_NoUAFM(128, 64)
+        self.d2 = LightDecoderBlock_NoUAFM(64,  32)
+        self.d1 = LightDecoderBlock_NoUAFM(32,  16)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -280,4 +250,4 @@ class PicoUNet_Ablation_A(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=256):
-    return PicoUNet_Ablation_A(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_Ablation_NoDG(num_classes=num_classes, input_size=input_size)
