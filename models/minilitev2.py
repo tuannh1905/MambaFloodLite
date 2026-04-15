@@ -5,13 +5,13 @@ import torch.nn.functional as F
 # ==============================================================================
 # LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
 # - BOTTLE-NECK ĐƯỜNG THẲNG: Dùng DW 7x7, xóa bỏ hoàn toàn SPP và nhánh.
-# - MICRO-AG FUSION (ĐẢO THỨ TỰ): Dùng x_up sinh alpha để lọc x_skip TRƯỚC khi cộng.
-# - ULTRA DECODER: Xóa bỏ CBAM và Residual Addition ở Decoder để tối đa hóa FPS.
-# - NEAREST UPSAMPLE: Đảm bảo MCU nội suy ảnh tốc độ cao nhất.
+# - MICRO-AG FUSION: Attention Gate siêu nhẹ để lọc rác TRƯỚC khi cộng.
+# - ULTRA DECODER (NEW): Lột sạch Refine Conv, EdgeCBAM và Residual ở Decoder để Max FPS.
+# - NEAREST UPSAMPLE: Nội suy ảnh thô (không refine) để tiết kiệm FLOPs.
 # ==============================================================================
 
 # ==============================================================================
-# 1. ATTENTION MODULES
+# 1. ATTENTION MODULES (DUAL ATTENTION TỐI ƯU CHO MCU)
 # ==============================================================================
 class MicroSEBlock(nn.Module):
     def __init__(self, channels):
@@ -53,25 +53,23 @@ class EdgeCBAM(nn.Module):
         return x
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & MICRO ATTENTION GATE (Đã Sửa Lỗi Logic)
+# 2. NEAREST UPSAMPLE (Cắt bỏ Refine) & MICRO ATTENTION GATE
 # ==============================================================================
 class NearestUpsample(nn.Module):
-    def __init__(self, channels, scale_factor=2):
+    """
+    ✓ ĐÃ TỐI ƯU (ĐIỂM NGHẼN 1): Xóa hoàn toàn Conv 3x3 và BatchNorm.
+    Chỉ thực hiện phóng to Nearest đơn thuần để tiết kiệm FLOPs tối đa.
+    """
+    def __init__(self, scale_factor=2):
         super().__init__()
-        self.up     = nn.Upsample(scale_factor=scale_factor, mode='nearest')
-        self.refine = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
-        self.bn     = nn.BatchNorm2d(channels)
+        self.up = nn.Upsample(scale_factor=scale_factor, mode='nearest')
 
     def forward(self, x):
-        return self.bn(self.refine(self.up(x)))
+        return self.up(x)
 
 class MicroAGFusion(nn.Module):
-    """
-    Attention Gate Chuẩn xác: Dùng x_up để soi đường cho x_skip TRƯỚC khi trộn.
-    """
     def __init__(self, in_c, out_c):
         super().__init__()
-        # Gate CHỈ soi vào x_up (in_c kênh)
         self.gate = nn.Sequential(
             nn.Conv2d(in_c, 1, kernel_size=1, bias=False),
             nn.Hardsigmoid()
@@ -84,17 +82,17 @@ class MicroAGFusion(nn.Module):
         )
 
     def forward(self, x_up, x_skip):
-        # 1. Đảo thứ tự: X_up tự soi bản thân để tạo mặt nạ alpha
-        alpha = self.gate(x_up) 
+        # 1. Tìm sự đồng thuận không gian
+        alpha = self.gate(x_up + x_skip) 
         
-        # 2. Dùng mặt nạ alpha lọc sạch rác của x_skip
+        # 2. Cắt tỉa rác
         x_skip_gated = x_skip * alpha
         
-        # 3. Trộn (x_up + skip sạch) bằng phép cộng In-place
+        # 3. Trộn kênh
         return self.fuse_conv(x_up + x_skip_gated)
 
 # ==============================================================================
-# 3. SQUARE-PFCU-DG BLOCK
+# 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size):
@@ -136,7 +134,7 @@ class MultiScale_PFCU_DG(nn.Module):
         return self.attention(self.act(fused_context + guided_details))
 
 # ==============================================================================
-# 4. ENCODER, ULTRA-DECODER & LINEAR BOTTLE-NECK
+# 4. ENCODER, LIGHT-DECODER & LINEAR BOTTLE-NECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c):
@@ -168,22 +166,19 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
-class LightDecoderBlock_Ultra(nn.Module):
-    """
-    Decoder "Lột sạch": Đường ống trơn tuột, bỏ qua CBAM và Residual để kéo Max FPS.
-    """
+class LightDecoderBlock_AG(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
-        self.up = NearestUpsample(in_c, scale_factor=2)
+        self.up = NearestUpsample(scale_factor=2)
         self.fusion = MicroAGFusion(in_c=in_c, out_c=out_c) 
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
         self.refine_spatial = SquareDW(gc, kernel_size=5)
-        # ✓ ĐÃ GẠCH BỎ EdgeCBAM (Tránh Attention sau khi trộn)
+        # ✓ ĐÃ TỐI ƯU (ĐIỂM NGHẼN 2): Xóa bỏ hoàn toàn khối EdgeCBAM tại đây
         
         self.pw_up  = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         self.bn_up  = nn.BatchNorm2d(out_c)
@@ -192,16 +187,14 @@ class LightDecoderBlock_Ultra(nn.Module):
 
     def forward(self, x, skip):
         x = self.up(x)
-        
-        # Lọc và trộn
         fused = self.fusion(x, skip)
         
-        # Ép kênh -> DW 5x5 -> Nở kênh
         feat = self.act(self.bn_down(self.pw_down(fused)))
         feat = self.refine_spatial(feat)
         out = self.bn_up(self.pw_up(feat))
         
-        # ✓ ĐÃ GẠCH BỎ out + fused (Cứu RAM cực mạnh)
+        # ✓ ĐÃ TỐI ƯU (ĐIỂM NGHẼN 3): Xóa bỏ Residual Addition (out + fused)
+        # RAM được giải phóng ngay lập tức sau khi tính toán xong fused
         return self.act(out)
 
 class LinearBottleneck(nn.Module):
@@ -241,10 +234,10 @@ class PicoUNet_Edge(nn.Module):
 
         self.b4 = LinearBottleneck(256)
 
-        self.d4 = LightDecoderBlock_Ultra(256, 128)
-        self.d3 = LightDecoderBlock_Ultra(128, 64)
-        self.d2 = LightDecoderBlock_Ultra(64,  32)
-        self.d1 = LightDecoderBlock_Ultra(32,  16)
+        self.d4 = LightDecoderBlock_AG(256, 128)
+        self.d3 = LightDecoderBlock_AG(128, 64)
+        self.d2 = LightDecoderBlock_AG(64,  32)
+        self.d1 = LightDecoderBlock_AG(32,  16)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
