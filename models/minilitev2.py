@@ -5,8 +5,8 @@ import torch.nn.functional as F
 # ==============================================================================
 # LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
 # - BOTTLE-NECK ĐƯỜNG THẲNG: Dùng DW 7x7, xóa bỏ hoàn toàn SPP và nhánh (Branching).
-# - ADDITION FUSION: Thay thế Concat bằng phép Cộng (In-place) giúp giảm 50% RAM.
-# - EDGE-CBAM (NEW): Bổ sung Spatial Attention siêu nhẹ (~98 tham số) kết hợp Channel Attention.
+# - MICRO-UAFM (NEW): Lai tạo có trọng số (alpha) giữa x_up và x_skip thay vì cộng mù quáng.
+# - EDGE-CBAM: Bổ sung Spatial Attention siêu nhẹ (~98 tham số) kết hợp Channel Attention.
 # - NEAREST UPSAMPLE: Đảm bảo MCU nội suy ảnh tốc độ cao nhất.
 # ==============================================================================
 
@@ -61,7 +61,7 @@ class EdgeCBAM(nn.Module):
         return x
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & ADDITION FUSION (Siêu tiết kiệm RAM)
+# 2. NEAREST UPSAMPLE & MICRO-UAFM (Lai tạo có trọng số)
 # ==============================================================================
 class NearestUpsample(nn.Module):
     def __init__(self, channels, scale_factor=2):
@@ -73,12 +73,19 @@ class NearestUpsample(nn.Module):
     def forward(self, x):
         return self.bn(self.refine(self.up(x)))
 
-class SimpleAddFusion(nn.Module):
+class MicroUAFM(nn.Module):
     """
-    ✓ EDGE OPTIMIZED: Dùng phép CỘNG (128 kênh) thay vì Concat rồi ép về số kênh đầu ra.
+    Unified Attention Fusion Module - Phiên bản siêu nhẹ cho MCU.
+    Học cách "lai tạo" x_up và x_skip thay vì cộng mù quáng.
     """
     def __init__(self, in_c, out_c):
         super().__init__()
+        # Khối tạo Bản đồ trọng số Không gian (Spatial Gate) -> Tốn cực ít RAM
+        self.attn_gate = nn.Sequential(
+            nn.Conv2d(in_c, 1, kernel_size=1, bias=False),
+            nn.Hardsigmoid() 
+        )
+        
         self.fuse_conv = nn.Sequential(
             nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c),
@@ -86,7 +93,14 @@ class SimpleAddFusion(nn.Module):
         )
 
     def forward(self, x_up, x_skip):
-        return self.fuse_conv(x_up + x_skip)
+        # 1. Tạo bản đồ alpha (0 -> 1) dựa trên tổng hợp nháp
+        alpha = self.attn_gate(x_up + x_skip)
+        
+        # 2. Lai tạo có trọng số (Trọng tài xử lý mâu thuẫn)
+        fused = x_up * alpha + x_skip * (1.0 - alpha)
+        
+        # 3. Trộn kênh
+        return self.fuse_conv(fused)
 
 # ==============================================================================
 # 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
@@ -121,7 +135,6 @@ class MultiScale_PFCU_DG(nn.Module):
         self.bn_fuse = nn.BatchNorm2d(dim) 
         
         self.dg_shortcut = DetailGuidance(dim)
-        # ✓ ĐÃ CẬP NHẬT: Dùng EdgeCBAM thay vì MicroSEBlock
         self.attention = EdgeCBAM(dim) 
         self.act = nn.ReLU6(inplace=True)
 
@@ -164,19 +177,19 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
-class LightDecoderBlock_Add(nn.Module):
+class LightDecoderBlock_UAFM(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
         self.up     = NearestUpsample(in_c, scale_factor=2)
-        self.fusion = SimpleAddFusion(in_c=in_c, out_c=out_c) 
+        # ✓ ĐÃ CẬP NHẬT: Dùng MicroUAFM thay vì SimpleAddFusion
+        self.fusion = MicroUAFM(in_c=in_c, out_c=out_c) 
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
         self.refine_spatial = SquareDW(gc, kernel_size=5)
-        # ✓ ĐÃ CẬP NHẬT: Dùng EdgeCBAM thay vì MicroSEBlock
         self.attention = EdgeCBAM(gc) 
         
         self.pw_up  = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
@@ -203,7 +216,6 @@ class LinearBottleneck(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dw1 = SquareDW(dim, kernel_size=7)
-        # ✓ ĐÃ CẬP NHẬT: Dùng EdgeCBAM thay vì MicroSEBlock
         self.attention = EdgeCBAM(dim)
         self.dw2 = SquareDW(dim, kernel_size=7)
         
@@ -237,10 +249,11 @@ class PicoUNet_Edge(nn.Module):
 
         self.b4 = LinearBottleneck(256)
 
-        self.d4 = LightDecoderBlock_Add(256, 128)
-        self.d3 = LightDecoderBlock_Add(128, 64)
-        self.d2 = LightDecoderBlock_Add(64,  32)
-        self.d1 = LightDecoderBlock_Add(32,  16)
+        # ✓ ĐÃ CẬP NHẬT: Gọi LightDecoderBlock_UAFM
+        self.d4 = LightDecoderBlock_UAFM(256, 128)
+        self.d3 = LightDecoderBlock_UAFM(128, 64)
+        self.d2 = LightDecoderBlock_UAFM(64,  32)
+        self.d1 = LightDecoderBlock_UAFM(32,  16)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
