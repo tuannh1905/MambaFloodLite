@@ -5,14 +5,13 @@ import torch.nn.functional as F
 # ==============================================================================
 # LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
 # - BOTTLE-NECK ĐƯỜNG THẲNG: Dùng DW 7x7, xóa bỏ hoàn toàn SPP và nhánh.
-# - MICRO-AG FUSION (NEW): Attention Gate siêu nhẹ (chỉ tốn ~480 params toàn mạng)
-#   để dùng Decoder (x_up) làm màng lọc cắt rác cho Encoder (x_skip) trước khi cộng.
-# - EDGE-CBAM: Bổ sung Spatial Attention siêu nhẹ (~98 tham số) kết hợp Channel Attention.
+# - MICRO-AG FUSION (ĐẢO THỨ TỰ): Dùng x_up sinh alpha để lọc x_skip TRƯỚC khi cộng.
+# - ULTRA DECODER: Xóa bỏ CBAM và Residual Addition ở Decoder để tối đa hóa FPS.
 # - NEAREST UPSAMPLE: Đảm bảo MCU nội suy ảnh tốc độ cao nhất.
 # ==============================================================================
 
 # ==============================================================================
-# 1. ATTENTION MODULES (DUAL ATTENTION TỐI ƯU CHO MCU)
+# 1. ATTENTION MODULES
 # ==============================================================================
 class MicroSEBlock(nn.Module):
     def __init__(self, channels):
@@ -54,7 +53,7 @@ class EdgeCBAM(nn.Module):
         return x
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & MICRO ATTENTION GATE (Hướng 2)
+# 2. NEAREST UPSAMPLE & MICRO ATTENTION GATE (Đã Sửa Lỗi Logic)
 # ==============================================================================
 class NearestUpsample(nn.Module):
     def __init__(self, channels, scale_factor=2):
@@ -68,20 +67,16 @@ class NearestUpsample(nn.Module):
 
 class MicroAGFusion(nn.Module):
     """
-    Attention Gate Siêu Nhẹ (Micro Attention Gate).
-    Dùng x_up để soi đường cho x_skip.
-    Overhead tham số: Bằng đúng in_c (vài trăm tham số).
+    Attention Gate Chuẩn xác: Dùng x_up để soi đường cho x_skip TRƯỚC khi trộn.
     """
     def __init__(self, in_c, out_c):
         super().__init__()
-        # Tạo Bản đồ chú ý không gian (Spatial Gate) từ sự kết hợp của x_up và x_skip
-        # Ép in_c kênh xuống 1 kênh duy nhất
+        # Gate CHỈ soi vào x_up (in_c kênh)
         self.gate = nn.Sequential(
             nn.Conv2d(in_c, 1, kernel_size=1, bias=False),
             nn.Hardsigmoid()
         )
         
-        # Khối trộn kênh cuối cùng
         self.fuse_conv = nn.Sequential(
             nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c),
@@ -89,17 +84,17 @@ class MicroAGFusion(nn.Module):
         )
 
     def forward(self, x_up, x_skip):
-        # 1. Tìm sự đồng thuận không gian giữa 2 luồng (Tìm ra chỗ nào có nước)
-        alpha = self.gate(x_up + x_skip) # Shape: (B, 1, H, W)
+        # 1. Đảo thứ tự: X_up tự soi bản thân để tạo mặt nạ alpha
+        alpha = self.gate(x_up) 
         
-        # 2. Dùng mặt nạ alpha cắt tỉa sạch sẽ rác của x_skip
+        # 2. Dùng mặt nạ alpha lọc sạch rác của x_skip
         x_skip_gated = x_skip * alpha
         
-        # 3. Cộng x_up với x_skip_gated (thay vì x_skip đầy rác) và trộn kênh
+        # 3. Trộn (x_up + skip sạch) bằng phép cộng In-place
         return self.fuse_conv(x_up + x_skip_gated)
 
 # ==============================================================================
-# 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
+# 3. SQUARE-PFCU-DG BLOCK
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size):
@@ -141,7 +136,7 @@ class MultiScale_PFCU_DG(nn.Module):
         return self.attention(self.act(fused_context + guided_details))
 
 # ==============================================================================
-# 4. ENCODER, LIGHT-DECODER & LINEAR BOTTLE-NECK
+# 4. ENCODER, ULTRA-DECODER & LINEAR BOTTLE-NECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c):
@@ -173,21 +168,22 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
-class LightDecoderBlock_AG(nn.Module):
+class LightDecoderBlock_Ultra(nn.Module):
+    """
+    Decoder "Lột sạch": Đường ống trơn tuột, bỏ qua CBAM và Residual để kéo Max FPS.
+    """
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
         self.up = NearestUpsample(in_c, scale_factor=2)
-        
-        # ✓ ĐÃ CẬP NHẬT: Dùng Khối MicroAG Fusion siêu nhẹ
         self.fusion = MicroAGFusion(in_c=in_c, out_c=out_c) 
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
         self.refine_spatial = SquareDW(gc, kernel_size=5)
-        self.attention = EdgeCBAM(gc) 
+        # ✓ ĐÃ GẠCH BỎ EdgeCBAM (Tránh Attention sau khi trộn)
         
         self.pw_up  = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         self.bn_up  = nn.BatchNorm2d(out_c)
@@ -197,15 +193,16 @@ class LightDecoderBlock_AG(nn.Module):
     def forward(self, x, skip):
         x = self.up(x)
         
-        # Gửi x_up và skip vào Cổng chú ý để cắt rác rồi trộn
+        # Lọc và trộn
         fused = self.fusion(x, skip)
         
+        # Ép kênh -> DW 5x5 -> Nở kênh
         feat = self.act(self.bn_down(self.pw_down(fused)))
         feat = self.refine_spatial(feat)
-        feat = self.attention(feat)
-        
         out = self.bn_up(self.pw_up(feat))
-        return self.act(out + fused)
+        
+        # ✓ ĐÃ GẠCH BỎ out + fused (Cứu RAM cực mạnh)
+        return self.act(out)
 
 class LinearBottleneck(nn.Module):
     def __init__(self, dim):
@@ -244,11 +241,10 @@ class PicoUNet_Edge(nn.Module):
 
         self.b4 = LinearBottleneck(256)
 
-        # ✓ ĐÃ CẬP NHẬT: Gọi LightDecoderBlock_AG
-        self.d4 = LightDecoderBlock_AG(256, 128)
-        self.d3 = LightDecoderBlock_AG(128, 64)
-        self.d2 = LightDecoderBlock_AG(64,  32)
-        self.d1 = LightDecoderBlock_AG(32,  16)
+        self.d4 = LightDecoderBlock_Ultra(256, 128)
+        self.d3 = LightDecoderBlock_Ultra(128, 64)
+        self.d2 = LightDecoderBlock_Ultra(64,  32)
+        self.d1 = LightDecoderBlock_Ultra(32,  16)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
