@@ -5,10 +5,10 @@ import torch.nn.functional as F
 # ==============================================================================
 # LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
 # - BOTTLE-NECK ĐƯỜNG THẲNG: Dùng DW 7x7, xóa bỏ hoàn toàn SPP và nhánh.
-# - SELF-CLEANING SKIP (NEW): Skip connection tự làm sạch rác bằng EdgeCBAM.
-# - SMART DECODER (NEW): Trộn bằng Add In-place, khôi phục Channel Attention sau DW 5x5.
-# - NEAREST UPSAMPLE: Nội suy ảnh thô (không refine) để tiết kiệm FLOPs.
-# - LƯỢNG HÓA INT8: Chuẩn hóa 100% dùng ReLU6 và Hardsigmoid.
+# - MICRO-AG FUSION: Attention Gate siêu nhẹ cắt rác cho Encoder trước khi cộng.
+# - ASYMMETRIC ENCODER (NEW): e1 chạy đường thẳng 7x7, e2-e4 phân nhánh.
+# - ASYMMETRIC DECODER (NEW): d1, d2 lột sạch CBAM/Residual để ép RAM; d3, d4 giữ nguyên.
+# - LARGE KERNEL STEM (NEW): Đầu vào dùng Conv 7x7 mở rộng tầm nhìn toàn cục.
 # ==============================================================================
 
 # ==============================================================================
@@ -54,30 +54,38 @@ class EdgeCBAM(nn.Module):
         return x
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & SELF-CLEANING SKIP
+# 2. NEAREST UPSAMPLE & MICRO ATTENTION GATE FUSION
 # ==============================================================================
 class NearestUpsample(nn.Module):
-    def __init__(self, scale_factor=2):
+    def __init__(self, channels, scale_factor=2):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=scale_factor, mode='nearest')
+        self.up     = nn.Upsample(scale_factor=scale_factor, mode='nearest')
+        self.refine = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
+        self.bn     = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        return self.up(x)
+        return self.bn(self.refine(self.up(x)))
 
-class SelfCleaningSkip(nn.Module):
-    """
-    Skip Connection tự làm sạch: Dùng góc nhìn 7x7 của CBAM để tự quét rác 
-    trước khi nhập hội với Decoder. Tránh tình trạng bị Decoder làm "mù lòa".
-    """
-    def __init__(self, channels):
+class MicroAGFusion(nn.Module):
+    def __init__(self, in_c, out_c):
         super().__init__()
-        self.cleaner = EdgeCBAM(channels, spatial_kernel=7)
-        
-    def forward(self, x_skip):
-        return self.cleaner(x_skip)
+        self.gate = nn.Sequential(
+            nn.Conv2d(in_c, 1, kernel_size=1, bias=False),
+            nn.Hardsigmoid()
+        )
+        self.fuse_conv = nn.Sequential(
+            nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c),
+            nn.ReLU6(inplace=True)
+        )
+
+    def forward(self, x_up, x_skip):
+        alpha = self.gate(x_up + x_skip) 
+        x_skip_gated = x_skip * alpha
+        return self.fuse_conv(x_up + x_skip_gated)
 
 # ==============================================================================
-# 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
+# 3. PFCU BLOCKS: LINEAR (Ép RAM) & MULTI-SCALE (Tăng mIoU)
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size):
@@ -98,7 +106,25 @@ class DetailGuidance(nn.Module):
     def forward(self, x):
         return x + self.bn(self.dw(x))
 
+class Linear_PFCU(nn.Module):
+    """ Dành cho tầng e1 (độ phân giải khổng lồ): Không phân nhánh, chỉ dùng MicroSE """
+    def __init__(self, dim):
+        super().__init__()
+        self.large_kernel = SquareDW(dim, kernel_size=7)
+        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn_fuse = nn.BatchNorm2d(dim) 
+        self.dg_shortcut = DetailGuidance(dim)
+        self.attention = MicroSEBlock(dim) # Chỉ dùng SE để đỡ tốn RAM không gian
+        self.act = nn.ReLU6(inplace=True)
+
+    def forward(self, x):
+        context = self.large_kernel(x)
+        fused_context = self.bn_fuse(self.pw_fuse(context))
+        guided_details = self.dg_shortcut(x)
+        return self.attention(self.act(fused_context + guided_details))
+
 class MultiScale_PFCU_DG(nn.Module):
+    """ Dành cho tầng e2, e3, e4 (độ phân giải nhỏ): Phân nhánh, dùng EdgeCBAM """
     def __init__(self, dim):
         super().__init__()
         self.branch_3 = SquareDW(dim, kernel_size=3)
@@ -107,7 +133,6 @@ class MultiScale_PFCU_DG(nn.Module):
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim) 
-        
         self.dg_shortcut = DetailGuidance(dim)
         self.attention = EdgeCBAM(dim) 
         self.act = nn.ReLU6(inplace=True)
@@ -119,91 +144,114 @@ class MultiScale_PFCU_DG(nn.Module):
         return self.attention(self.act(fused_context + guided_details))
 
 # ==============================================================================
-# 4. ENCODER, SMART-DECODER & LINEAR BOTTLE-NECK
+# 4. ENCODER ASYMMETRIC, DECODER ASYMMETRIC & LINEAR BOTTLE-NECK
 # ==============================================================================
-class EncoderBlock(nn.Module):
+class EncoderBlock_Linear(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
-        self.pfcu_dg   = MultiScale_PFCU_DG(in_c)
+        self.pfcu_dg = Linear_PFCU(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
 
         if not self.same_channels:
-            self.pw      = nn.Conv2d(in_c, conv_out, kernel_size=1, bias=False)
-            self.bn_pw   = nn.BatchNorm2d(conv_out) 
+            self.pw = nn.Conv2d(in_c, conv_out, kernel_size=1, bias=False)
+            self.bn_pw = nn.BatchNorm2d(conv_out) 
             self.down_pw = nn.MaxPool2d((2, 2))
-
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x):
         feat = self.pfcu_dg(x) 
-
         if self.same_channels:
             return self.act(self.down_pool(feat)), feat
         else:
             feat_pw = self.bn_pw(self.pw(feat)) 
             skip = torch.cat([feat, feat_pw], dim=1) 
-            
             pool_feat = self.down_pool(feat)
             pool_pw   = self.down_pw(feat_pw)
-            x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
-            return x, skip
+            return self.act(torch.cat([pool_feat, pool_pw], dim=1)), skip
 
-class LightDecoderBlock_Smart(nn.Module):
-    """
-    Decoder "Thông minh":
-    1. Trộn bằng In-place Addition (Cứu Peak RAM).
-    2. Không dùng Residual cuối mạng (Cứu Peak RAM).
-    3. Trả lại Channel Attention sau khi vuốt mượt (Tốn ~0 RAM, tăng mIoU).
-    """
+class EncoderBlock_MultiScale(nn.Module):
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        self.same_channels = (in_c == out_c)
+        conv_out = out_c - in_c if not self.same_channels else out_c
+
+        self.pfcu_dg = MultiScale_PFCU_DG(in_c)
+        self.down_pool = nn.MaxPool2d((2, 2))
+
+        if not self.same_channels:
+            self.pw = nn.Conv2d(in_c, conv_out, kernel_size=1, bias=False)
+            self.bn_pw = nn.BatchNorm2d(conv_out) 
+            self.down_pw = nn.MaxPool2d((2, 2))
+        self.act = nn.ReLU6(inplace=True)
+
+    def forward(self, x):
+        feat = self.pfcu_dg(x) 
+        if self.same_channels:
+            return self.act(self.down_pool(feat)), feat
+        else:
+            feat_pw = self.bn_pw(self.pw(feat)) 
+            skip = torch.cat([feat, feat_pw], dim=1) 
+            pool_feat = self.down_pool(feat)
+            pool_pw   = self.down_pw(feat_pw)
+            return self.act(torch.cat([pool_feat, pool_pw], dim=1)), skip
+
+class LightDecoderBlock_AG_Deep(nn.Module):
+    """ Dùng cho tầng d4, d3: Giữ nguyên CBAM và Residual vì RAM còn rộng rãi """
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
-        self.up = NearestUpsample(scale_factor=2)
-        
-        # ✓ ĐÃ CẬP NHẬT: Skip tự dọn rác
-        self.skip_cleaner = SelfCleaningSkip(in_c)
-        
-        self.fuse_conv = nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU6(inplace=True)
-        )
+        self.up = NearestUpsample(in_c, scale_factor=2)
+        self.fusion = MicroAGFusion(in_c=in_c, out_c=out_c) 
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
         self.refine_spatial = SquareDW(gc, kernel_size=5)
-        
-        # ✓ ĐÃ CẬP NHẬT: Bơm lại Channel Attention
-        self.channel_att = MicroSEBlock(gc)
+        self.attention = EdgeCBAM(gc) 
         
         self.pw_up  = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         self.bn_up  = nn.BatchNorm2d(out_c)
-        
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x, skip):
         x = self.up(x)
-        
-        # Skip tự làm sạch trước
-        skip_clean = self.skip_cleaner(skip)
-        
-        # Cộng và trộn kênh (In-place)
-        fused = self.fuse_conv(x + skip_clean)
-        
-        # Ép kênh -> DW 5x5 -> Nhấn mạnh Kênh -> Nở kênh
+        fused = self.fusion(x, skip)
         feat = self.act(self.bn_down(self.pw_down(fused)))
         feat = self.refine_spatial(feat)
-        feat = self.channel_att(feat) 
-        
+        feat = self.attention(feat)
         out = self.bn_up(self.pw_up(feat))
+        return self.act(out + fused)
+
+class LightDecoderBlock_AG_Shallow(nn.Module):
+    """ Dùng cho tầng d2, d1: Lột sạch CBAM và Residual để cứu Peak RAM """
+    def __init__(self, in_c, out_c):
+        super().__init__()
+        gc = max(out_c // 4, 4)
+
+        self.up = NearestUpsample(in_c, scale_factor=2)
+        self.fusion = MicroAGFusion(in_c=in_c, out_c=out_c) 
+
+        self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
+        self.bn_down = nn.BatchNorm2d(gc)
         
-        # Đường ống đi thẳng, tính xong xóa luôn biến cũ
-        return self.act(out)
+        self.refine_spatial = SquareDW(gc, kernel_size=5)
+        # Bỏ CBAM hoàn toàn
+        
+        self.pw_up  = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
+        self.bn_up  = nn.BatchNorm2d(out_c)
+        self.act = nn.ReLU6(inplace=True)
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        fused = self.fusion(x, skip)
+        feat = self.act(self.bn_down(self.pw_down(fused)))
+        feat = self.refine_spatial(feat)
+        out = self.bn_up(self.pw_up(feat))
+        return self.act(out) # Bỏ cộng dư (fused)
 
 class LinearBottleneck(nn.Module):
     def __init__(self, dim):
@@ -224,7 +272,7 @@ class LinearBottleneck(nn.Module):
         return out + x 
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (PicoUNet EDGE)
+# 5. MẠNG CHÍNH (PicoUNet EDGE ASYMMETRIC)
 # ==============================================================================
 class PicoUNet_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=256):
@@ -233,20 +281,26 @@ class PicoUNet_Edge(nn.Module):
         if input_size % 16 != 0:
             raise ValueError(f"PicoUNet yêu cầu input_size chia hết cho 16.")
 
-        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
+        # ✓ Stem 7x7 mở góc nhìn rộng
+        self.conv_in = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU6(inplace=True)
+        )
 
-        self.e1 = EncoderBlock(16,  32)
-        self.e2 = EncoderBlock(32,  64)
-        self.e3 = EncoderBlock(64,  128)
-        self.e4 = EncoderBlock(128, 256)
+        # ✓ Encoder Bất đối xứng
+        self.e1 = EncoderBlock_Linear(16,  32)      # Linear (Chống Peak RAM)
+        self.e2 = EncoderBlock_MultiScale(32,  64)  # Multi-Scale (Tăng mIoU)
+        self.e3 = EncoderBlock_MultiScale(64,  128) # Multi-Scale
+        self.e4 = EncoderBlock_MultiScale(128, 256) # Multi-Scale
 
         self.b4 = LinearBottleneck(256)
 
-        # Gọi LightDecoderBlock_Smart
-        self.d4 = LightDecoderBlock_Smart(256, 128)
-        self.d3 = LightDecoderBlock_Smart(128, 64)
-        self.d2 = LightDecoderBlock_Smart(64,  32)
-        self.d1 = LightDecoderBlock_Smart(32,  16)
+        # ✓ Decoder Bất đối xứng
+        self.d4 = LightDecoderBlock_AG_Deep(256, 128)    # Giữ CBAM, Residual
+        self.d3 = LightDecoderBlock_AG_Deep(128, 64)     # Giữ CBAM, Residual
+        self.d2 = LightDecoderBlock_AG_Shallow(64,  32)  # Bỏ CBAM, Residual
+        self.d1 = LightDecoderBlock_AG_Shallow(32,  16)  # Bỏ CBAM, Residual
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
