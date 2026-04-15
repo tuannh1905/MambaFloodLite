@@ -4,9 +4,9 @@ import torch.nn.functional as F
 
 # ==============================================================================
 # LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
-# - BOTTLE-NECK ĐƯỜNG THẲNG: Dùng DW 7x7, xóa bỏ hoàn toàn SPP và nhánh (Branching).
-# - PRE-FUSION FILTERING (NEW): Dùng MicroSE "rửa sạch" skip connection trước khi đem cộng.
-# - ADDITION FUSION: Dùng phép Cộng (In-place) giúp giảm 50% RAM so với Concat.
+# - BOTTLE-NECK ĐƯỜNG THẲNG: Dùng DW 7x7, xóa bỏ hoàn toàn SPP và nhánh.
+# - MICRO-AG FUSION (NEW): Attention Gate siêu nhẹ (chỉ tốn ~480 params toàn mạng)
+#   để dùng Decoder (x_up) làm màng lọc cắt rác cho Encoder (x_skip) trước khi cộng.
 # - EDGE-CBAM: Bổ sung Spatial Attention siêu nhẹ (~98 tham số) kết hợp Channel Attention.
 # - NEAREST UPSAMPLE: Đảm bảo MCU nội suy ảnh tốc độ cao nhất.
 # ==============================================================================
@@ -30,10 +30,6 @@ class MicroSEBlock(nn.Module):
         return x * self.se(y)
 
 class MicroSpatialAttention(nn.Module):
-    """
-    Attention Không gian (Spatial): Tập trung vào "Vị trí nào là nước".
-    Sử dụng torch.mean và torch.max dọc theo trục kênh cực kỳ thân thiện với MCU.
-    """
     def __init__(self, kernel_size=7):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
@@ -47,10 +43,6 @@ class MicroSpatialAttention(nn.Module):
         return x * self.hardsigmoid(y)
 
 class EdgeCBAM(nn.Module):
-    """
-    Cơ chế Dual Attention (CBAM) chuẩn Công nghiệp: Kênh trước, Không gian sau.
-    Tuyệt đối không dùng Permute/Reshape.
-    """
     def __init__(self, channels, spatial_kernel=7):
         super().__init__()
         self.channel_att = MicroSEBlock(channels)
@@ -62,7 +54,7 @@ class EdgeCBAM(nn.Module):
         return x
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & ADDITION FUSION
+# 2. NEAREST UPSAMPLE & MICRO ATTENTION GATE (Hướng 2)
 # ==============================================================================
 class NearestUpsample(nn.Module):
     def __init__(self, channels, scale_factor=2):
@@ -74,12 +66,22 @@ class NearestUpsample(nn.Module):
     def forward(self, x):
         return self.bn(self.refine(self.up(x)))
 
-class SimpleAddFusion(nn.Module):
+class MicroAGFusion(nn.Module):
     """
-    Dùng phép CỘNG (128 kênh) siêu tiết kiệm RAM.
+    Attention Gate Siêu Nhẹ (Micro Attention Gate).
+    Dùng x_up để soi đường cho x_skip.
+    Overhead tham số: Bằng đúng in_c (vài trăm tham số).
     """
     def __init__(self, in_c, out_c):
         super().__init__()
+        # Tạo Bản đồ chú ý không gian (Spatial Gate) từ sự kết hợp của x_up và x_skip
+        # Ép in_c kênh xuống 1 kênh duy nhất
+        self.gate = nn.Sequential(
+            nn.Conv2d(in_c, 1, kernel_size=1, bias=False),
+            nn.Hardsigmoid()
+        )
+        
+        # Khối trộn kênh cuối cùng
         self.fuse_conv = nn.Sequential(
             nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c),
@@ -87,7 +89,14 @@ class SimpleAddFusion(nn.Module):
         )
 
     def forward(self, x_up, x_skip):
-        return self.fuse_conv(x_up + x_skip)
+        # 1. Tìm sự đồng thuận không gian giữa 2 luồng (Tìm ra chỗ nào có nước)
+        alpha = self.gate(x_up + x_skip) # Shape: (B, 1, H, W)
+        
+        # 2. Dùng mặt nạ alpha cắt tỉa sạch sẽ rác của x_skip
+        x_skip_gated = x_skip * alpha
+        
+        # 3. Cộng x_up với x_skip_gated (thay vì x_skip đầy rác) và trộn kênh
+        return self.fuse_conv(x_up + x_skip_gated)
 
 # ==============================================================================
 # 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
@@ -164,18 +173,15 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
-class LightDecoderBlock_PreFilter(nn.Module):
+class LightDecoderBlock_AG(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
         self.up = NearestUpsample(in_c, scale_factor=2)
         
-        # ✓ ĐÃ CẬP NHẬT: Trạm gác lọc rác nhánh Skip
-        self.skip_filter = MicroSEBlock(in_c)
-        
-        # Vẫn dùng SimpleAddFusion như cũ
-        self.fusion = SimpleAddFusion(in_c=in_c, out_c=out_c) 
+        # ✓ ĐÃ CẬP NHẬT: Dùng Khối MicroAG Fusion siêu nhẹ
+        self.fusion = MicroAGFusion(in_c=in_c, out_c=out_c) 
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
@@ -191,9 +197,8 @@ class LightDecoderBlock_PreFilter(nn.Module):
     def forward(self, x, skip):
         x = self.up(x)
         
-        # Rửa sạch dữ liệu skip trước khi cho "qua cầu"
-        skip_filtered = self.skip_filter(skip)
-        fused = self.fusion(x, skip_filtered)
+        # Gửi x_up và skip vào Cổng chú ý để cắt rác rồi trộn
+        fused = self.fusion(x, skip)
         
         feat = self.act(self.bn_down(self.pw_down(fused)))
         feat = self.refine_spatial(feat)
@@ -239,11 +244,11 @@ class PicoUNet_Edge(nn.Module):
 
         self.b4 = LinearBottleneck(256)
 
-        # ✓ ĐÃ CẬP NHẬT: Gọi LightDecoderBlock_PreFilter
-        self.d4 = LightDecoderBlock_PreFilter(256, 128)
-        self.d3 = LightDecoderBlock_PreFilter(128, 64)
-        self.d2 = LightDecoderBlock_PreFilter(64,  32)
-        self.d1 = LightDecoderBlock_PreFilter(32,  16)
+        # ✓ ĐÃ CẬP NHẬT: Gọi LightDecoderBlock_AG
+        self.d4 = LightDecoderBlock_AG(256, 128)
+        self.d3 = LightDecoderBlock_AG(128, 64)
+        self.d2 = LightDecoderBlock_AG(64,  32)
+        self.d1 = LightDecoderBlock_AG(32,  16)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
