@@ -5,10 +5,10 @@ import torch.nn.functional as F
 # ==============================================================================
 # LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
 # - ✓ ĐÃ CẬP NHẬT 1: ECABlock hoàn toàn sạch bóng lệnh permute(), dùng Conv2d 1x1.
-# - ✓ ĐÃ CẬP NHẬT 2: Thin Stem - Bắt đầu từ 8 kênh thay vì 16 kênh để ép FLOPs.
-# - ✓ ĐÃ CẬP NHẬT 3: Factorized_PFCU_DG - Đổi 3 nhánh (3,5,7) thành 2 nhánh (3,5).
-# - ✓ ĐÃ CẬP NHẬT 4: SequentialDilatedBottleneck - Xóa bỏ F.interpolate và SPP.
-# - BOTTLE-NECK TĨNH & NEAREST UPSAMPLE: Giữ nguyên để tương thích.
+# - ✓ ĐÃ CẬP NHẬT 2: Phục hồi Base Channel = 16 (Tối ưu cho 128x128 Input).
+# - ✓ ĐÃ CẬP NHẬT 3: Factorized_PFCU_DG - Feature Reuse 3 lớp 3x3 để tạo 3x3, 5x5, 7x7.
+# - ✓ ĐÃ CẬP NHẬT 4: Xóa sạch từ khóa `dilation` khỏi mọi class (Chống MCU lỗi).
+# - ✓ ĐÃ CẬP NHẬT 5: StackedBottleneck - Xếp chồng 4 lớp 3x3 để đạt RF=9x9.
 # ==============================================================================
 
 # ==============================================================================
@@ -16,8 +16,8 @@ import torch.nn.functional as F
 # ==============================================================================
 class ECABlock(nn.Module):
     """
-    ✓ TỐI ƯU: Đã xóa sổ hoàn toàn permute().
-    Dùng Conv2d 1x1 trên ma trận (B, C, 1, 1) để học Channel Attention.
+    Bản thay thế hoàn hảo cho khối Squeeze-and-Excitation (FC layers) trong sơ đồ gốc.
+    Dùng Conv2d 1x1 để học Channel Attention không cần xáo trộn bộ nhớ.
     """
     def __init__(self, channels):
         super().__init__()
@@ -35,7 +35,7 @@ class ECABlock(nn.Module):
         return x * y
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & SIMPLE FUSION (GIỮ NGUYÊN BẢN ABLATION)
+# 2. NEAREST UPSAMPLE & SIMPLE FUSION
 # ==============================================================================
 class NearestUpsample(nn.Module):
     def __init__(self, channels, scale_factor=2):
@@ -64,11 +64,9 @@ class SimpleConcatFusion(nn.Module):
 # 3. KHỐI ENCODER MỚI: FACTORIZED INCEPTION-LITE
 # ==============================================================================
 class SquareDW(nn.Module):
-    def __init__(self, dim, kernel_size=3, dilation=1):
+    def __init__(self, dim):
         super().__init__()
-        padding = (kernel_size // 2) * dilation
-        self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, 
-                            dilation=dilation, groups=dim, bias=False)
+        self.dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
         self.bn = nn.BatchNorm2d(dim) 
 
     def forward(self, x):
@@ -85,17 +83,15 @@ class DetailGuidance(nn.Module):
 
 class Factorized_PFCU_DG(nn.Module):
     """
-    ✓ TỐI ƯU: Chỉ còn 2 nhánh song song (giảm Peak RAM).
-    Nhánh 5x5 được tách thành 2 lớp DW 3x3 chạy nối tiếp để MCU tính nhanh hơn.
+    ✓ TỐI ƯU: Feature Reuse (Tái sử dụng đặc trưng).
+    Thay vì 3 nhánh song song, ta chạy 3 lớp 3x3 nối tiếp và trích xuất ở từng chặng.
+    Vừa đạt được 3x3, 5x5, 7x7, vừa ép Peak RAM xuống mức cực thấp.
     """
     def __init__(self, dim):
         super().__init__()
-        # Nhánh 1: Bắt chi tiết (3x3)
-        self.branch_3 = SquareDW(dim, kernel_size=3)
-        
-        # Nhánh 2: Bắt ngữ cảnh (5x5 phân rã)
-        self.branch_5_part1 = SquareDW(dim, kernel_size=3)
-        self.branch_5_part2 = SquareDW(dim, kernel_size=3)
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) # Chạy tiếp từ 3x3
+        self.dw_7x7 = SquareDW(dim) # Chạy tiếp từ 5x5
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim) 
@@ -105,15 +101,16 @@ class Factorized_PFCU_DG(nn.Module):
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x):
-        b3 = self.branch_3(x)
-        b5 = self.branch_5_part2(self.branch_5_part1(x))
+        b3 = self.dw_3x3(x)         # Receptive Field: 3x3
+        b5 = self.dw_5x5(b3)        # Receptive Field: 5x5
+        b7 = self.dw_7x7(b5)        # Receptive Field: 7x7
         
-        fused_context = self.bn_fuse(self.pw_fuse(b3 + b5))
+        fused_context = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
         guided_details = self.dg_shortcut(x)
         return self.eca(self.act(fused_context + guided_details))
 
 # ==============================================================================
-# 4. ENCODER, DECODER & BOTTLE-NECK GIÃN NỞ TUẦN TỰ
+# 4. ENCODER, DECODER & STACKED BOTTLE-NECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c):
@@ -156,7 +153,9 @@ class LightDecoderBlock_NoUAFM(nn.Module):
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
-        self.refine_spatial = SquareDW(gc, kernel_size=5)
+        self.refine_spatial_1 = SquareDW(gc)
+        self.refine_spatial_2 = SquareDW(gc)
+        
         self.eca = ECABlock(gc) 
         
         self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
@@ -169,23 +168,23 @@ class LightDecoderBlock_NoUAFM(nn.Module):
         fused = self.fusion(x, skip)
         
         feat = self.act(self.bn_down(self.pw_down(fused)))
-        feat = self.refine_spatial(feat)
+        feat = self.refine_spatial_2(self.refine_spatial_1(feat))
         feat = self.eca(feat)
         
         out = self.bn_up(self.pw_up(feat))
         return self.act(out + fused)
 
-class SequentialDilatedBottleneck(nn.Module):
+class StackedBottleneck(nn.Module):
     """
-    ✓ TỐI ƯU: Thay thế hoàn toàn SPP nặng nề.
-    Chạy 3 lớp DW 3x3 tuần tự với Dilation tăng dần (1 -> 2 -> 4).
-    Tạo ra Receptive Field tương đương 15x15 nhưng bộ nhớ chỉ nạp 1 đường thẳng.
+    ✓ TỐI ƯU: Đập bỏ SPP và Dilation.
+    Xếp chồng 4 lớp DW 3x3 để đạt góc nhìn 9x9 (Bao trọn ảnh 8x8 ở đáy mạng).
     """
     def __init__(self, dim):
         super().__init__()
-        self.dw1 = SquareDW(dim, kernel_size=3, dilation=1)
-        self.dw2 = SquareDW(dim, kernel_size=3, dilation=2)
-        self.dw3 = SquareDW(dim, kernel_size=3, dilation=4)
+        self.dw1 = SquareDW(dim) # Góc nhìn: 3x3
+        self.dw2 = SquareDW(dim) # Góc nhìn: 5x5
+        self.dw3 = SquareDW(dim) # Góc nhìn: 7x7
+        self.dw4 = SquareDW(dim) # Góc nhìn: 9x9
         
         self.pw = nn.Sequential(
             nn.Conv2d(dim, dim, kernel_size=1, bias=False),
@@ -195,15 +194,13 @@ class SequentialDilatedBottleneck(nn.Module):
         self.eca = ECABlock(dim)
 
     def forward(self, x):
-        out = self.dw1(x)
-        out = self.dw2(out)
-        out = self.dw3(out)
+        out = self.dw4(self.dw3(self.dw2(self.dw1(x))))
         out = self.pw(out)
         out = self.eca(out)
         return out + x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (THIN STEM: 128x128 INPUT TỐI ƯU)
+# 5. MẠNG CHÍNH (ĐÃ PHỤC HỒI BASE CHANNELS = 16)
 # ==============================================================================
 class PicoUNet_Ablation_NoUAFM(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -212,25 +209,22 @@ class PicoUNet_Ablation_NoUAFM(nn.Module):
         if input_size % 16 != 0:
             raise ValueError(f"PicoUNet yêu cầu input_size chia hết cho 16.")
 
-        # ✓ TỐI ƯU: Thin Stem. Bắt đầu với 8 kênh thay vì 16 kênh.
-        self.conv_in = nn.Conv2d(3, 8, kernel_size=3, padding=1)
+        # ✓ Đã phục hồi 16 kênh
+        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # Số kênh nở dần: 8 -> 16 -> 32 -> 64 -> 128
-        self.e1 = EncoderBlock(8,   16)
-        self.e2 = EncoderBlock(16,  32)
-        self.e3 = EncoderBlock(32,  64)
-        self.e4 = EncoderBlock(64, 128)
+        self.e1 = EncoderBlock(16,  32)
+        self.e2 = EncoderBlock(32,  64)
+        self.e3 = EncoderBlock(64,  128)
+        self.e4 = EncoderBlock(128, 256)
 
-        # Bottleneck mới: Dilation tuần tự
-        self.b4 = SequentialDilatedBottleneck(128)
+        self.b4 = StackedBottleneck(256)
 
-        # Decoder lùi dần số kênh: 128 -> 64 -> 32 -> 16 -> 8
-        self.d4 = LightDecoderBlock_NoUAFM(128, 64)
-        self.d3 = LightDecoderBlock_NoUAFM(64,  32)
-        self.d2 = LightDecoderBlock_NoUAFM(32,  16)
-        self.d1 = LightDecoderBlock_NoUAFM(16,   8)
+        self.d4 = LightDecoderBlock_NoUAFM(256, 128)
+        self.d3 = LightDecoderBlock_NoUAFM(128, 64)
+        self.d2 = LightDecoderBlock_NoUAFM(64,  32)
+        self.d1 = LightDecoderBlock_NoUAFM(32,  16)
 
-        self.conv_out = nn.Conv2d(8, num_classes, kernel_size=1)
+        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
