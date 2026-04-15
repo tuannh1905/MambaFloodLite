@@ -4,57 +4,40 @@ import torch.nn.functional as F
 
 # ==============================================================================
 # LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
-# - BOTTLE-NECK ĐƯỜNG THẲNG: Dùng DW 7x7, xóa bỏ hoàn toàn SPP và nhánh.
-# - MICRO-AG FUSION (NEW): Attention Gate siêu nhẹ (chỉ tốn ~480 params toàn mạng)
-#   để dùng Decoder (x_up) làm màng lọc cắt rác cho Encoder (x_skip) trước khi cộng.
-# - EDGE-CBAM: Bổ sung Spatial Attention siêu nhẹ (~98 tham số) kết hợp Channel Attention.
-# - NEAREST UPSAMPLE: Đảm bảo MCU nội suy ảnh tốc độ cao nhất.
+# - ✓ ĐÃ CẬP NHẬT 1: ECABlock hoàn toàn sạch bóng lệnh permute(), dùng Conv2d 1x1.
+# - ✓ ĐÃ CẬP NHẬT 2: Phục hồi Base Channel = 16 (Tối ưu cho 128x128 Input).
+# - ✓ ĐÃ CẬP NHẬT 3: Factorized_PFCU_DG - Feature Reuse 3 lớp 3x3 để tạo 3x3, 5x5, 7x7.
+# - ✓ ĐÃ CẬP NHẬT 4: Xóa sạch từ khóa `dilation` khỏi mọi class (Chống MCU lỗi).
+# - ✓ ĐÃ CẬP NHẬT 5: PerfectedBottleneck - 2 lớp DW 3x3, 0 Pointwise thừa, 0 bóp kênh.
+# - ✓ ĐÃ CẬP NHẬT 6: ECABlock_Lite - Tăng tỉ lệ nén (r=8) để giảm 50% tham số Attention.
 # ==============================================================================
 
 # ==============================================================================
-# 1. ATTENTION MODULES (DUAL ATTENTION TỐI ƯU CHO MCU)
+# 1. ATTENTION MODULES (ECA TỐI ƯU MCU)
 # ==============================================================================
-class MicroSEBlock(nn.Module):
+class ECABlock_Lite(nn.Module):
+    """
+    ✓ TỐI ƯU: Bản thay thế hoàn hảo cho khối Squeeze-and-Excitation (FC layers).
+    Dùng Conv2d 1x1 để học Channel Attention không cần xáo trộn bộ nhớ.
+    Tỉ lệ nén r=8 (channels // 8) giúp giảm 50% tham số so với r=4.
+    """
     def __init__(self, channels):
         super().__init__()
-        mid_channels = max(8, channels // 4)
-        self.se = nn.Sequential(
+        mid_channels = max(8, channels // 8) 
+        self.conv = nn.Sequential(
             nn.Conv2d(channels, mid_channels, kernel_size=1, bias=False),
             nn.ReLU6(inplace=True),
-            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False),
-            nn.Hardsigmoid() 
+            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
+        self.hardsigmoid = nn.Hardsigmoid() 
 
     def forward(self, x):
-        y = torch.mean(x, dim=[2, 3], keepdim=True)
-        return x * self.se(y)
-
-class MicroSpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-        self.hardsigmoid = nn.Hardsigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        y = torch.cat([avg_out, max_out], dim=1)
-        y = self.conv(y)
-        return x * self.hardsigmoid(y)
-
-class EdgeCBAM(nn.Module):
-    def __init__(self, channels, spatial_kernel=7):
-        super().__init__()
-        self.channel_att = MicroSEBlock(channels)
-        self.spatial_att = MicroSpatialAttention(kernel_size=spatial_kernel)
-
-    def forward(self, x):
-        x = self.channel_att(x)
-        x = self.spatial_att(x)
-        return x
+        y = torch.mean(x, dim=[2, 3], keepdim=True)              
+        y = self.hardsigmoid(self.conv(y))                     
+        return x * y
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & MICRO ATTENTION GATE (Hướng 2)
+# 2. NEAREST UPSAMPLE & SIMPLE FUSION
 # ==============================================================================
 class NearestUpsample(nn.Module):
     def __init__(self, channels, scale_factor=2):
@@ -66,46 +49,26 @@ class NearestUpsample(nn.Module):
     def forward(self, x):
         return self.bn(self.refine(self.up(x)))
 
-class MicroAGFusion(nn.Module):
-    """
-    Attention Gate Siêu Nhẹ (Micro Attention Gate).
-    Dùng x_up để soi đường cho x_skip.
-    Overhead tham số: Bằng đúng in_c (vài trăm tham số).
-    """
-    def __init__(self, in_c, out_c):
+class SimpleConcatFusion(nn.Module):
+    def __init__(self, in_c, skip_c, out_c):
         super().__init__()
-        # Tạo Bản đồ chú ý không gian (Spatial Gate) từ sự kết hợp của x_up và x_skip
-        # Ép in_c kênh xuống 1 kênh duy nhất
-        self.gate = nn.Sequential(
-            nn.Conv2d(in_c, 1, kernel_size=1, bias=False),
-            nn.Hardsigmoid()
-        )
-        
-        # Khối trộn kênh cuối cùng
         self.fuse_conv = nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
+            nn.Conv2d(in_c + skip_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c),
             nn.ReLU6(inplace=True)
         )
 
     def forward(self, x_up, x_skip):
-        # 1. Tìm sự đồng thuận không gian giữa 2 luồng (Tìm ra chỗ nào có nước)
-        alpha = self.gate(x_up + x_skip) # Shape: (B, 1, H, W)
-        
-        # 2. Dùng mặt nạ alpha cắt tỉa sạch sẽ rác của x_skip
-        x_skip_gated = x_skip * alpha
-        
-        # 3. Cộng x_up với x_skip_gated (thay vì x_skip đầy rác) và trộn kênh
-        return self.fuse_conv(x_up + x_skip_gated)
+        fused = torch.cat([x_up, x_skip], dim=1)
+        return self.fuse_conv(fused)
 
 # ==============================================================================
-# 3. SQUARE-PFCU-DG BLOCK (MCU NATIVE)
+# 3. KHỐI ENCODER MỚI: FACTORIZED INCEPTION-LITE
 # ==============================================================================
 class SquareDW(nn.Module):
-    def __init__(self, dim, kernel_size):
+    def __init__(self, dim):
         super().__init__()
-        padding = kernel_size // 2
-        self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim, bias=False)
+        self.dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
         self.bn = nn.BatchNorm2d(dim) 
 
     def forward(self, x):
@@ -120,28 +83,36 @@ class DetailGuidance(nn.Module):
     def forward(self, x):
         return x + self.bn(self.dw(x))
 
-class MultiScale_PFCU_DG(nn.Module):
+class Factorized_PFCU_DG(nn.Module):
+    """
+    ✓ TỐI ƯU: Feature Reuse (Tái sử dụng đặc trưng).
+    Thay vì 3 nhánh song song, ta chạy 3 lớp 3x3 nối tiếp và trích xuất ở từng chặng.
+    Vừa đạt được 3x3, 5x5, 7x7, vừa ép Peak RAM xuống mức cực thấp.
+    """
     def __init__(self, dim):
         super().__init__()
-        self.branch_3 = SquareDW(dim, kernel_size=3)
-        self.branch_5 = SquareDW(dim, kernel_size=5)
-        self.branch_7 = SquareDW(dim, kernel_size=7)
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) # Chạy tiếp từ 3x3
+        self.dw_7x7 = SquareDW(dim) # Chạy tiếp từ 5x5
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim) 
         
         self.dg_shortcut = DetailGuidance(dim)
-        self.attention = EdgeCBAM(dim) 
+        self.eca = ECABlock_Lite(dim) 
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x):
-        b3, b5, b7 = self.branch_3(x), self.branch_5(x), self.branch_7(x)
+        b3 = self.dw_3x3(x)         # Receptive Field: 3x3
+        b5 = self.dw_5x5(b3)        # Receptive Field: 5x5
+        b7 = self.dw_7x7(b5)        # Receptive Field: 7x7
+        
         fused_context = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
         guided_details = self.dg_shortcut(x)
-        return self.attention(self.act(fused_context + guided_details))
+        return self.eca(self.act(fused_context + guided_details))
 
 # ==============================================================================
-# 4. ENCODER, LIGHT-DECODER & LINEAR BOTTLE-NECK
+# 4. ENCODER, DECODER & PERFECTED BOTTLE-NECK
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c):
@@ -149,7 +120,7 @@ class EncoderBlock(nn.Module):
         self.same_channels = (in_c == out_c)
         conv_out = out_c - in_c if not self.same_channels else out_c
 
-        self.pfcu_dg   = MultiScale_PFCU_DG(in_c)
+        self.pfcu_dg   = Factorized_PFCU_DG(in_c)
         self.down_pool = nn.MaxPool2d((2, 2))
 
         if not self.same_channels:
@@ -173,68 +144,67 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
-class LightDecoderBlock_AG(nn.Module):
+class LightDecoderBlock_NoUAFM(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
-        self.up = NearestUpsample(in_c, scale_factor=2)
-        
-        # ✓ ĐÃ CẬP NHẬT: Dùng Khối MicroAG Fusion siêu nhẹ
-        self.fusion = MicroAGFusion(in_c=in_c, out_c=out_c) 
+        self.up   = NearestUpsample(in_c, scale_factor=2)
+        self.fusion = SimpleConcatFusion(in_c=in_c, skip_c=in_c, out_c=out_c)
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
-        self.refine_spatial = SquareDW(gc, kernel_size=5)
-        self.attention = EdgeCBAM(gc) 
+        self.refine_spatial_1 = SquareDW(gc)
+        self.refine_spatial_2 = SquareDW(gc)
         
-        self.pw_up  = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
+        self.eca = ECABlock_Lite(gc) 
+        
+        self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         self.bn_up  = nn.BatchNorm2d(out_c)
         
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x, skip):
         x = self.up(x)
-        
-        # Gửi x_up và skip vào Cổng chú ý để cắt rác rồi trộn
         fused = self.fusion(x, skip)
         
         feat = self.act(self.bn_down(self.pw_down(fused)))
-        feat = self.refine_spatial(feat)
-        feat = self.attention(feat)
+        feat = self.refine_spatial_2(self.refine_spatial_1(feat))
+        feat = self.eca(feat)
         
         out = self.bn_up(self.pw_up(feat))
         return self.act(out + fused)
 
-class LinearBottleneck(nn.Module):
+class PerfectedBottleneck(nn.Module):
+    """
+    ✓ TỐI ƯU 1: Chỉ dùng 2 lớp DW 3x3 (Góc nhìn 5x5) để chống Nhiễu viền Padding ở ảnh 8x8.
+    ✓ TỐI ƯU 2: Xóa sổ lớp Pointwise (Conv 1x1) dư thừa, nhường việc trộn kênh cho Decoder.
+    ✓ TỐI ƯU 3: Dữ liệu 256 kênh đi qua mà không bị bóp nghẹt hay đánh mất một bit nào!
+    """
     def __init__(self, dim):
         super().__init__()
-        self.dw1 = SquareDW(dim, kernel_size=7)
-        self.attention = EdgeCBAM(dim)
-        self.dw2 = SquareDW(dim, kernel_size=7)
+        self.dw1 = SquareDW(dim) # Góc nhìn: 3x3
+        self.dw2 = SquareDW(dim) # Góc nhìn: 5x5
         
-        self.pw = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_pw = nn.BatchNorm2d(dim)
-        self.act = nn.ReLU6(inplace=True)
+        self.eca = ECABlock_Lite(dim)
 
     def forward(self, x):
-        out = self.dw1(x)
-        out = self.attention(out)
-        out = self.dw2(out)
-        out = self.act(self.bn_pw(self.pw(out)))
-        return out + x 
+        out = self.dw2(self.dw1(x))
+        out = self.eca(out)
+        return out + x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (PicoUNet EDGE)
+# 5. MẠNG CHÍNH (ĐÃ PHỤC HỒI BASE CHANNELS = 16)
 # ==============================================================================
-class PicoUNet_Edge(nn.Module):
-    def __init__(self, num_classes=1, input_size=256):
+class PicoUNet_Ablation_NoUAFM(nn.Module):
+    def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
         if input_size % 16 != 0:
             raise ValueError(f"PicoUNet yêu cầu input_size chia hết cho 16.")
 
+        # ✓ Đã phục hồi 16 kênh
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
         self.e1 = EncoderBlock(16,  32)
@@ -242,13 +212,13 @@ class PicoUNet_Edge(nn.Module):
         self.e3 = EncoderBlock(64,  128)
         self.e4 = EncoderBlock(128, 256)
 
-        self.b4 = LinearBottleneck(256)
+        # ✓ Thay StackedBottleneck bằng PerfectedBottleneck
+        self.b4 = PerfectedBottleneck(256)
 
-        # ✓ ĐÃ CẬP NHẬT: Gọi LightDecoderBlock_AG
-        self.d4 = LightDecoderBlock_AG(256, 128)
-        self.d3 = LightDecoderBlock_AG(128, 64)
-        self.d2 = LightDecoderBlock_AG(64,  32)
-        self.d1 = LightDecoderBlock_AG(32,  16)
+        self.d4 = LightDecoderBlock_NoUAFM(256, 128)
+        self.d3 = LightDecoderBlock_NoUAFM(128, 64)
+        self.d2 = LightDecoderBlock_NoUAFM(64,  32)
+        self.d1 = LightDecoderBlock_NoUAFM(32,  16)
 
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -269,5 +239,5 @@ class PicoUNet_Edge(nn.Module):
         
         return self.conv_out(x)
 
-def build_model(num_classes=1, input_size=256):
-    return PicoUNet_Edge(num_classes=num_classes, input_size=input_size)
+def build_model(num_classes=1, input_size=128):
+    return PicoUNet_Ablation_NoUAFM(num_classes=num_classes, input_size=input_size)
