@@ -4,10 +4,11 @@ import torch.nn.functional as F
 
 # ==============================================================================
 # PICO-UNET V2: BẢN PAPER - TỐI ƯU HÓA CHO ESP32-S3 (CHUẨN TEMPLATE)
-# - ✓ TỐI ƯU 1: ECABlock hoàn toàn sạch bóng lệnh permute().
-# - ✓ TỐI ƯU 2: Đã XÓA SỔ ChannelShuffle để tránh nút thắt Memory (Contiguous) trên MCU.
-# - ✓ TỐI ƯU 3: Asymmetric Scaling (24 -> 48 -> 96 -> 128), tăng độ sắc nét vùng biên.
-# - ✓ TỐI ƯU 4: Giới hạn kênh ở 128 (Cap at 128) để giữ GFLOPs ở mức siêu thấp.
+# - ✓ TỐI ƯU 1: ECABlock dùng Conv2d 1x1, 0% Memory Copy.
+# - ✓ TỐI ƯU 2: ĐÃ XÓA ChannelShuffle. Giao việc trộn kênh cho Pointwise + ECA.
+# - ✓ TỐI ƯU 3: MultiScale_PFCU_DG_v2 áp dụng Feature Reuse (tiết kiệm Peak RAM).
+# - ✓ TỐI ƯU 4: Giới hạn kênh ở 128 (Cap at 128) để giảm GFLOPs triệt để.
+# - ✓ TỐI ƯU 5: LightInvertedBottleneck thay thế Bottleneck cũ siêu nhẹ.
 # ==============================================================================
 
 # ==============================================================================
@@ -68,13 +69,14 @@ class SimpleConcatFusion(nn.Module):
         return self.fuse(torch.cat([x, skip], dim=1))
 
 # ==============================================================================
-# 3. KHỐI ENCODER & DECODER V2 (FEATURE REUSE THUẦN TÚY)
+# 3. KHỐI ENCODER & DECODER V2 (CROSS-BRANCH BẰNG 1x1 + ATTENTION)
 # ==============================================================================
 class MultiScale_PFCU_DG_v2(nn.Module):
     """
     ✓ TỐI ƯU TEMPLATE (Feature Reuse):
-    Dữ liệu chảy thành 1 đường thẳng qua 3 lớp 3x3 nối tiếp.
-    Lớp Conv 1x1 (pw_fuse) sẽ tự động trộn chéo kênh mà không cần ChannelShuffle.
+    Thay vì chạy 3 nhánh độc lập rồi cộng lại, ta chạy 3 lớp 3x3 nối tiếp.
+    Dữ liệu chảy thành 1 đường thẳng, tiết kiệm cực nhiều Peak RAM.
+    ✓ TRỘN KÊNH: Pointwise (pw_fuse) trộn vật lý, ECABlock định tuyến thông tin.
     """
     def __init__(self, dim):
         super().__init__()
@@ -85,16 +87,19 @@ class MultiScale_PFCU_DG_v2(nn.Module):
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         
+        # Đã xóa ChannelShuffle
         self.eca = ECABlock(dim)
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x):
-        # Đường ống nối tiếp
         b3 = self.dw_3x3(x)         # RF: 3x3
         b5 = self.dw_5x5(b3)        # RF: 5x5
         b7 = self.dw_7x7(b5)        # RF: 7x7
         
+        # Trộn chéo (Cross-branch fusion) bằng Conv 1x1
         fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
+        
+        # Đánh trọng số bằng Attention và cộng Residual
         return self.eca(self.act(fused + x))
 
 class EncoderBlock_v2(nn.Module):
@@ -192,26 +197,25 @@ class PicoUNet_v2_Paper(nn.Module):
         if input_size % 16 != 0:
             raise ValueError(f"Input_size phải chia hết cho 16.")
 
-        # ✓ Asymmetric Scaling: Bắt đầu từ 24 kênh để bắt nét cực tốt
-        self.conv_in = nn.Conv2d(3, 24, kernel_size=3, padding=1)
+        # Khởi tạo Base Channel = 16
+        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
         
-        # Encoder: 24 -> 48 -> 96 -> 128 -> 128 (Bóp nghẹt ở 128 để cứu GFLOPs)
-        self.e1 = EncoderBlock_v2(24, 48)
-        self.e2 = EncoderBlock_v2(48, 96)
-        self.e3 = EncoderBlock_v2(96, 128)
+        # Encoder: 16 -> 32 -> 64 -> 128 -> 128 (Đã Cap ở 128 theo Paper)
+        self.e1 = EncoderBlock_v2(16, 32)
+        self.e2 = EncoderBlock_v2(32, 64)
+        self.e3 = EncoderBlock_v2(64, 128)
         self.e4 = EncoderBlock_v2(128, 128) 
         
-        # Bottleneck: Inverted Residual chạy trên 128 kênh
+        # Bottleneck: Inverted Residual cực nhẹ (128 kênh)
         self.bottleneck = LightInvertedBottleneck(128)
         
-        # Decoder lùi dần theo đúng cấu trúc đối xứng với Encoder
+        # Decoder lùi dần: 128 -> 128 -> 64 -> 32 -> 16
         self.d4 = LightDecoderBlock_NoUAFM(128, 128)
-        self.d3 = LightDecoderBlock_NoUAFM(128, 96)
-        self.d2 = LightDecoderBlock_NoUAFM(96, 48)
-        self.d1 = LightDecoderBlock_NoUAFM(48, 24)
+        self.d3 = LightDecoderBlock_NoUAFM(128, 64)
+        self.d2 = LightDecoderBlock_NoUAFM(64, 32)
+        self.d1 = LightDecoderBlock_NoUAFM(32, 16)
         
-        # Output về 1 class phân vùng ngập lụt
-        self.conv_out = nn.Conv2d(24, num_classes, kernel_size=1)
+        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
@@ -233,6 +237,6 @@ class PicoUNet_v2_Paper(nn.Module):
 def build_model(num_classes=1, input_size=128):
     """
     Khởi tạo Pico-UNet v2 dành cho Paper nghiên cứu.
-    Đã dọn dẹp ChannelShuffle, áp dụng Asymmetric Scaling (24->48->96->128).
+    Đã tối ưu hóa kernel 3x3, bỏ permute và giới hạn 128 channels.
     """
     return PicoUNet_v2_Paper(num_classes=num_classes, input_size=input_size)
