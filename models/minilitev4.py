@@ -4,11 +4,12 @@ import torch.nn.functional as F
 
 # ==============================================================================
 # PICO-UNET V2: BẢN PAPER - TỐI ƯU HÓA CHO ESP32-S3 (CHUẨN TEMPLATE)
-# - ✓ TỐI ƯU 1: ECABlock dùng Conv2d 1x1, 0% Memory Copy.
-# - ✓ TỐI ƯU 2: ĐÃ XÓA ChannelShuffle. Giao việc trộn kênh cho Pointwise + ECA.
-# - ✓ TỐI ƯU 3: MultiScale_PFCU_DG_v2 áp dụng Feature Reuse (tiết kiệm Peak RAM).
-# - ✓ TỐI ƯU 4: Giới hạn kênh ở 128 (Cap at 128) để giảm GFLOPs triệt để.
-# - ✓ TỐI ƯU 5: LightInvertedBottleneck thay thế Bottleneck cũ siêu nhẹ.
+# - ✓ TỐI ƯU 1: ECABlock hoàn toàn sạch bóng lệnh permute(), dùng Conv2d 1x1.
+# - ✓ TỐI ƯU 2: MultiScale_PFCU_DG_v2 áp dụng Feature Reuse (tiết kiệm Peak RAM).
+# - ✓ TỐI ƯU 3: Giới hạn kênh ở 128 (Cap at 128) để giảm GFLOPs triệt để.
+# - ✓ TỐI ƯU 4: LightInvertedBottleneck thay thế Bottleneck cũ siêu nhẹ.
+# - ✓ TỐI ƯU 5 (NEW): Đã XÓA lệnh torch.cat, dùng AdditiveDecoderBlock để cứu RAM 
+#                    và bảo vệ tuyệt đối thông tin của Skip-Connection.
 # ==============================================================================
 
 # ==============================================================================
@@ -56,20 +57,8 @@ class NearestUpsample(nn.Module):
     def forward(self, x):
         return self.refine(self.up(x))
 
-class SimpleConcatFusion(nn.Module):
-    def __init__(self, in_c, skip_c, out_c):
-        super().__init__()
-        self.fuse = nn.Sequential(
-            nn.Conv2d(in_c + skip_c, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c), 
-            nn.ReLU6(inplace=True)
-        )
-
-    def forward(self, x, skip):
-        return self.fuse(torch.cat([x, skip], dim=1))
-
 # ==============================================================================
-# 3. KHỐI ENCODER & DECODER V2 (CROSS-BRANCH BẰNG 1x1 + ATTENTION)
+# 3. KHỐI ENCODER V2 (CÓ FEATURE REUSE, KHÔNG CHANNEL SHUFFLE)
 # ==============================================================================
 class MultiScale_PFCU_DG_v2(nn.Module):
     """
@@ -87,11 +76,11 @@ class MultiScale_PFCU_DG_v2(nn.Module):
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         
-        # Đã xóa ChannelShuffle
         self.eca = ECABlock(dim)
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x):
+        # Đường ống nối tiếp
         b3 = self.dw_3x3(x)         # RF: 3x3
         b5 = self.dw_5x5(b3)        # RF: 5x5
         b7 = self.dw_7x7(b5)        # RF: 7x7
@@ -133,16 +122,23 @@ class EncoderBlock_v2(nn.Module):
             out = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return out, skip
 
-class LightDecoderBlock_NoUAFM(nn.Module):
+# ==============================================================================
+# 4. DECODER MỚI (ADDITIVE FUSION) VÀ BOTTLE-NECK
+# ==============================================================================
+class AdditiveDecoderBlock(nn.Module):
+    """
+    ✓ TỐI ƯU MỚI: Additive Fusion (Cộng trực tiếp) thay vì Concat.
+    Bảo vệ nguyên vẹn luồng Skip-Connection, không chôn vùi vào lớp Conv1x1.
+    Đồng thời giảm 50% Peak RAM đỉnh tại khâu trộn (Fusion).
+    """
     def __init__(self, in_c, out_c):
         super().__init__()
-        gc = max(out_c // 4, 4)
-        
         self.up = NearestUpsample(in_c)
-        self.fusion = SimpleConcatFusion(in_c, in_c, out_c)
         
+        # Xử lý đặc trưng SAU KHI CỘNG
+        gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
-            nn.Conv2d(out_c, gc, kernel_size=1, bias=False), 
+            nn.Conv2d(in_c, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             nn.ReLU6(inplace=True),
             
@@ -152,20 +148,26 @@ class LightDecoderBlock_NoUAFM(nn.Module):
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
         )
+        
+        # Ép kênh song song để cộng Residual cuối cùng
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x, skip):
-        up = self.up(x)
-        fused = self.fusion(up, skip)
-        return self.act(self.refine(fused) + fused)
+        # 1. Additive Fusion: Cộng thẳng để thông luồng Gradient
+        fused = self.up(x) + skip
+        
+        # 2. Refine và cộng Residual (x + refine(x))
+        return self.act(self.refine(fused) + self.shortcut(fused))
 
-# ==============================================================================
-# 4. BOTTLE-NECK ĐÁY MẠNG (INVERTED RESIDUAL)
-# ==============================================================================
+
 class LightInvertedBottleneck(nn.Module):
     """ 
     Bottleneck siêu nhẹ lấy cảm hứng từ MobileNetV2.
-    Expand -> Depthwise -> Project.
+    Expand -> Depthwise -> Project (Linear Output - Không có hàm kích hoạt ở đuôi).
     """
     def __init__(self, dim, expand_ratio=2):
         super().__init__()
@@ -179,7 +181,7 @@ class LightInvertedBottleneck(nn.Module):
             nn.Conv2d(hid, hid, kernel_size=3, padding=1, groups=hid, bias=False),
             nn.BatchNorm2d(hid), 
             nn.ReLU6(inplace=True),
-            # 3. Project
+            # 3. Project (Ánh xạ tuyến tính)
             nn.Conv2d(hid, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim),
         )
@@ -209,11 +211,11 @@ class PicoUNet_v2_Paper(nn.Module):
         # Bottleneck: Inverted Residual cực nhẹ (128 kênh)
         self.bottleneck = LightInvertedBottleneck(128)
         
-        # Decoder lùi dần: 128 -> 128 -> 64 -> 32 -> 16
-        self.d4 = LightDecoderBlock_NoUAFM(128, 128)
-        self.d3 = LightDecoderBlock_NoUAFM(128, 64)
-        self.d2 = LightDecoderBlock_NoUAFM(64, 32)
-        self.d1 = LightDecoderBlock_NoUAFM(32, 16)
+        # Decoder lùi dần với AdditiveDecoderBlock
+        self.d4 = AdditiveDecoderBlock(128, 128)
+        self.d3 = AdditiveDecoderBlock(128, 64)
+        self.d2 = AdditiveDecoderBlock(64, 32)
+        self.d1 = AdditiveDecoderBlock(32, 16)
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -237,6 +239,6 @@ class PicoUNet_v2_Paper(nn.Module):
 def build_model(num_classes=1, input_size=128):
     """
     Khởi tạo Pico-UNet v2 dành cho Paper nghiên cứu.
-    Đã tối ưu hóa kernel 3x3, bỏ permute và giới hạn 128 channels.
+    Đã tối ưu hóa kernel 3x3, bỏ permute, dùng Additive Fusion.
     """
     return PicoUNet_v2_Paper(num_classes=num_classes, input_size=input_size)
