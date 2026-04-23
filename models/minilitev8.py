@@ -202,10 +202,12 @@ class PicoUNet_v2_Paper(nn.Module):
         self.bottleneck = SerialMultiScaleBottleneck(192)
         
         # Decoder lùi đối xứng
-        self.d4 = AdditiveDecoderBlock(192, 192) # in: 192, skip: 192
-        self.d3 = AdditiveDecoderBlock(192, 96)  # in: 192, skip: 96
-        self.d2 = AdditiveDecoderBlock(96, 48)   # in: 96,  skip: 48
-        self.d1 = AdditiveDecoderBlock(48, 24)   # in: 48,  skip: 24
+        # Lưu ý: Các khối d4, d3, d2, d1 giờ nhận đầu vào (in_c) và xuất ra (out_c) 
+        # Khối proj bên trong AdditiveDecoderBlock sẽ lo việc khớp dimension với skip_c (bằng out_c)
+        self.d4 = AdditiveDecoderBlock(in_c=192, out_c=192) # in: 192, skip: 192
+        self.d3 = AdditiveDecoderBlock(in_c=192, out_c=96)  # in: 192, skip: 96
+        self.d2 = AdditiveDecoderBlock(in_c=96,  out_c=48)  # in: 96,  skip: 48
+        self.d1 = AdditiveDecoderBlock(in_c=48,  out_c=24)  # in: 48,  skip: 24
         
         self.conv_out = nn.Conv2d(24, num_classes, kernel_size=1)
 
