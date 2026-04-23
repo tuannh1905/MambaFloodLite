@@ -4,25 +4,25 @@ import torch.nn.functional as F
 
 # ==============================================================================
 # LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
-# - ✓ ĐÃ CẬP NHẬT 1: ECABlock hoàn toàn sạch bóng lệnh permute(), dùng Conv2d 1x1.
-# - ✓ ĐÃ CẬP NHẬT 2: Factorized_PFCU_DG - Feature Reuse 3 lớp 3x3 để tiết kiệm RAM.
-# - ✓ ĐÃ CẬP NHẬT 3: Thay thế toàn bộ ReLU6 bằng Hardswish để tăng tính phi tuyến.
-# - ✓ ĐÃ CẬP NHẬT 4: ECABlock_Lite - Tỉ lệ nén r=8.
-# - ✓ ĐÃ CẬP NHẬT 5: Phục hồi Base Channel 16 -> 256 để tối đa hóa "cơ bắp".
-# - ✓ ĐÃ CẬP NHẬT 6 (NEW): SPPF_Lite + Spatial Attention (CookedBottleneck).
+# - ✓ ĐÃ CẬP NHẬT 1: ECABlock hoàn toàn sạch bóng lệnh permute().
+# - ✓ ĐÃ CẬP NHẬT 2: Phục hồi Base Channel = 16 -> 256 (Tối ưu cho 128x128 Input).
+# - ✓ ĐÃ CẬP NHẬT 3: Factorized_PFCU_DG - Feature Reuse 3 lớp 3x3.
+# - ✓ ĐÃ CẬP NHẬT 4: Nâng cấp toàn bộ ReLU6 -> Hardswish (Tăng mIoU, 0 tham số).
+# - ✓ ĐÃ CẬP NHẬT 5 (NEW): Thêm SpatialAttention_MCU vào Bottleneck (Dual Attention).
+# - ✓ ĐÃ CẬP NHẬT 6 (NEW): Thêm GatedConcatFusion vào Decoder để dập nhiễu nền.
 # ==============================================================================
 
 # ==============================================================================
 # 1. ATTENTION MODULES (DUAL ATTENTION CHO MCU)
 # ==============================================================================
 class ECABlock_Lite(nn.Module):
-    """ Channel Attention: Học xem KÊNH nào chứa đặc trưng ngập lụt. """
+    """ Channel Attention (Tỉ lệ nén r=8) """
     def __init__(self, channels):
         super().__init__()
         mid_channels = max(8, channels // 8) 
         self.conv = nn.Sequential(
             nn.Conv2d(channels, mid_channels, kernel_size=1, bias=False),
-            nn.Hardswish(inplace=True),
+            nn.Hardswish(inplace=True), # Nâng cấp Hardswish
             nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
         self.hardsigmoid = nn.Hardsigmoid() 
@@ -34,8 +34,8 @@ class ECABlock_Lite(nn.Module):
 
 class SpatialAttention_MCU(nn.Module):
     """ 
-    Spatial Attention: Học xem VỊ TRÍ nào trên ảnh 8x8 là vũng nước.
-    Ép 256 kênh thành 2 mặt phẳng (Max và Mean) -> Quét bằng Conv 7x7 (Đúng 98 params!).
+    ✓ NEW: Spatial Attention (Bản đồ định vị không gian).
+    Siêu nhẹ: Ép đa kênh thành 2 mặt phẳng, quét Conv 7x7 (Tốn đúng 98 tham số).
     """
     def __init__(self, kernel_size=7):
         super().__init__()
@@ -50,17 +50,8 @@ class SpatialAttention_MCU(nn.Module):
         return x * y
 
 # ==============================================================================
-# 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE
+# 2. NEAREST UPSAMPLE & GATED FUSION (CHỐNG NHIỄU DECODER)
 # ==============================================================================
-class SquareDW(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim) 
-
-    def forward(self, x):
-        return self.bn(self.dw(x)) 
-
 class NearestUpsample(nn.Module):
     def __init__(self, channels, scale_factor=2):
         super().__init__()
@@ -71,22 +62,44 @@ class NearestUpsample(nn.Module):
     def forward(self, x):
         return self.bn(self.refine(self.up(x)))
 
-class SimpleConcatFusion(nn.Module):
+class GatedConcatFusion(nn.Module):
+    """
+    ✓ NEW: Dùng đặc trưng Decoder tạo Mặt Nạ (Gate) dập tắt nhiễu của Encoder.
+    Giúp mép nước sắc nét hơn rất nhiều mà tốn chưa tới 1k params.
+    """
     def __init__(self, in_c, skip_c, out_c):
         super().__init__()
+        # Bộ tạo mặt nạ từ upsampled feature
+        self.gate = nn.Sequential(
+            nn.Conv2d(in_c, 1, kernel_size=1, bias=False),
+            nn.Hardsigmoid()
+        )
         self.fuse_conv = nn.Sequential(
             nn.Conv2d(in_c + skip_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c),
-            nn.Hardswish(inplace=True)
+            nn.Hardswish(inplace=True) # Nâng cấp Hardswish
         )
 
     def forward(self, x_up, x_skip):
-        fused = torch.cat([x_up, x_skip], dim=1)
+        # Nhân mặt nạ để lọc rác trước khi nối
+        mask = self.gate(x_up)
+        gated_skip = x_skip * mask
+        
+        fused = torch.cat([x_up, gated_skip], dim=1)
         return self.fuse_conv(fused)
 
 # ==============================================================================
-# 3. KHỐI ENCODER & DECODER VỚI HARD-SWISH
+# 3. KHỐI ENCODER: FACTORIZED INCEPTION-LITE
 # ==============================================================================
+class SquareDW(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
+        self.bn = nn.BatchNorm2d(dim) 
+
+    def forward(self, x):
+        return self.bn(self.dw(x)) 
+
 class DetailGuidance(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -108,7 +121,7 @@ class Factorized_PFCU_DG(nn.Module):
         
         self.dg_shortcut = DetailGuidance(dim)
         self.eca = ECABlock_Lite(dim) 
-        self.act = nn.Hardswish(inplace=True)
+        self.act = nn.Hardswish(inplace=True) # Nâng cấp Hardswish
 
     def forward(self, x):
         b3 = self.dw_3x3(x)         
@@ -133,7 +146,7 @@ class EncoderBlock(nn.Module):
             self.bn_pw   = nn.BatchNorm2d(conv_out) 
             self.down_pw = nn.MaxPool2d((2, 2))
 
-        self.act = nn.Hardswish(inplace=True)
+        self.act = nn.Hardswish(inplace=True) # Nâng cấp Hardswish
 
     def forward(self, x):
         feat = self.pfcu_dg(x) 
@@ -149,25 +162,30 @@ class EncoderBlock(nn.Module):
             x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
             return x, skip
 
+# ==============================================================================
+# 4. DECODER & BOTTLE-NECK ĐÃ NÂNG CẤP
+# ==============================================================================
 class LightDecoderBlock_NoUAFM(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
         gc = max(out_c // 4, 4)
 
         self.up   = NearestUpsample(in_c, scale_factor=2)
-        self.fusion = SimpleConcatFusion(in_c=in_c, skip_c=in_c, out_c=out_c)
+        # ✓ Thay SimpleConcatFusion bằng GatedConcatFusion
+        self.fusion = GatedConcatFusion(in_c=in_c, skip_c=in_c, out_c=out_c)
 
         self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
         self.bn_down = nn.BatchNorm2d(gc)
         
         self.refine_spatial_1 = SquareDW(gc)
         self.refine_spatial_2 = SquareDW(gc)
+        
         self.eca = ECABlock_Lite(gc) 
         
-        self.pw_up  = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
+        self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
         self.bn_up  = nn.BatchNorm2d(out_c)
         
-        self.act = nn.Hardswish(inplace=True)
+        self.act = nn.Hardswish(inplace=True) # Nâng cấp Hardswish
 
     def forward(self, x, skip):
         x = self.up(x)
@@ -180,58 +198,27 @@ class LightDecoderBlock_NoUAFM(nn.Module):
         out = self.bn_up(self.pw_up(feat))
         return self.act(out + fused)
 
-# ==============================================================================
-# 4. BOTTLE-NECK ĐÁY MẠNG (ĐÃ COOK VỚI GIA VỊ HẠNG NẶNG)
-# ==============================================================================
-class SPPF_Lite(nn.Module):
+class PerfectedBottleneck(nn.Module):
     """
-    Kéo góc nhìn (Receptive Field) lên mức tối đa bằng các lớp MaxPool nối tiếp.
-    Concat ở ảnh 8x8 cực kỳ rẻ về RAM, không lo nghẽn cổ chai vật lý.
+    ✓ NEW: Thêm Spatial Attention tạo thành Dual Attention Block.
+    0 bóp kênh, 0 Pointwise thừa, nhưng biết chính xác vũng nước nằm ở đâu.
     """
     def __init__(self, dim):
         super().__init__()
-        hid = dim // 2 
-        self.cv1 = nn.Sequential(
-            nn.Conv2d(dim, hid, kernel_size=1, bias=False),
-            nn.BatchNorm2d(hid),
-            nn.Hardswish(inplace=True)
-        )
-        self.pool = nn.MaxPool2d(kernel_size=5, stride=1, padding=2)
-        self.cv2 = nn.Sequential(
-            nn.Conv2d(hid * 4, dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim),
-            nn.Hardswish(inplace=True)
-        )
-
-    def forward(self, x):
-        x = self.cv1(x)
-        y1 = self.pool(x)
-        y2 = self.pool(y1)
-        y3 = self.pool(y2)
-        # Nối 4 ma trận hid lại thành hid*4
-        out = torch.cat([x, y1, y2, y3], dim=1)
-        return self.cv2(out)
-
-class CookedBottleneck(nn.Module):
-    """
-    Trái tim của mạng lưới: SPPF (Ngữ cảnh) -> DW (Làm mượt) -> Dual Attention (Tập trung)
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.sppf = SPPF_Lite(dim)
-        self.dw = SquareDW(dim) 
+        self.dw1 = SquareDW(dim) 
+        self.dw2 = SquareDW(dim) 
+        
         self.channel_attn = ECABlock_Lite(dim)
         self.spatial_attn = SpatialAttention_MCU(kernel_size=7)
 
     def forward(self, x):
-        out = self.sppf(x)
-        out = self.dw(out)
+        out = self.dw2(self.dw1(x))
         out = self.channel_attn(out)
-        out = self.spatial_attn(out)
+        out = self.spatial_attn(out) # Dual Attention
         return out + x
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (ĐÃ PHỤC HỒI CHUỖI 16 -> 256)
+# 5. MẠNG CHÍNH PICO-UNET
 # ==============================================================================
 class PicoUNet_Ablation_NoUAFM(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -240,19 +227,17 @@ class PicoUNet_Ablation_NoUAFM(nn.Module):
         if input_size % 16 != 0:
             raise ValueError(f"PicoUNet yêu cầu input_size chia hết cho 16.")
 
-        # Phục hồi Base = 16
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
 
-        # Full Size cơ bắp: 16 -> 32 -> 64 -> 128 -> 256
         self.e1 = EncoderBlock(16,  32)
         self.e2 = EncoderBlock(32,  64)
         self.e3 = EncoderBlock(64,  128)
         self.e4 = EncoderBlock(128, 256)
 
-        # Bottleneck ở tầng sâu nhất 256 kênh
-        self.b4 = CookedBottleneck(256)
+        # Bottleneck với Dual Attention
+        self.b4 = PerfectedBottleneck(256)
 
-        # Decoder lùi đối xứng
+        # Decoder với Gated Fusion chống nhiễu
         self.d4 = LightDecoderBlock_NoUAFM(256, 128)
         self.d3 = LightDecoderBlock_NoUAFM(128, 64)
         self.d2 = LightDecoderBlock_NoUAFM(64,  32)
@@ -279,4 +264,3 @@ class PicoUNet_Ablation_NoUAFM(nn.Module):
 
 def build_model(num_classes=1, input_size=128):
     return PicoUNet_Ablation_NoUAFM(num_classes=num_classes, input_size=input_size)
-#upgrade from minilitev2.py
