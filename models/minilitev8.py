@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 # ==============================================================================
 # PICO-UNET V2: BẢN PAPER - TỐI ƯU HÓA CHO ESP32-S3 (BẢN CÂN BẰNG)
-# - ✓ TỐI ƯU 1: AdditiveDecoderBlock ĐÃ FIX BUG lệch chiều kênh (Dimension Mismatch).
+# - ✓ TỐI ƯU 1: AdditiveDecoderBlock ĐÃ FIX BUG TẬN GỐC (Tách bạch in_c, skip_c, out_c).
 # - ✓ TỐI ƯU 2: SerialMultiScaleBottleneck (Góc nhìn đa tỷ lệ).
 # - ✓ TỐI ƯU 3: Nâng cấp toàn bộ thành Hardswish siêu mượt.
 # - ✓ TỐI ƯU 4: Cấu hình "Vừa Vừa" (24 -> 48 -> 96 -> 192) đạt ~195k Params.
@@ -123,22 +123,23 @@ class EncoderBlock_v2(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ĐÃ FIX BUG ADDITIVE) & BOTTLE-NECK
+# 4. DECODER (FIX BUG TRIỆT ĐỂ) & BOTTLE-NECK
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
-    def __init__(self, in_c, out_c):
+    def __init__(self, in_c, skip_c, out_c):
         super().__init__()
         self.up = NearestUpsample(in_c)
         
-        # ✓ FIX BUG: Chiếu in_c về bằng out_c (skip channel) để có thể cộng trực tiếp
+        # ✓ FIX MẠNH: Chiếu kênh đầu vào (in_c) về BẰNG VỚI kênh skip (skip_c)
         self.proj = nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c)
+            nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(skip_c)
         )
         
         gc = max(out_c // 4, 4)
+        # Chú ý: refine nhận vào tensor đã được cộng (số kênh là skip_c), xuất ra out_c
         self.refine = nn.Sequential(
-            nn.Conv2d(out_c, gc, kernel_size=1, bias=False), 
+            nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             nn.Hardswish(inplace=True),
             
@@ -148,14 +149,20 @@ class AdditiveDecoderBlock(nn.Module):
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
         )
+        
+        # Shortcut nhận skip_c và trả về out_c để cộng residual
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
         self.act = nn.Hardswish(inplace=True)
 
     def forward(self, x, skip):
-        # 1. Ép kênh x về bằng kênh skip rồi mới cộng (tránh crash tensor)
+        # 1. Ép kênh x (từ in_c -> skip_c) rồi mới cộng với skip (skip_c)
         fused = self.proj(self.up(x)) + skip
         
-        # 2. Refine và cộng Residual (fused + refine(fused))
-        return self.act(self.refine(fused) + fused)
+        # 2. Refine (skip_c -> out_c) và cộng với Shortcut (skip_c -> out_c)
+        return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
     def __init__(self, dim):
@@ -189,25 +196,29 @@ class PicoUNet_v2_Paper(nn.Module):
         if input_size % 16 != 0:
             raise ValueError(f"Input_size phải chia hết cho 16.")
 
-        # Khởi điểm: 24 Channels (Vừa đủ mạnh, không phình to)
         self.conv_in = nn.Conv2d(3, 24, kernel_size=3, padding=1)
         
-        # Mở rộng nhẹ nhàng: 24 -> 48 -> 96 -> 192 -> 192 (Chốt chặn ở 192)
+        # Encoder:
+        # e1: 24 -> 48   => s1 có 48 kênh
+        # e2: 48 -> 96   => s2 có 96 kênh
+        # e3: 96 -> 192  => s3 có 192 kênh
+        # e4: 192 -> 192 => s4 có 192 kênh
         self.e1 = EncoderBlock_v2(24, 48)
         self.e2 = EncoderBlock_v2(48, 96)
         self.e3 = EncoderBlock_v2(96, 192)
         self.e4 = EncoderBlock_v2(192, 192) 
         
-        # Bottleneck: 192 kênh
         self.bottleneck = SerialMultiScaleBottleneck(192)
         
-        # Decoder lùi đối xứng
-        # Lưu ý: Các khối d4, d3, d2, d1 giờ nhận đầu vào (in_c) và xuất ra (out_c) 
-        # Khối proj bên trong AdditiveDecoderBlock sẽ lo việc khớp dimension với skip_c (bằng out_c)
-        self.d4 = AdditiveDecoderBlock(in_c=192, out_c=192) # in: 192, skip: 192
-        self.d3 = AdditiveDecoderBlock(in_c=192, out_c=96)  # in: 192, skip: 96
-        self.d2 = AdditiveDecoderBlock(in_c=96,  out_c=48)  # in: 96,  skip: 48
-        self.d1 = AdditiveDecoderBlock(in_c=48,  out_c=24)  # in: 48,  skip: 24
+        # Decoder lùi đối xứng (Đã khai báo rành mạch in, skip, out)
+        # d4 nhận x=192, s4=192 -> trả về 192
+        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=192) 
+        # d3 nhận x=192 (từ d4), s3=192 -> trả về 96
+        self.d3 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=96)  
+        # d2 nhận x=96 (từ d3), s2=96 -> trả về 48
+        self.d2 = AdditiveDecoderBlock(in_c=96,  skip_c=96,  out_c=48)   
+        # d1 nhận x=48 (từ d2), s1=48 -> trả về 24
+        self.d1 = AdditiveDecoderBlock(in_c=48,  skip_c=48,  out_c=24)   
         
         self.conv_out = nn.Conv2d(24, num_classes, kernel_size=1)
 
