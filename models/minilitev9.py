@@ -8,6 +8,7 @@ import torch.nn.functional as F
 # - ✓ CUT ATTENTION: Bỏ hoàn toàn ECA ở Encoder để giảm Overhead băng thông.
 # - ✓ DUAL-SCALE ENCODER: E1, E2 chỉ dùng 3x3 + 5x5 để giảm GFLOPs ở độ phân giải cao.
 # - ✓ BƠM PARAMS: Cấu hình kênh 32 -> 64 -> 128 -> 192.
+# - ✓ FIX BUG: Khai báo chuẩn xác skip_c cho Decoder V4.
 # ==============================================================================
 
 def get_activation(act_type):
@@ -219,20 +220,23 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # ✓ Tầng Nông (DualScale, Không ECA, ReLU6)
+        # Encoder:
+        # e1: 32 -> 64   => s1 có 64 kênh
+        # e2: 64 -> 128  => s2 có 128 kênh
+        # e3: 128 -> 192 => s3 có 192 kênh
+        # e4: 192 -> 192 => s4 có 192 kênh
         self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
         self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
-        
-        # ✓ Tầng Sâu (MultiScale, Không ECA, Hardswish)
         self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
         self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
         
         self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
+        # Decoder (Khai báo đúng skip_c lấy từ s4, s3, s2, s1)
         self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=128, out_c=64,  act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=64,  out_c=32,  act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=32,  out_c=16,  act_type='hswish')   
+        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
+        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
