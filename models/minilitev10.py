@@ -35,17 +35,21 @@ class ECABlock(nn.Module):
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
+# 2. SpatialAttention_MCU: CHỈ SỬA DUY NHẤT LỖI CỦA torch.max
 class SpatialAttention_MCU(nn.Module):
-    # Kernel_size=3 tốn đúng 18 params
     def __init__(self, kernel_size=3):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
         self.hardsigmoid = nn.Hardsigmoid()
-
+        
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        y = torch.cat([avg_out, max_out], dim=1) 
+        
+        # BẮT BUỘC PHẢI SỬA DÒNG NÀY:
+        # Dùng torch.amax để không sinh ra tensor vị trí (indices) gây lỗi ONNX
+        max_out = torch.amax(x, dim=1, keepdim=True) 
+        
+        y = torch.cat([avg_out, max_out], dim=1)
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
