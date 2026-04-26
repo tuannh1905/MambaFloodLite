@@ -30,8 +30,8 @@ def set_seed(seed):
 
 DATASETS = {
     'floodkaggle': {
-        #'id': '1uMgjTSxseBuxH65VhLdN_4_rlMihamHa',
-        'id': '1LwWCPk3gsPDiRAnB_RUVffCky-j8yNO0',
+        'id': '1uMgjTSxseBuxH65VhLdN_4_rlMihamHa',
+        #'id': '1LwWCPk3gsPDiRAnB_RUVffCky-j8yNO0',
         'dir': 'floodkaggle'
     },
     'floodscene': {
