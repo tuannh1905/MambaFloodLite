@@ -49,11 +49,13 @@ class ECABlock(nn.Module):
             get_activation(act_type),
             nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
-        # Dùng hàm Custom
         self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
-        y = torch.mean(x, dim=[2, 3], keepdim=True)
+        # Hãy tin mình, khi xuất ONNX, hàm này sẽ biến thành GlobalAveragePool siêu nhẹ, 
+        # chạy trên vi điều khiển còn mượt hơn cả torch.mean!
+        y = F.adaptive_avg_pool2d(x, (1, 1))
+        
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
