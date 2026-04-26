@@ -3,6 +3,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
+# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
+# ==============================================================================
+class CustomHardsigmoid(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.relu6 = nn.ReLU6(inplace=True)
+
+    def forward(self, x):
+        return self.relu6(x + 3.0) / 6.0
+
+class CustomHardswish(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hardsigmoid = CustomHardsigmoid()
+
+    def forward(self, x):
+        return x * self.hardsigmoid(x)
+
+def get_activation(act_type):
+    if act_type == 'hswish':
+        return CustomHardswish()
+    return nn.ReLU6(inplace=True)
+
+# ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
 # - ✓ ADDITIVE FUSION: Giữ nguyên để cứu RAM.
 # - ✓ CUT ATTENTION: Bỏ hoàn toàn ECA ở Encoder để giảm Overhead băng thông.
@@ -10,11 +34,6 @@ import torch.nn.functional as F
 # - ✓ BƠM PARAMS: Cấu hình kênh 32 -> 64 -> 128 -> 192.
 # - ✓ FIX BUG: Khai báo chuẩn xác skip_c cho Decoder V4.
 # ==============================================================================
-
-def get_activation(act_type):
-    if act_type == 'hswish':
-        return nn.Hardswish(inplace=True)
-    return nn.ReLU6(inplace=True)
 
 # ==============================================================================
 # 1. ATTENTION MODULES
@@ -28,7 +47,8 @@ class ECABlock(nn.Module):
             get_activation(act_type),
             nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
-        self.hardsigmoid = nn.Hardsigmoid()
+        # Đã thay thế bằng CustomHardsigmoid
+        self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
         y = torch.mean(x, dim=[2, 3], keepdim=True)
@@ -39,7 +59,8 @@ class SpatialAttention_MCU(nn.Module):
     def __init__(self, kernel_size=3):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-        self.hardsigmoid = nn.Hardsigmoid()
+        # Đã thay thế bằng CustomHardsigmoid
+        self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
@@ -77,7 +98,6 @@ class NearestUpsample(nn.Module):
 # 3. KHỐI ENCODER (CHIA LÀM 2 LOẠI: DUAL-SCALE VÀ MULTI-SCALE)
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
-    """ ✓ Tối ưu cho Tầng Nông (Ảnh to): Chỉ dùng 3x3 và 5x5, KHÔNG DÙNG ECA """
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
         self.dw_3x3 = SquareDW(dim)
@@ -88,14 +108,13 @@ class DualScale_PFCU_DG(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        b3 = self.dw_3x3(x)         
+        b3 = self.dw_3x3(x)        
         b5 = self.dw_5x5(b3)        
         
         fused = self.bn_fuse(self.pw_fuse(b3 + b5))
         return self.act(fused + x)
 
 class MultiScale_PFCU_DG(nn.Module):
-    """ ✓ Dùng cho Tầng Sâu (Ảnh nhỏ): Full 3x3, 5x5, 7x7, KHÔNG DÙNG ECA """
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
         self.dw_3x3 = SquareDW(dim)
@@ -107,7 +126,7 @@ class MultiScale_PFCU_DG(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        b3 = self.dw_3x3(x)         
+        b3 = self.dw_3x3(x)        
         b5 = self.dw_5x5(b3)        
         b7 = self.dw_7x7(b5)        
         
@@ -117,7 +136,6 @@ class MultiScale_PFCU_DG(nn.Module):
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
         super().__init__()
-        # Nếu là tầng sâu (is_deep=True) thì gọi MultiScale, ngược lại gọi DualScale
         if is_deep:
             self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
         else:
@@ -170,7 +188,7 @@ class AdditiveDecoderBlock(nn.Module):
             get_activation(act_type),
             
             SquareDW(gc, kernel_size=5), 
-            ECABlock(gc, act_type), # ECA được giữ lại ở Decoder để lọc skip-connection
+            ECABlock(gc, act_type), 
             
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
@@ -197,7 +215,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
     def forward(self, x):
-        d1 = self.dw_3x3(x)         
+        d1 = self.dw_3x3(x)        
         d2 = self.dw_5x5(d1)        
         d3 = self.dw_7x7(d2)        
         
@@ -220,11 +238,6 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # Encoder:
-        # e1: 32 -> 64   => s1 có 64 kênh
-        # e2: 64 -> 128  => s2 có 128 kênh
-        # e3: 128 -> 192 => s3 có 192 kênh
-        # e4: 192 -> 192 => s4 có 192 kênh
         self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
         self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
         self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
@@ -232,7 +245,6 @@ class PicoUNet_v4_Edge(nn.Module):
         
         self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
-        # Decoder (Khai báo đúng skip_c lấy từ s4, s3, s2, s1)
         self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
         self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
         self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
