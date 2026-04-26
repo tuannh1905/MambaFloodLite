@@ -8,12 +8,33 @@ import torch.nn.functional as F
 # - ✓ CHIẾN THUẬT 3: Hybrid Activation (e1, e2 dùng ReLU6; e3, e4, Decoder dùng Hardswish).
 # - ✓ CHIẾN THUẬT 4: Đơn giản hóa Decoder bằng Concat Fusion truyền thống.
 # - ✓ CHIẾN THUẬT 5 (NEW): Bóp kênh đáy mạng về 128 (24 -> 48 -> 96 -> 128) để tối đa FPS.
+# - ✓ CHIẾN THUẬT 6 (ONNX FIX): Tự định nghĩa Hardsigmoid/Hardswish để ép xuất Opset 11.
 # ==============================================================================
+
+# ==============================================================================
+# 0. CUSTOM ACTIVATIONS (DÀNH RIÊNG CHO ONNX EXPORT OPSET 11)
+# ==============================================================================
+class CustomHardsigmoid(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.relu6 = nn.ReLU6(inplace=True)
+        
+    def forward(self, x):
+        return self.relu6(x + 3.0) / 6.0
+
+class CustomHardswish(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hardsigmoid = CustomHardsigmoid()
+        
+    def forward(self, x):
+        return x * self.hardsigmoid(x)
 
 # Hàm hỗ trợ chọn Activation linh hoạt
 def get_activation(act_type):
     if act_type == 'hswish':
-        return nn.Hardswish(inplace=True)
+        # Dùng hàm Custom để không bị lỗi version_converter
+        return CustomHardswish()
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
@@ -28,24 +49,24 @@ class ECABlock(nn.Module):
             get_activation(act_type),
             nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
-        self.hardsigmoid = nn.Hardsigmoid()
+        # Dùng hàm Custom
+        self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
         y = torch.mean(x, dim=[2, 3], keepdim=True)
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
-# 2. SpatialAttention_MCU: CHỈ SỬA DUY NHẤT LỖI CỦA torch.max
+# 2. SpatialAttention_MCU: Dùng amax để tránh lỗi indices
 class SpatialAttention_MCU(nn.Module):
     def __init__(self, kernel_size=3):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-        self.hardsigmoid = nn.Hardsigmoid()
+        # Dùng hàm Custom
+        self.hardsigmoid = CustomHardsigmoid()
         
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
-        
-        # BẮT BUỘC PHẢI SỬA DÒNG NÀY:
         # Dùng torch.amax để không sinh ra tensor vị trí (indices) gây lỗi ONNX
         max_out = torch.amax(x, dim=1, keepdim=True) 
         
