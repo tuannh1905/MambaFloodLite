@@ -47,11 +47,11 @@ class ECABlock(nn.Module):
             get_activation(act_type),
             nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
-        # Đã thay thế bằng CustomHardsigmoid
         self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
-        y = torch.mean(x, dim=[2, 3], keepdim=True)
+        # VACCINE 2: Dùng AdaptiveAvgPool thay vì torch.mean
+        y = F.adaptive_avg_pool2d(x, 1) 
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
