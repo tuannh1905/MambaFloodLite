@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11
+# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
 # ==============================================================================
 class CustomHardsigmoid(nn.Module):
     def __init__(self):
@@ -27,11 +27,9 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V10: MASTERPIECE EDITION (BẢN HOÀN THIỆN CUỐI CÙNG)
-# - ✓ KẾ THỪA: Out-Space Fusion, Compressed Skip, CE-Gate Bottleneck.
-# - ✓ HEAD SMOOTHING: d1 = 24 kênh + DWConv 3x3 chống rỗ mask.
-# - ✓ MỚI (THICK REFINE): gc = max(out_c // 2, 8). Bơm thêm "thịt" cho Decoder 
-#     để vắt kiệt chi tiết, gọt biên cực mượt mà không làm rớt FPS.
+# PICO-UNET V11: CONTEXT PYRAMID EDITION
+# - ✓ ADDITIVE CONTEXT BOTTLENECK: Gom ngữ cảnh đa thang (Local, 2x2, 4x4, Global).
+# - ✓ KẾ THỪA TINH HOA: Out-Space Fusion (V7), Skip Compression (V7), Head Smooth (V9).
 # ==============================================================================
 
 # ==============================================================================
@@ -54,7 +52,7 @@ class CEGate(nn.Module):
         return x * gate
 
 # ==============================================================================
-# 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE
+# 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE CƠ BẢN
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size=3):
@@ -67,12 +65,15 @@ class SquareDW(nn.Module):
         return self.bn(self.dw(x))
 
 class NearestUpsample(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels=None):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        # Không cần refine, để Decoder hoặc Block tự handle
+        pass
 
-    def forward(self, x):
-        return self.up(x)
+    def forward(self, x, scale_factor=2, size=None):
+        if size is not None:
+            return F.interpolate(x, size=size, mode='nearest')
+        return F.interpolate(x, scale_factor=scale_factor, mode='nearest')
 
 # ==============================================================================
 # 3. COMPRESSED ENCODER BLOCKS
@@ -157,34 +158,77 @@ class CompressedEncoderBlock(nn.Module):
 # ==============================================================================
 # 4. BOTTLENECK & OUT-SPACE DECODER
 # ==============================================================================
-class SerialMultiScaleBottleneck(nn.Module):
+
+class PoolBranch(nn.Module):
+    """ Nhánh con cho Bottleneck: Pooling -> 1x1 -> Upsample """
+    def __init__(self, in_c, branch_c, pool_size, act_type):
+        super().__init__()
+        if pool_size == 'global':
+            self.pool = nn.AdaptiveAvgPool2d(1)
+        else:
+            # Kernel và stride bằng pool_size để hạ độ phân giải
+            self.pool = nn.AvgPool2d(kernel_size=pool_size, stride=pool_size)
+            
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_c, branch_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(branch_c),
+            get_activation(act_type)
+        )
+        
+    def forward(self, x, target_size):
+        # Pool -> Ép kênh -> Phóng to lại kích thước gốc bằng Nearest (rẻ)
+        p = self.conv(self.pool(x))
+        return F.interpolate(p, size=target_size, mode='nearest')
+
+class ContextBottleneck_MCU(nn.Module):
+    """ ✓ MỚI: BOTTLENECK ĐA THANG (PPM-LITE) DÀNH CHO MCU """
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        self.dw1 = SquareDW(dim, kernel_size=3)
-        self.dw2 = SquareDW(dim, kernel_size=3) 
-        self.dw3 = SquareDW(dim, kernel_size=3) 
+        # Bóp số kênh nhánh xuống 1/4 để tiết kiệm chi phí
+        branch_c = max(16, dim // 4)
         
-        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
-        self.act_fuse = get_activation(act_type)
+        # 1. Nhánh Local (Bám cấu trúc gốc)
+        self.local = nn.Sequential(
+            SquareDW(dim, kernel_size=3),
+            nn.Conv2d(dim, branch_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(branch_c),
+            get_activation(act_type)
+        )
         
+        # 2. Các nhánh Context
+        self.pool2 = PoolBranch(dim, branch_c, pool_size=2, act_type=act_type)
+        self.pool4 = PoolBranch(dim, branch_c, pool_size=4, act_type=act_type)
+        self.pool_g = PoolBranch(dim, branch_c, pool_size='global', act_type=act_type)
+        
+        # 3. Fuse & Gate
+        self.fuse = nn.Sequential(
+            nn.Conv2d(branch_c, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim),
+            get_activation(act_type)
+        )
         self.ce_gate = CEGate(dim, act_type)
 
     def forward(self, x):
-        d1 = self.dw1(x)        
-        d2 = self.dw2(d1)        
-        d3 = self.dw3(d2)        
+        target_size = x.shape[2:]
         
-        fused_dw = d1 + d2 + d3
-        local_context = self.act_fuse(self.bn_fuse(self.pw_fuse(fused_dw)))
-        out = self.ce_gate(local_context)
+        l  = self.local(x)
+        p2 = self.pool2(x, target_size)
+        p4 = self.pool4(x, target_size)
+        pg = self.pool_g(x, target_size)
+        
+        # Cộng Additive để hòa trộn không gian mà không phình kênh
+        fused = l + p2 + p4 + pg
+        
+        # 1x1 Fuse để định hướng lại Feature
+        out = self.fuse(fused)
+        
+        # Cổng toàn cục CE-Gate & Residual
+        out = self.ce_gate(out)
         return x + out
 
 class OutSpaceDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
-        self.up = NearestUpsample(in_c)
-        
         self.up_proj = nn.Sequential(
             nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
@@ -195,7 +239,6 @@ class OutSpaceDecoderBlock(nn.Module):
             nn.BatchNorm2d(out_c)
         )
         
-        # ✓ THICK REFINE: Bơm thêm sức mạnh cho việc tinh chỉnh (Gọt biên)
         gc = max(out_c // 2, 8) 
         
         self.refine = nn.Sequential(
@@ -212,13 +255,14 @@ class OutSpaceDecoderBlock(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        fused = self.up_proj(self.up(x)) + self.skip_proj(skip)
+        up_x = F.interpolate(x, scale_factor=2, mode='nearest')
+        fused = self.up_proj(up_x) + self.skip_proj(skip)
         return self.act(self.refine(fused) + fused)
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V10
+# 5. MẠNG CHÍNH PICO-UNET V11
 # ==============================================================================
-class PicoUNet_v10_Edge(nn.Module):
+class PicoUNet_v11_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
@@ -232,7 +276,8 @@ class PicoUNet_v10_Edge(nn.Module):
         self.e3 = CompressedEncoderBlock(96, 128, skip_c=80, is_deep=True, act_type='hswish')  
         self.e4 = CompressedEncoderBlock(128, 128, skip_c=80, is_deep=True, act_type='hswish') 
         
-        self.bottleneck = SerialMultiScaleBottleneck(128, act_type='hswish')
+        # ✓ Thay máu Bottleneck hoàn toàn mới
+        self.bottleneck = ContextBottleneck_MCU(128, act_type='hswish')
         
         self.d4 = OutSpaceDecoderBlock(in_c=128, skip_c=80, out_c=96, act_type='hswish') 
         self.d3 = OutSpaceDecoderBlock(in_c=96,  skip_c=80, out_c=48,  act_type='hswish')  
@@ -265,4 +310,4 @@ class PicoUNet_v10_Edge(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v10_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v11_Edge(num_classes=num_classes, input_size=input_size)
