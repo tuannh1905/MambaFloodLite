@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
+# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11
 # ==============================================================================
 class CustomHardsigmoid(nn.Module):
     def __init__(self):
@@ -27,18 +27,17 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V8: THE PERFECT EDGE EDITION
-# - ✓ OUT-SPACE FUSION: Cộng tensor ở không gian nhỏ (giảm >50% MACs 1x1).
-# - ✓ SKIP COMPRESSION: Nén kênh Skip ngay tại Encoder (giảm 50% RAM).
-# - ✓ SERIAL-DW + CE-GATE BOTTLENECK: Kiến trúc nối tiếp, trộn 1x1, lọc toàn cục.
-# - ✓ CLEAN CODE: Xóa bỏ hoàn toàn Spatial Attention thừa thãi.
+# PICO-UNET V10: MASTERPIECE EDITION (BẢN HOÀN THIỆN CUỐI CÙNG)
+# - ✓ KẾ THỪA: Out-Space Fusion, Compressed Skip, CE-Gate Bottleneck.
+# - ✓ HEAD SMOOTHING: d1 = 24 kênh + DWConv 3x3 chống rỗ mask.
+# - ✓ MỚI (THICK REFINE): gc = max(out_c // 2, 8). Bơm thêm "thịt" cho Decoder 
+#     để vắt kiệt chi tiết, gọt biên cực mượt mà không làm rớt FPS.
 # ==============================================================================
 
 # ==============================================================================
 # 1. CONTEXT ENHANCEMENT GATE (CE-GATE)
 # ==============================================================================
 class CEGate(nn.Module):
-    """ ✓ Tóm tắt toàn cục -> MLP -> Hardsigmoid -> Lọc Kênh """
     def __init__(self, channels, act_type='hswish'):
         super().__init__()
         mid_channels = max(8, channels // 4)
@@ -51,7 +50,6 @@ class CEGate(nn.Module):
         )
 
     def forward(self, x):
-        # Tạo vector trọng số (gate) và nhân ngược lại vào feature map
         gate = self.mlp(self.pool(x))
         return x * gate
 
@@ -160,19 +158,16 @@ class CompressedEncoderBlock(nn.Module):
 # 4. BOTTLENECK & OUT-SPACE DECODER
 # ==============================================================================
 class SerialMultiScaleBottleneck(nn.Module):
-    """ ✓ Chuẩn tinh thần: Serial DW -> Fuse 1x1 -> CE-Gate -> Residual """
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
         self.dw1 = SquareDW(dim, kernel_size=3)
         self.dw2 = SquareDW(dim, kernel_size=3) 
         self.dw3 = SquareDW(dim, kernel_size=3) 
         
-        # 1x1 Conv trộn ngữ nghĩa sau khi DW đã thu thập thông tin không gian
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         self.act_fuse = get_activation(act_type)
         
-        # CE-Gate (Tăng giảm trọng số kênh dựa trên toàn cục)
         self.ce_gate = CEGate(dim, act_type)
 
     def forward(self, x):
@@ -181,11 +176,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         d3 = self.dw3(d2)        
         
         fused_dw = d1 + d2 + d3
-        
-        # Trộn kênh bằng pointwise
         local_context = self.act_fuse(self.bn_fuse(self.pw_fuse(fused_dw)))
-        
-        # Áp dụng Gate và cộng residual
         out = self.ce_gate(local_context)
         return x + out
 
@@ -204,14 +195,16 @@ class OutSpaceDecoderBlock(nn.Module):
             nn.BatchNorm2d(out_c)
         )
         
-        gc = max(out_c // 4, 4)
+        # ✓ THICK REFINE: Bơm thêm sức mạnh cho việc tinh chỉnh (Gọt biên)
+        gc = max(out_c // 2, 8) 
+        
         self.refine = nn.Sequential(
             nn.Conv2d(out_c, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
             SquareDW(gc, kernel_size=5), 
-            CEGate(gc, act_type), # Cập nhật tên thành CEGate
+            CEGate(gc, act_type), 
             
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
@@ -223,9 +216,9 @@ class OutSpaceDecoderBlock(nn.Module):
         return self.act(self.refine(fused) + fused)
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V8 (PERFECT EDGE)
+# 5. MẠNG CHÍNH PICO-UNET V10
 # ==============================================================================
-class PicoUNet_v8_Edge(nn.Module):
+class PicoUNet_v10_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
@@ -234,20 +227,24 @@ class PicoUNet_v8_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 24, kernel_size=3, padding=1)
         
-        # Trunk: 24 -> 48 -> 96 -> 128 
         self.e1 = CompressedEncoderBlock(24, 48, skip_c=24, is_deep=False, act_type='relu6')   
         self.e2 = CompressedEncoderBlock(48, 96, skip_c=48, is_deep=False, act_type='relu6')   
-        self.e3 = CompressedEncoderBlock(96, 128, skip_c=64, is_deep=True, act_type='hswish') 
-        self.e4 = CompressedEncoderBlock(128, 128, skip_c=64, is_deep=True, act_type='hswish') 
+        self.e3 = CompressedEncoderBlock(96, 128, skip_c=80, is_deep=True, act_type='hswish')  
+        self.e4 = CompressedEncoderBlock(128, 128, skip_c=80, is_deep=True, act_type='hswish') 
         
         self.bottleneck = SerialMultiScaleBottleneck(128, act_type='hswish')
         
-        self.d4 = OutSpaceDecoderBlock(in_c=128, skip_c=64, out_c=96, act_type='hswish') 
-        self.d3 = OutSpaceDecoderBlock(in_c=96,  skip_c=64, out_c=48,  act_type='hswish')  
+        self.d4 = OutSpaceDecoderBlock(in_c=128, skip_c=80, out_c=96, act_type='hswish') 
+        self.d3 = OutSpaceDecoderBlock(in_c=96,  skip_c=80, out_c=48,  act_type='hswish')  
         self.d2 = OutSpaceDecoderBlock(in_c=48,  skip_c=48, out_c=24,  act_type='relu6')   
-        self.d1 = OutSpaceDecoderBlock(in_c=24,  skip_c=24, out_c=16,  act_type='relu6')   
+        self.d1 = OutSpaceDecoderBlock(in_c=24,  skip_c=24, out_c=24,  act_type='relu6')   
         
-        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
+        self.head_smooth = nn.Sequential(
+            SquareDW(24, kernel_size=3),
+            get_activation('relu6')
+        )
+        
+        self.conv_out = nn.Conv2d(24, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
@@ -264,7 +261,8 @@ class PicoUNet_v8_Edge(nn.Module):
         x = self.d2(x, s2)
         x = self.d1(x, s1)
         
+        x = self.head_smooth(x)
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v8_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v10_Edge(num_classes=num_classes, input_size=input_size)
