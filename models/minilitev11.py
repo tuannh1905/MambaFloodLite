@@ -27,13 +27,10 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# - ✓ ADDITIVE FUSION: Giữ nguyên để cứu RAM.
-# - ✓ CUT ATTENTION: Bỏ hoàn toàn ECA ở Encoder để giảm Overhead băng thông.
-# - ✓ DUAL-SCALE ENCODER: E1, E2 chỉ dùng 3x3 + 5x5 để giảm GFLOPs.
-# - ✓ BƠM PARAMS: Cấu hình kênh 32 -> 64 -> 128 -> 192.
-# - ✓ FIX BUG DECODER: Khai báo chuẩn xác skip_c cho Decoder V4.
-# - ✓ FIX BUG CẬN THỊ: Đã truyền rõ kernel_size=3, 5, 7 vào các khối SquareDW.
+# PICO-UNET V5: BẢN "GFLOPS DIET" (~300K PARAMS - SIÊU THẤP FLOPS)
+# - ✓ LIGHT DECODER: Khối d1, d2 bỏ 5x5, bỏ ECA, dùng ReLU6 để bay tốc độ ở ảnh to.
+# - ✓ BOTTLENECK FUSE: Thêm Conv 1x1 trộn luồng 3x3+5x5+7x7 mượt mà.
+# - ✓ DUAL-SCALE ENCODER: E1, E2 tiếp tục giữ trạng thái siêu nhẹ.
 # ==============================================================================
 
 # ==============================================================================
@@ -51,7 +48,6 @@ class ECABlock(nn.Module):
         self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
-        # VACCINE 2: Dùng AdaptiveAvgPool thay vì torch.mean
         y = F.adaptive_avg_pool2d(x, 1) 
         y = self.hardsigmoid(self.conv(y))
         return x * y
@@ -60,7 +56,6 @@ class SpatialAttention_MCU(nn.Module):
     def __init__(self, kernel_size=3):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-        # Đã thay thế bằng CustomHardsigmoid
         self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
@@ -101,9 +96,9 @@ class NearestUpsample(nn.Module):
 class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        # ✓ ĐÃ SỬA: Truyền rõ kernel_size
+        # Kỹ thuật Factorized: Chồng 2 lớp 3x3 để tạo RF 5x5
         self.dw_3x3 = SquareDW(dim, kernel_size=3)
-        self.dw_5x5 = SquareDW(dim, kernel_size=5) 
+        self.dw_5x5 = SquareDW(dim, kernel_size=3) 
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
@@ -119,10 +114,10 @@ class DualScale_PFCU_DG(nn.Module):
 class MultiScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        # ✓ ĐÃ SỬA: Truyền rõ kernel_size
+        # Kỹ thuật Factorized: Chồng 3 lớp 3x3 để tạo RF 7x7
         self.dw_3x3 = SquareDW(dim, kernel_size=3)
-        self.dw_5x5 = SquareDW(dim, kernel_size=5) 
-        self.dw_7x7 = SquareDW(dim, kernel_size=7) 
+        self.dw_5x5 = SquareDW(dim, kernel_size=3) 
+        self.dw_7x7 = SquareDW(dim, kernel_size=3) 
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
@@ -172,9 +167,10 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK
+# 4. DECODER (2 PHIÊN BẢN) & BOTTLE-NECK
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
+    """ ✓ BẢN HEAVY: Dùng cho tầng sâu (d4, d3). Có 5x5 và ECA """
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
@@ -190,7 +186,7 @@ class AdditiveDecoderBlock(nn.Module):
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
-            SquareDW(gc, kernel_size=5), 
+            SquareDW(gc, kernel_size=5), # Tầng sâu ảnh nhỏ nên dùng 5x5
             ECABlock(gc, act_type), 
             
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
@@ -207,13 +203,52 @@ class AdditiveDecoderBlock(nn.Module):
         fused = self.proj(self.up(x)) + skip
         return self.act(self.refine(fused) + self.shortcut(fused))
 
+
+class LightAdditiveDecoderBlock(nn.Module):
+    """ ✓ BẢN LIGHT: Dùng cho tầng nông (d2, d1). Cắt sạch 5x5 và ECA """
+    def __init__(self, in_c, skip_c, out_c, act_type='relu6'):
+        super().__init__()
+        self.up = NearestUpsample(in_c)
+        
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(skip_c)
+        )
+        
+        gc = max(out_c // 4, 4)
+        self.refine = nn.Sequential(
+            nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
+            nn.BatchNorm2d(gc), 
+            get_activation(act_type),
+            
+            SquareDW(gc, kernel_size=3), # Thay 5x5 bằng 3x3 siêu nhẹ
+            # ĐÃ XÓA ECABLOCK ĐỂ CỨU GFLOPS
+            
+            nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
+            nn.BatchNorm2d(out_c)
+        )
+        
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
+        self.act = get_activation(act_type)
+
+    def forward(self, x, skip):
+        fused = self.proj(self.up(x)) + skip
+        return self.act(self.refine(fused) + self.shortcut(fused))
+
+
 class SerialMultiScaleBottleneck(nn.Module):
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        # ✓ ĐÃ SỬA: Truyền rõ kernel_size
         self.dw_3x3 = SquareDW(dim, kernel_size=3)
-        self.dw_5x5 = SquareDW(dim, kernel_size=5) 
-        self.dw_7x7 = SquareDW(dim, kernel_size=7) 
+        self.dw_5x5 = SquareDW(dim, kernel_size=3) 
+        self.dw_7x7 = SquareDW(dim, kernel_size=3) 
+        
+        # ✓ MỚI: Thêm 1x1 Pointwise để trộn 3 luồng thay vì cộng chay
+        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn_fuse = nn.BatchNorm2d(dim)
         
         self.channel_attn = ECABlock(dim, act_type)
         self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
@@ -223,7 +258,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         d2 = self.dw_5x5(d1)        
         d3 = self.dw_7x7(d2)        
         
-        fused = d1 + d2 + d3
+        fused = self.bn_fuse(self.pw_fuse(d1 + d2 + d3))
         
         out = self.channel_attn(fused)
         out = self.spatial_attn(out)
@@ -231,9 +266,9 @@ class SerialMultiScaleBottleneck(nn.Module):
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE)
+# 5. MẠNG CHÍNH PICO-UNET V5 (SIÊU THẤP FLOPS)
 # ==============================================================================
-class PicoUNet_v4_Edge(nn.Module):
+class PicoUNet_v5_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
@@ -249,10 +284,13 @@ class PicoUNet_v4_Edge(nn.Module):
         
         self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
+        # d4, d3: Tầng sâu (16x16, 32x32) -> Dùng AdditiveDecoderBlock (Heavy), Hswish
         self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
         self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        
+        # d2, d1: Tầng nông (64x64, 128x128) -> Dùng LightAdditiveDecoderBlock (Siêu nhẹ), ReLU6
+        self.d2 = LightAdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='relu6')   
+        self.d1 = LightAdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='relu6')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -274,4 +312,4 @@ class PicoUNet_v4_Edge(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v4_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v5_Edge(num_classes=num_classes, input_size=input_size)
