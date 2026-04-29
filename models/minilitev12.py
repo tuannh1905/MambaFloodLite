@@ -27,10 +27,10 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V15: THE ULTIMATE LRASPP EDITION
-# - ✓ LRASPP-LIKE BOTTLENECK: Kết hợp Local (3x3 -> 5x5) và Global (GAP).
-# - ✓ THICKER SHALLOW SKIPS: s1(16), s2(24) giúp giữ chi tiết sắc nét hơn.
-# - ✓ THICKER GUIDED REFINEMENT: d1, d2 được bơm thêm mid_c (16, 20).
+# PICO-UNET V16: THE MASTER-CRAFTED EDITION
+# - ✓ FIXED GATE BIAS: Thêm bias=True cho Gate để học được Default Prior (Đóng/Mở).
+# - ✓ FIXED SHORTCUT: Bổ sung skip_shortcut cho GDR Block, cứu rỗi Detail bị đứt.
+# - ✓ FIXED DOUBLE ACT: Xóa bỏ Activation thừa ở head_smooth.
 # ==============================================================================
 
 # ==============================================================================
@@ -57,7 +57,7 @@ class NearestUpsample(nn.Module):
         return F.interpolate(x, scale_factor=scale_factor, mode='nearest')
 
 # ==============================================================================
-# 2. ENCODER BLOCKS (Detail vs Semantic)
+# 2. ENCODER BLOCKS
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
@@ -137,16 +137,14 @@ class CompressedEncoderBlock(nn.Module):
         return out, skip_compressed
 
 # ==============================================================================
-# 3. NEW BOTTLENECK (BÓP GAP GỌN NHẸ)
+# 3. NEW BOTTLENECK (LRASPP-LIKE)
 # ==============================================================================
 class BottleneckWithGAP(nn.Module):
     def __init__(self, dim=128, act_type='hswish'):
         super().__init__()
-        # V14 SquareDW đã tích hợp sẵn Act+BN, nối tiếp tạo RF=7
         self.dw1 = SquareDW(dim, kernel_size=3, act_type=act_type)  
         self.dw2 = SquareDW(dim, kernel_size=5, act_type=act_type)  
         
-        # GAP thay cho lớp 5x5 thứ 3. RF: vô cực
         self.gap_proj = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(dim, dim, kernel_size=1, bias=False),
@@ -162,7 +160,6 @@ class BottleneckWithGAP(nn.Module):
 
     def forward(self, x):
         local = self.dw2(self.dw1(x))
-        # GAP: context toàn cục, PyTorch sẽ tự động broadcast (1x1) lên (HxW) khi cộng
         global_ctx = self.gap_proj(x)
         return self.fuse(local + global_ctx)
 
@@ -212,8 +209,9 @@ class GuidedDetailRefinementBlock(nn.Module):
             nn.BatchNorm2d(mid_c)
         )
         
+        # ✓ FIX 3: Thêm bias=True cho Gate để nới lỏng Default Prior
         self.gate = nn.Sequential(
-            nn.Conv2d(mid_c, mid_c, kernel_size=1, bias=False),
+            nn.Conv2d(mid_c, mid_c, kernel_size=1, bias=True),
             CustomHardsigmoid()
         )
         
@@ -224,10 +222,18 @@ class GuidedDetailRefinementBlock(nn.Module):
             nn.BatchNorm2d(out_c)
         )
         
+        # Shortcut từ nhánh lên (Semantic)
         self.shortcut = nn.Sequential(
             nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
         )
+        
+        # ✓ FIX 1: Shortcut cứu rỗi từ nhánh ngang (Detail)
+        self.skip_shortcut = nn.Sequential(
+            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
+        
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
@@ -235,16 +241,18 @@ class GuidedDetailRefinementBlock(nn.Module):
         sem = self.low_sem(up_x)
         det = self.skip_det(skip)
         
+        # Gating: Modulation chi tiết
         fused = sem + det * self.gate(sem)
         fused = self.dw(fused)
         out = self.to_out(fused)
         
-        return self.act(out + self.shortcut(up_x))
+        # ✓ Cộng cả 3: Tín hiệu chính + Shortcut Lên + Shortcut Ngang (Detail Base)
+        return self.act(out + self.shortcut(up_x) + self.skip_shortcut(skip))
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V15 (FINAL DEPLOY)
+# 5. MẠNG CHÍNH PICO-UNET V16
 # ==============================================================================
-class PicoUNet_v15_Edge(nn.Module):
+class PicoUNet_v16_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
@@ -253,27 +261,21 @@ class PicoUNet_v15_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
         
-        # ✓ FIX 1: Tăng Skip_c ở e1, e2
         self.e1 = CompressedEncoderBlock(16, 32, skip_c=16,  is_deep=False, act_type='relu6')   
         self.e2 = CompressedEncoderBlock(32, 64, skip_c=24, is_deep=False, act_type='relu6')   
         self.e3 = CompressedEncoderBlock(64, 128, skip_c=48, is_deep=True, act_type='hswish')  
         self.e4 = CompressedEncoderBlock(128, 128, skip_c=64, is_deep=True, act_type='hswish') 
         
-        # ✓ FIX 2: Tích hợp LRASPP Bottleneck
         self.bottleneck = BottleneckWithGAP(128, act_type='hswish')
         
-        # Decoder
         self.d4 = SemanticDecoderBlock(in_c=128, skip_c=64, out_c=96, act_type='hswish') 
         self.d3 = SemanticDecoderBlock(in_c=96,  skip_c=48, out_c=64, act_type='hswish')  
         
-        # ✓ FIX 1 (tt): Cập nhật Decoder nhận chuẩn skip_c và mid_c mới
         self.d2 = GuidedDetailRefinementBlock(in_c=64, skip_c=24, out_c=32, mid_c=20, act_type='relu6')   
         self.d1 = GuidedDetailRefinementBlock(in_c=32, skip_c=16,  out_c=16, mid_c=16, act_type='relu6')   
         
-        self.head_smooth = nn.Sequential(
-            SquareDW(16, kernel_size=3, act_type='relu6'),
-            get_activation('relu6')
-        )
+        # ✓ FIX 2: Loại bỏ hàm Activation thừa, chỉ dùng SquareDW
+        self.head_smooth = SquareDW(16, kernel_size=3, act_type='relu6')
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
@@ -295,4 +297,4 @@ class PicoUNet_v15_Edge(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v15_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v16_Edge(num_classes=num_classes, input_size=input_size)
