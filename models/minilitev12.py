@@ -27,10 +27,10 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4 (SPPM-LITE EDITION)
-# - ✓ LÕI V4: Giữ nguyên Linear Encoder, Additive Decoder để bắt texture mặt nước.
-# - ✓ BOTTLE-NECK MỚI: Thay thế Serial DW bằng Simple Pyramid Pooling Module (SPPM) 
-#     để lấy góc nhìn toàn cục (Global Context) mà không làm tăng vọt MACs.
+# PICO-UNET V4 CSP EDITION
+# - ✓ CSP ENCODER: Tích hợp Cross Stage Partial Network vào Encoder.
+# - ✓ HEAVY PATH: Dùng 2 lớp DW 3x3 nối tiếp chạy trên C/2 kênh.
+# - ✓ LÕI V4: Giữ nguyên Attention, Additive Decoder và kiến trúc tổng thể.
 # ==============================================================================
 
 # ==============================================================================
@@ -91,51 +91,53 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER (CHIA LÀM 2 LOẠI: DUAL-SCALE VÀ MULTI-SCALE)
+# 3. KHỐI ENCODER CSP (THAY THẾ PFCU_DG)
 # ==============================================================================
-class DualScale_PFCU_DG(nn.Module):
+class CSP_DualDW_Block(nn.Module):
+    """
+    Kiến trúc CSP: Split -> Heavy Path (2x DW 3x3) & Light Path (Bypass) -> Concat -> Fuse
+    """
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
+        # Chia đôi số kênh
+        self.half_dim = dim // 2
         
+        # Nhánh Heavy: Xử lý đặc trưng phức tạp trên C/2 kênh
+        # Bổ sung activation ở giữa 2 lớp DW để bẻ gãy tuyến tính
+        self.heavy_path = nn.Sequential(
+            SquareDW(self.half_dim, kernel_size=3),
+            get_activation(act_type),
+            SquareDW(self.half_dim, kernel_size=3)
+        )
+        
+        # Trộn lại sau khi Concat
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        b3 = self.dw_3x3(x)        
-        b5 = self.dw_5x5(b3)        
+        # Bước 1: Split theo channel (Không tốn tính toán)
+        # x1 đi vào Heavy, x2 đi vào Light
+        x1 = x[:, :self.half_dim, :, :]
+        x2 = x[:, self.half_dim:, :, :]
         
-        fused = self.bn_fuse(self.pw_fuse(b3 + b5))
-        return self.act(fused + x)
+        # Bước 2: Xử lý 2 nhánh
+        out1 = self.heavy_path(x1)
+        # out2 = x2 (Bypass nguyên bản)
+        
+        # Bước 3: Merge lại
+        fused_concat = torch.cat([out1, x2], dim=1)
+        
+        # Fuse 1x1 và cộng residual gốc
+        fused_out = self.bn_fuse(self.pw_fuse(fused_concat))
+        return self.act(fused_out + x)
 
-class MultiScale_PFCU_DG(nn.Module):
-    def __init__(self, dim, act_type='hswish'):
-        super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
-        self.dw_7x7 = SquareDW(dim) 
-        
-        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
-        self.act = get_activation(act_type)
-
-    def forward(self, x):
-        b3 = self.dw_3x3(x)        
-        b5 = self.dw_5x5(b3)        
-        b7 = self.dw_7x7(b5)        
-        
-        fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
-        return self.act(fused + x)
 
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
         super().__init__()
-        if is_deep:
-            self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
-        else:
-            self.pfcu_dg = DualScale_PFCU_DG(in_c, act_type)
+        # Đồng nhất dùng CSP Block cho cả tầng nông và sâu để tối ưu hóa
+        self.csp_block = CSP_DualDW_Block(in_c, act_type)
             
         self.down_pool = nn.MaxPool2d((2, 2))
         
@@ -150,7 +152,7 @@ class EncoderBlock(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        feat = self.pfcu_dg(x)
+        feat = self.csp_block(x)
         
         if self.same_channels:
             return self.act(self.down_pool(feat)), feat
@@ -165,7 +167,7 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER & BOTTLE-NECK (SPPM-LITE)
+# 4. DECODER (ADDITIVE) & BOTTLE-NECK
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
@@ -200,70 +202,30 @@ class AdditiveDecoderBlock(nn.Module):
         fused = self.proj(self.up(x)) + skip
         return self.act(self.refine(fused) + self.shortcut(fused))
 
-class PoolBranch(nn.Module):
-    """ Nhánh Pooling cho Kim tự tháp SPPM """
-    def __init__(self, in_c, out_c, pool_size, act_type):
-        super().__init__()
-        if pool_size == 1:
-            self.pool = nn.AdaptiveAvgPool2d(1)
-        else:
-            self.pool = nn.AdaptiveAvgPool2d((pool_size, pool_size))
-            
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c),
-            get_activation(act_type)
-        )
-
-    def forward(self, x, target_size):
-        # Pool -> Conv 1x1 -> Upsample bằng kích thước feature map gốc
-        pooled = self.conv(self.pool(x))
-        return F.interpolate(pooled, size=target_size, mode='nearest')
-
-class SPPMBottleneck(nn.Module):
-    """ Tích hợp Simple Pyramid Pooling Module (SPPM) thay cho Serial DW """
+class SerialMultiScaleBottleneck(nn.Module):
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        # Bóp số kênh của mỗi nhánh để tiết kiệm MACs
-        branch_c = max(32, dim // 4)
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
+        self.dw_7x7 = SquareDW(dim) 
         
-        # 3 Nhánh không gian: 1x1 (Global), 2x2, 4x4
-        self.pool1 = PoolBranch(dim, branch_c, pool_size=1, act_type=act_type)
-        self.pool2 = PoolBranch(dim, branch_c, pool_size=2, act_type=act_type)
-        self.pool4 = PoolBranch(dim, branch_c, pool_size=4, act_type=act_type)
-        
-        # Fuse 3 luồng lại và khôi phục số kênh về dim
-        self.fuse = nn.Sequential(
-            nn.Conv2d(branch_c, dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim),
-            get_activation(act_type)
-        )
-        
-        # Giữ lại cụm Attention của V4 gốc
         self.channel_attn = ECABlock(dim, act_type)
         self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
     def forward(self, x):
-        target_size = x.shape[2:]
+        d1 = self.dw_3x3(x)        
+        d2 = self.dw_5x5(d1)        
+        d3 = self.dw_7x7(d2)        
         
-        p1 = self.pool1(x, target_size)
-        p2 = self.pool2(x, target_size)
-        p4 = self.pool4(x, target_size)
+        fused = d1 + d2 + d3
         
-        # Additive Fusion: Cộng trực tiếp các nhánh pooling
-        ppm_out = self.fuse(p1 + p2 + p4)
-        
-        # Residual cộng với feature map gốc
-        out = x + ppm_out
-        
-        # Khẳng định lại tính năng V4 (Bộ Não & La Bàn)
-        out = self.channel_attn(out)
+        out = self.channel_attn(fused)
         out = self.spatial_attn(out)
         
-        return out
+        return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SPPM-LITE)
+# 5. MẠNG CHÍNH PICO-UNET V4 (CSP EDITION)
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -274,13 +236,13 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
+        # Tích hợp CSP Block vào toàn bộ Encoder
         self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
         self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
         self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
         self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
         
-        # ✓ Thay thế Bottleneck bằng SPPM-Lite
-        self.bottleneck = SPPMBottleneck(192, act_type='hswish')
+        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
         self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
         self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
