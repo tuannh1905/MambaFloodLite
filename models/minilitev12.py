@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
+# 0. CUSTOM ACTIVATIONS
 # ==============================================================================
 class CustomHardsigmoid(nn.Module):
     def __init__(self):
@@ -27,10 +27,11 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4 CSP EDITION
-# - ✓ CSP ENCODER: Tích hợp Cross Stage Partial Network vào Encoder.
-# - ✓ HEAVY PATH: Dùng 2 lớp DW 3x3 nối tiếp chạy trên C/2 kênh.
-# - ✓ LÕI V4: Giữ nguyên Attention, Additive Decoder và kiến trúc tổng thể.
+# PICO-UNET V21: THE GHOST-V4 EDITION
+# - ✓ GHOST ENCODER: Thay thế toàn bộ cụm PFCU_DG nặng nề bằng GhostModule.
+# - ✓ LINEAR GHOSTS: Nhánh sinh Ghost không dùng phi tuyến, giữ đặc tính làm mờ của V4.
+# - ✓ LÕI V4: Giữ nguyên Attention, Bottleneck V4, và Additive Decoder V4.
+# - ✓ DOWNSAMPLE: Trở lại dùng Learnable Downsample (Stride=2) bảo vệ viền.
 # ==============================================================================
 
 # ==============================================================================
@@ -69,14 +70,16 @@ class SpatialAttention_MCU(nn.Module):
 # 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE
 # ==============================================================================
 class SquareDW(nn.Module):
-    def __init__(self, dim, kernel_size=3):
+    # Dùng cho Bottleneck và Decoder
+    def __init__(self, dim, kernel_size=3, act_type='relu6'):
         super().__init__()
         padding = kernel_size // 2
         self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim, bias=False)
         self.bn = nn.BatchNorm2d(dim)
+        self.act = get_activation(act_type)
 
     def forward(self, x):
-        return self.bn(self.dw(x))
+        return self.act(self.bn(self.dw(x)))
 
 class NearestUpsample(nn.Module):
     def __init__(self, channels):
@@ -91,83 +94,70 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER CSP (THAY THẾ PFCU_DG)
+# 3. KHỐI ENCODER GHOST (THAY MÁU HOÀN TOÀN)
 # ==============================================================================
-class CSP_DualDW_Block(nn.Module):
+class LinearGhostModule(nn.Module):
     """
-    Kiến trúc CSP: Split -> Heavy Path (2x DW 3x3) & Light Path (Bypass) -> Concat -> Fuse
+    Tạo ra một nửa số kênh bằng 1x1 Conv (Đắt).
+    Sinh ra nửa còn lại bằng DW Conv (Siêu rẻ, KHÔNG dùng Activation để giữ hồn V4).
     """
-    def __init__(self, dim, act_type='relu6'):
+    def __init__(self, in_c, out_c, dw_size=3, act_type='relu6'):
         super().__init__()
-        # Chia đôi số kênh
-        self.half_dim = dim // 2
-        
-        # Nhánh Heavy: Xử lý đặc trưng phức tạp trên C/2 kênh
-        # Bổ sung activation ở giữa 2 lớp DW để bẻ gãy tuyến tính
-        self.heavy_path = nn.Sequential(
-            SquareDW(self.half_dim, kernel_size=3),
-            get_activation(act_type),
-            SquareDW(self.half_dim, kernel_size=3)
+        self.out_c = out_c
+        init_channels = out_c // 2
+        new_channels = out_c - init_channels
+
+        # Nhánh Primary (Intrinsic Features)
+        self.primary_conv = nn.Sequential(
+            nn.Conv2d(in_c, init_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(init_channels),
+            get_activation(act_type)
         )
-        
-        # Trộn lại sau khi Concat
-        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
-        self.act = get_activation(act_type)
+
+        # Nhánh Ghost (Cheap Operation - Linear Manifold)
+        self.cheap_operation = nn.Sequential(
+            nn.Conv2d(init_channels, new_channels, kernel_size=dw_size, padding=dw_size//2, groups=init_channels, bias=False),
+            nn.BatchNorm2d(new_channels)
+            # ✓ Bỏ qua Activation ở đây để tạo độ mượt cho nước (V4 Style)
+        )
 
     def forward(self, x):
-        # Bước 1: Split theo channel (Không tốn tính toán)
-        # x1 đi vào Heavy, x2 đi vào Light
-        x1 = x[:, :self.half_dim, :, :]
-        x2 = x[:, self.half_dim:, :, :]
-        
-        # Bước 2: Xử lý 2 nhánh
-        out1 = self.heavy_path(x1)
-        # out2 = x2 (Bypass nguyên bản)
-        
-        # Bước 3: Merge lại
-        fused_concat = torch.cat([out1, x2], dim=1)
-        
-        # Fuse 1x1 và cộng residual gốc
-        fused_out = self.bn_fuse(self.pw_fuse(fused_concat))
-        return self.act(fused_out + x)
+        x1 = self.primary_conv(x)
+        x2 = self.cheap_operation(x1)
+        # Nối lại là đủ 100% out_c
+        return torch.cat([x1, x2], dim=1)
 
-
-class EncoderBlock(nn.Module):
+class GhostEncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
         super().__init__()
-        # Đồng nhất dùng CSP Block cho cả tầng nông và sâu để tối ưu hóa
-        self.csp_block = CSP_DualDW_Block(in_c, act_type)
-            
-        self.down_pool = nn.MaxPool2d((2, 2))
+        # Tầng sâu dùng DW 5x5 để làm Ghost nhằm tăng Receptive Field
+        dw_size = 5 if is_deep else 3
         
-        self.same_channels = (in_c == out_c)
-        if not self.same_channels:
-            self.pw = nn.Sequential(
-                nn.Conv2d(in_c, out_c - in_c, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_c - in_c)
-            )
-            self.down_pw = nn.MaxPool2d((2, 2))
+        # Thay thế hoàn toàn Dual/Multi Scale của V4 bằng GhostModule
+        self.ghost_extract = LinearGhostModule(in_c, out_c, dw_size=dw_size, act_type=act_type)
             
-        self.act = get_activation(act_type)
+        self.same_channels = (in_c == out_c)
+        
+        # Kỹ thuật Learnable Downsample Stride=2
+        self.down_dw = nn.Sequential(
+            nn.Conv2d(out_c, out_c, kernel_size=3, stride=2, padding=1, groups=out_c, bias=False),
+            nn.BatchNorm2d(out_c),
+            get_activation(act_type)
+        )
 
     def forward(self, x):
-        feat = self.csp_block(x)
+        # Trích xuất đặc trưng
+        feat = self.ghost_extract(x)
         
-        if self.same_channels:
-            return self.act(self.down_pool(feat)), feat
-        else:
-            feat_pw = self.pw(feat)
-            skip = torch.cat([feat, feat_pw], dim=1)
+        # Nhánh skip (Nếu in_c != out_c thì GhostModule đã lo việc tăng kênh rồi)
+        skip = feat
             
-            pool_feat = self.down_pool(feat)
-            pool_pw   = self.down_pw(feat_pw)
-            
-            out = self.act(torch.cat([pool_feat, pool_pw], dim=1))
-            return out, skip
+        # Hạ mẫu đưa xuống tầng dưới
+        out = self.down_dw(skip)
+        return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK
+# 4. DECODER & BOTTLE-NECK CỦA V4
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
@@ -185,7 +175,7 @@ class AdditiveDecoderBlock(nn.Module):
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
-            SquareDW(gc, kernel_size=5), 
+            SquareDW(gc, kernel_size=5, act_type=act_type), 
             ECABlock(gc, act_type), 
             
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
@@ -205,9 +195,10 @@ class AdditiveDecoderBlock(nn.Module):
 class SerialMultiScaleBottleneck(nn.Module):
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
-        self.dw_7x7 = SquareDW(dim) 
+        # V4 Serial DW 
+        self.dw_3x3 = SquareDW(dim, kernel_size=3, act_type=act_type)
+        self.dw_5x5 = SquareDW(dim, kernel_size=3, act_type=act_type) 
+        self.dw_7x7 = SquareDW(dim, kernel_size=3, act_type=act_type) 
         
         self.channel_attn = ECABlock(dim, act_type)
         self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
@@ -218,16 +209,14 @@ class SerialMultiScaleBottleneck(nn.Module):
         d3 = self.dw_7x7(d2)        
         
         fused = d1 + d2 + d3
-        
         out = self.channel_attn(fused)
         out = self.spatial_attn(out)
-        
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (CSP EDITION)
+# 5. MẠNG CHÍNH PICO-UNET V21 (GHOST EDITION)
 # ==============================================================================
-class PicoUNet_v4_Edge(nn.Module):
+class PicoUNet_v21_Ghost(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
@@ -236,11 +225,11 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # Tích hợp CSP Block vào toàn bộ Encoder
-        self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
-        self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
-        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
-        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
+        # ✓ Thay toàn bộ bằng khối GhostEncoderBlock siêu rẻ MACs
+        self.e1 = GhostEncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
+        self.e2 = GhostEncoderBlock(64, 128, is_deep=False, act_type='relu6')   
+        self.e3 = GhostEncoderBlock(128, 192, is_deep=True, act_type='hswish') 
+        self.e4 = GhostEncoderBlock(192, 192, is_deep=True, act_type='hswish') 
         
         self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
@@ -269,4 +258,4 @@ class PicoUNet_v4_Edge(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v4_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v21_Ghost(num_classes=num_classes, input_size=input_size)
