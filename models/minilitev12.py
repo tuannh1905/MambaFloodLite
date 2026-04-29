@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
+# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11
 # ==============================================================================
 class CustomHardsigmoid(nn.Module):
     def __init__(self):
@@ -27,24 +27,25 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V13: THE GUIDED REFINEMENT EDITION
-# - ✓ D1/D2 CHỈ LÀ THỢ XÂY: Dùng Guided Detail Refinement siêu mỏng (mid_c=12).
-# - ✓ SKIP PHÂN CẤP: s1(8), s2(16) [Rất nén] | s3(48), s4(64) [Mang Semantic].
-# - ✓ E1/E2 DOWN-SAMPLE SỚM: Bóp ảnh nhỏ nhanh chóng, cắt MACs triệt để.
+# PICO-UNET V14: THE FINAL BUGFIX (NON-LINEARITY EDITION)
+# - ✓ BUG THẾ KỶ FIXED: SquareDW đã có Activation (Chống hiện tượng tuyến tính hóa).
+# - ✓ KIẾN TRÚC V13 GIỮ NGUYÊN: Guided Detail Refinement siêu mỏng ở tầng nông.
 # ==============================================================================
 
 # ==============================================================================
 # 1. KHỐI TÍCH CHẬP VÀ UPSAMPLE
 # ==============================================================================
 class SquareDW(nn.Module):
-    def __init__(self, dim, kernel_size=3):
+    """ ✓ MỚI: Tự động bơm Activation để phá vỡ tính tuyến tính khi xếp chồng """
+    def __init__(self, dim, kernel_size=3, act_type='relu6'):
         super().__init__()
         padding = kernel_size // 2
         self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim, bias=False)
         self.bn = nn.BatchNorm2d(dim)
+        self.act = get_activation(act_type)
 
     def forward(self, x):
-        return self.bn(self.dw(x))
+        return self.act(self.bn(self.dw(x)))
 
 class NearestUpsample(nn.Module):
     def __init__(self, channels=None):
@@ -61,13 +62,14 @@ class NearestUpsample(nn.Module):
 class CompressedEncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, skip_c, is_deep=False, act_type='relu6'):
         super().__init__()
-        # Kỹ thuật Factorized Conv
-        self.dw1 = SquareDW(in_c, kernel_size=3)
-        self.dw2 = SquareDW(in_c, kernel_size=3)
+        
+        # ✓ Khai báo SquareDW có truyền act_type
+        self.dw1 = SquareDW(in_c, kernel_size=3, act_type=act_type)
+        self.dw2 = SquareDW(in_c, kernel_size=3, act_type=act_type)
         self.is_deep = is_deep
         
         if is_deep:
-            self.dw3 = SquareDW(in_c, kernel_size=3)
+            self.dw3 = SquareDW(in_c, kernel_size=3, act_type=act_type)
             
         self.pw_fuse = nn.Conv2d(in_c, in_c, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(in_c)
@@ -85,7 +87,6 @@ class CompressedEncoderBlock(nn.Module):
             
         self.act_out = get_activation(act_type)
         
-        # ✓ Lớp Nén Skip-Connection (Bóp gắt ở tầng nông, lỏng ở tầng sâu)
         self.compress_skip = nn.Sequential(
             nn.Conv2d(out_c, skip_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(skip_c),
@@ -120,7 +121,6 @@ class CompressedEncoderBlock(nn.Module):
 # ==============================================================================
 
 class SemanticDecoderBlock(nn.Module):
-    """ ✓ Dùng cho d4, d3: Gánh vác Semantic Fusion (Não bộ) """
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample()
@@ -139,7 +139,8 @@ class SemanticDecoderBlock(nn.Module):
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
-            SquareDW(gc, kernel_size=5), # Gọt biên
+            # Cần truyền act_type vào SquareDW
+            SquareDW(gc, kernel_size=5, act_type=act_type), 
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
         )
@@ -151,39 +152,33 @@ class SemanticDecoderBlock(nn.Module):
 
 
 class GuidedDetailRefinementBlock(nn.Module):
-    """ ✓ MỚI! Dùng cho d2, d1: Tầng nông (Chỉ gọt biên và texture) siêu rẻ """
     def __init__(self, in_c, skip_c, out_c, mid_c=12, act_type='relu6'):
         super().__init__()
         self.up = NearestUpsample()
         
-        # Semantic đi lên bị ép vào không gian guide cực hẹp (mid_c)
         self.low_sem = nn.Sequential(
             nn.Conv2d(in_c, mid_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(mid_c)
         )
-        # Detail đi ngang bị ép vào mid_c
         self.skip_det = nn.Sequential(
             nn.Conv2d(skip_c, mid_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(mid_c)
         )
         
-        # ✓ GATE: Dùng Semantic để quyết định xem có nhận Detail từ Skip hay không
         self.gate = nn.Sequential(
             nn.Conv2d(mid_c, mid_c, kernel_size=1, bias=False),
             CustomHardsigmoid()
         )
         
-        # Gọt không gian 3x3
-        self.dw = SquareDW(mid_c, kernel_size=3)
+        # Cần truyền act_type vào SquareDW
+        self.dw = SquareDW(mid_c, kernel_size=3, act_type=act_type)
         self.act_mid = get_activation(act_type)
         
-        # Phóng lên out_c để truyền lên
         self.to_out = nn.Sequential(
             nn.Conv2d(mid_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
         )
         
-        # Shortcut residual
         self.shortcut = nn.Sequential(
             nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
@@ -196,7 +191,6 @@ class GuidedDetailRefinementBlock(nn.Module):
         sem = self.low_sem(up_x)
         det = self.skip_det(skip)
         
-        # Gating: Detail chỉ được đi qua nếu Semantic cho phép
         fused = sem + det * self.gate(sem)
         
         fused = self.act_mid(self.dw(fused))
@@ -205,9 +199,9 @@ class GuidedDetailRefinementBlock(nn.Module):
         return self.act(out + self.shortcut(up_x))
 
 # ==============================================================================
-# 4. MẠNG CHÍNH PICO-UNET V13 (THE GUIDED REFINEMENT)
+# 4. MẠNG CHÍNH PICO-UNET V14 (THE FINAL BUGFIX)
 # ==============================================================================
-class PicoUNet_v13_Edge(nn.Module):
+class PicoUNet_v14_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
@@ -216,34 +210,29 @@ class PicoUNet_v13_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
         
-        # ✓ TRUNK: 16 -> 32 -> 64 -> 128 (Mỏng ở nông, Dày ở sâu)
-        # ✓ COMPRESSED SKIPS: s1(8) [Rất nén], s2(16), s3(48), s4(64) [Ít nén]
         self.e1 = CompressedEncoderBlock(16, 32, skip_c=8,  is_deep=False, act_type='relu6')   
         self.e2 = CompressedEncoderBlock(32, 64, skip_c=16, is_deep=False, act_type='relu6')   
         self.e3 = CompressedEncoderBlock(64, 128, skip_c=48, is_deep=True, act_type='hswish')  
         self.e4 = CompressedEncoderBlock(128, 128, skip_c=64, is_deep=True, act_type='hswish') 
         
-        # Bottleneck (Giữ nguyên cấu trúc mỏng nhẹ 128->128 của V4)
+        # ✓ Sửa Bottleneck để dùng SquareDW có Activation
         self.bottleneck = nn.Sequential(
-            SquareDW(128, kernel_size=3),
-            SquareDW(128, kernel_size=3),
-            SquareDW(128, kernel_size=3),
+            SquareDW(128, kernel_size=3, act_type='hswish'),
+            SquareDW(128, kernel_size=3, act_type='hswish'),
+            SquareDW(128, kernel_size=3, act_type='hswish'),
             nn.Conv2d(128, 128, kernel_size=1, bias=False),
             nn.BatchNorm2d(128),
             get_activation('hswish')
         )
         
-        # ✓ D4, D3 (Semantic Decoder): Trộn ngữ nghĩa
         self.d4 = SemanticDecoderBlock(in_c=128, skip_c=64, out_c=96, act_type='hswish') 
         self.d3 = SemanticDecoderBlock(in_c=96,  skip_c=48, out_c=64, act_type='hswish')  
         
-        # ✓ D2, D1 (Guided Detail Refinement): Thợ xây siêu rẻ (mid_c=16 và mid_c=12)
         self.d2 = GuidedDetailRefinementBlock(in_c=64, skip_c=16, out_c=32, mid_c=16, act_type='relu6')   
         self.d1 = GuidedDetailRefinementBlock(in_c=32, skip_c=8,  out_c=16, mid_c=12, act_type='relu6')   
         
-        # Head Smoothing
         self.head_smooth = nn.Sequential(
-            SquareDW(16, kernel_size=3),
+            SquareDW(16, kernel_size=3, act_type='relu6'),
             get_activation('relu6')
         )
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
@@ -267,4 +256,4 @@ class PicoUNet_v13_Edge(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v13_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v14_Edge(num_classes=num_classes, input_size=input_size)
