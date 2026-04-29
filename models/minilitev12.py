@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
+# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11
 # ==============================================================================
 class CustomHardsigmoid(nn.Module):
     def __init__(self):
@@ -27,10 +27,11 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4 (SPPM-LITE EDITION)
-# - ✓ LÕI V4: Giữ nguyên Linear Encoder, Additive Decoder để bắt texture mặt nước.
-# - ✓ BOTTLE-NECK MỚI: Thay thế Serial DW bằng Simple Pyramid Pooling Module (SPPM) 
-#     để lấy góc nhìn toàn cục (Global Context) mà không làm tăng vọt MACs.
+# PICO-UNET V20: THE THIN-STEM SPPM EDITION
+# - ✓ EXTREME CHANNEL BOTTLENECK: Tầng nông siêu mỏng (16 -> 24 -> 64) để chém MACs.
+# - ✓ LINEAR FACTORIZED: SquareDW không chứa Activation, tối ưu phần cứng.
+# - ✓ LEARNABLE DOWNSAMPLE: Hạ mẫu bằng Stride=2, không dùng MaxPool.
+# - ✓ BOTTLE-NECK: SPPM-Lite lấy góc nhìn không gian Kim tự tháp.
 # ==============================================================================
 
 # ==============================================================================
@@ -69,6 +70,7 @@ class SpatialAttention_MCU(nn.Module):
 # 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE
 # ==============================================================================
 class SquareDW(nn.Module):
+    # ✓ TRỞ VỀ CHÂN LÝ: Không dùng Activation để tạo Linear Manifold
     def __init__(self, dim, kernel_size=3):
         super().__init__()
         padding = kernel_size // 2
@@ -91,7 +93,7 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER (CHIA LÀM 2 LOẠI: DUAL-SCALE VÀ MULTI-SCALE)
+# 3. ENCODER BLOCKS (DUAL-SCALE/MULTI-SCALE + STRIDE 2)
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
@@ -137,35 +139,34 @@ class EncoderBlock(nn.Module):
         else:
             self.pfcu_dg = DualScale_PFCU_DG(in_c, act_type)
             
-        self.down_pool = nn.MaxPool2d((2, 2))
-        
         self.same_channels = (in_c == out_c)
         if not self.same_channels:
             self.pw = nn.Sequential(
                 nn.Conv2d(in_c, out_c - in_c, kernel_size=1, bias=False),
                 nn.BatchNorm2d(out_c - in_c)
             )
-            self.down_pw = nn.MaxPool2d((2, 2))
             
-        self.act = get_activation(act_type)
+        # ✓ LEARNABLE DOWNSAMPLE: Stride=2 
+        self.down_dw = nn.Sequential(
+            nn.Conv2d(out_c, out_c, kernel_size=3, stride=2, padding=1, groups=out_c, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
+        self.act_out = get_activation(act_type)
 
     def forward(self, x):
         feat = self.pfcu_dg(x)
         
         if self.same_channels:
-            return self.act(self.down_pool(feat)), feat
+            skip = feat
         else:
             feat_pw = self.pw(feat)
             skip = torch.cat([feat, feat_pw], dim=1)
             
-            pool_feat = self.down_pool(feat)
-            pool_pw   = self.down_pw(feat_pw)
-            
-            out = self.act(torch.cat([pool_feat, pool_pw], dim=1))
-            return out, skip
+        out = self.act_out(self.down_dw(skip))
+        return out, skip
 
 # ==============================================================================
-# 4. DECODER & BOTTLE-NECK (SPPM-LITE)
+# 4. DECODER & BOTTLE-NECK (SPPM)
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
@@ -201,7 +202,6 @@ class AdditiveDecoderBlock(nn.Module):
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class PoolBranch(nn.Module):
-    """ Nhánh Pooling cho Kim tự tháp SPPM """
     def __init__(self, in_c, out_c, pool_size, act_type):
         super().__init__()
         if pool_size == 1:
@@ -216,30 +216,24 @@ class PoolBranch(nn.Module):
         )
 
     def forward(self, x, target_size):
-        # Pool -> Conv 1x1 -> Upsample bằng kích thước feature map gốc
         pooled = self.conv(self.pool(x))
         return F.interpolate(pooled, size=target_size, mode='nearest')
 
 class SPPMBottleneck(nn.Module):
-    """ Tích hợp Simple Pyramid Pooling Module (SPPM) thay cho Serial DW """
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        # Bóp số kênh của mỗi nhánh để tiết kiệm MACs
         branch_c = max(32, dim // 4)
         
-        # 3 Nhánh không gian: 1x1 (Global), 2x2, 4x4
         self.pool1 = PoolBranch(dim, branch_c, pool_size=1, act_type=act_type)
         self.pool2 = PoolBranch(dim, branch_c, pool_size=2, act_type=act_type)
         self.pool4 = PoolBranch(dim, branch_c, pool_size=4, act_type=act_type)
         
-        # Fuse 3 luồng lại và khôi phục số kênh về dim
         self.fuse = nn.Sequential(
             nn.Conv2d(branch_c, dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(dim),
             get_activation(act_type)
         )
         
-        # Giữ lại cụm Attention của V4 gốc
         self.channel_attn = ECABlock(dim, act_type)
         self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
@@ -250,42 +244,40 @@ class SPPMBottleneck(nn.Module):
         p2 = self.pool2(x, target_size)
         p4 = self.pool4(x, target_size)
         
-        # Additive Fusion: Cộng trực tiếp các nhánh pooling
         ppm_out = self.fuse(p1 + p2 + p4)
-        
-        # Residual cộng với feature map gốc
         out = x + ppm_out
         
-        # Khẳng định lại tính năng V4 (Bộ Não & La Bàn)
         out = self.channel_attn(out)
         out = self.spatial_attn(out)
         
         return out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SPPM-LITE)
+# 5. MẠNG CHÍNH PICO-UNET V20
 # ==============================================================================
-class PicoUNet_v4_Edge(nn.Module):
+class PicoUNet_v20_ThinStem(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
         if input_size % 16 != 0:
             raise ValueError(f"Input_size phải chia hết cho 16.")
 
-        self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        # ✓ CỬA NGÕ SIÊU MỎNG: Chỉ bắt đầu bằng 16 kênh
+        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
         
-        self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
-        self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
-        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
-        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
+        # ✓ THÁP KÊNH BẤT ĐỐI XỨNG: Mỏng ở tầng nông, hầm hố ở tầng sâu
+        self.e1 = EncoderBlock(16, 24,  is_deep=False, act_type='relu6')   
+        self.e2 = EncoderBlock(24, 64,  is_deep=False, act_type='relu6')   
+        self.e3 = EncoderBlock(64, 128, is_deep=True,  act_type='hswish') 
+        self.e4 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
         
-        # ✓ Thay thế Bottleneck bằng SPPM-Lite
         self.bottleneck = SPPMBottleneck(192, act_type='hswish')
         
+        # ✓ ĐẢO NGƯỢC THÁP KÊNH Ở DECODER
         self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=128, out_c=64,  act_type='hswish')  
+        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=64,  out_c=24,  act_type='relu6')   
+        self.d1 = AdditiveDecoderBlock(in_c=24,  skip_c=24,  out_c=16,  act_type='relu6')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -307,4 +299,4 @@ class PicoUNet_v4_Edge(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v4_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v20_ThinStem(num_classes=num_classes, input_size=input_size)
