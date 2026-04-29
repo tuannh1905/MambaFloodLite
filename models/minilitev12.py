@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
+# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11
 # ==============================================================================
 class CustomHardsigmoid(nn.Module):
     def __init__(self):
@@ -27,10 +27,10 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V16: THE MASTER-CRAFTED EDITION
-# - ✓ FIXED GATE BIAS: Thêm bias=True cho Gate để học được Default Prior (Đóng/Mở).
-# - ✓ FIXED SHORTCUT: Bổ sung skip_shortcut cho GDR Block, cứu rỗi Detail bị đứt.
-# - ✓ FIXED DOUBLE ACT: Xóa bỏ Activation thừa ở head_smooth.
+# PICO-UNET V17: THE BRUTE-FORCE SIMPLICITY
+# - ✓ SIMPLE DECODER: Xóa bỏ Guided/Gate Block, quy về 1 Decoder siêu đơn giản.
+# - ✓ WIDER TRUNK: Bơm kênh mạch chính lên 32->64->128->192 (Đổi độ phức tạp lấy Kênh).
+# - ✓ RICHER SKIPS: s1(16), s2(32), s3(64), s4(96).
 # ==============================================================================
 
 # ==============================================================================
@@ -48,13 +48,11 @@ class SquareDW(nn.Module):
         return self.act(self.bn(self.dw(x)))
 
 class NearestUpsample(nn.Module):
-    def __init__(self, channels=None):
+    def __init__(self):
         super().__init__()
 
-    def forward(self, x, scale_factor=2, size=None):
-        if size is not None:
-            return F.interpolate(x, size=size, mode='nearest')
-        return F.interpolate(x, scale_factor=scale_factor, mode='nearest')
+    def forward(self, x):
+        return F.interpolate(x, scale_factor=2, mode='nearest')
 
 # ==============================================================================
 # 2. ENCODER BLOCKS
@@ -137,7 +135,7 @@ class CompressedEncoderBlock(nn.Module):
         return out, skip_compressed
 
 # ==============================================================================
-# 3. NEW BOTTLENECK (LRASPP-LIKE)
+# 3. LRASPP BOTTLENECK
 # ==============================================================================
 class BottleneckWithGAP(nn.Module):
     def __init__(self, dim=128, act_type='hswish'):
@@ -164,12 +162,15 @@ class BottleneckWithGAP(nn.Module):
         return self.fuse(local + global_ctx)
 
 # ==============================================================================
-# 4. DECODER BLOCKS
+# 4. SIMPLE DECODER BLOCK (SỰ ĐƠN GIẢN LÊN NGÔI)
 # ==============================================================================
-class SemanticDecoderBlock(nn.Module):
-    def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
+class SimpleDecoderBlock(nn.Module):
+    """ ✓ Tối giản hóa: Up -> Chiếu -> Cộng -> Lọc 3x3 -> Xong """
+    def __init__(self, in_c, skip_c, out_c, act_type='relu6'):
         super().__init__()
         self.up = NearestUpsample()
+        
+        # Ép 2 luồng về chung kích thước out_c (Out-space fusion siêu nhẹ)
         self.up_proj = nn.Sequential(
             nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
@@ -179,104 +180,48 @@ class SemanticDecoderBlock(nn.Module):
             nn.BatchNorm2d(out_c)
         )
         
-        gc = max(out_c // 2, 8) 
+        # Refine bằng DW3x3 nối với 1x1 (Không gate, không mở rộng kênh)
         self.refine = nn.Sequential(
-            nn.Conv2d(out_c, gc, kernel_size=1, bias=False), 
-            nn.BatchNorm2d(gc), 
-            get_activation(act_type),
-            
-            SquareDW(gc, kernel_size=5, act_type=act_type), 
-            nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
+            SquareDW(out_c, kernel_size=3, act_type=act_type), 
+            nn.Conv2d(out_c, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
         )
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
         fused = self.up_proj(self.up(x)) + self.skip_proj(skip)
+        # Cộng thêm residual để dòng gradient mượt hơn
         return self.act(self.refine(fused) + fused)
 
-class GuidedDetailRefinementBlock(nn.Module):
-    def __init__(self, in_c, skip_c, out_c, mid_c=12, act_type='relu6'):
-        super().__init__()
-        self.up = NearestUpsample()
-        
-        self.low_sem = nn.Sequential(
-            nn.Conv2d(in_c, mid_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(mid_c)
-        )
-        self.skip_det = nn.Sequential(
-            nn.Conv2d(skip_c, mid_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(mid_c)
-        )
-        
-        # ✓ FIX 3: Thêm bias=True cho Gate để nới lỏng Default Prior
-        self.gate = nn.Sequential(
-            nn.Conv2d(mid_c, mid_c, kernel_size=1, bias=True),
-            CustomHardsigmoid()
-        )
-        
-        self.dw = SquareDW(mid_c, kernel_size=3, act_type=act_type)
-        
-        self.to_out = nn.Sequential(
-            nn.Conv2d(mid_c, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c)
-        )
-        
-        # Shortcut từ nhánh lên (Semantic)
-        self.shortcut = nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c)
-        )
-        
-        # ✓ FIX 1: Shortcut cứu rỗi từ nhánh ngang (Detail)
-        self.skip_shortcut = nn.Sequential(
-            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c)
-        )
-        
-        self.act = get_activation(act_type)
-
-    def forward(self, x, skip):
-        up_x = self.up(x)
-        sem = self.low_sem(up_x)
-        det = self.skip_det(skip)
-        
-        # Gating: Modulation chi tiết
-        fused = sem + det * self.gate(sem)
-        fused = self.dw(fused)
-        out = self.to_out(fused)
-        
-        # ✓ Cộng cả 3: Tín hiệu chính + Shortcut Lên + Shortcut Ngang (Detail Base)
-        return self.act(out + self.shortcut(up_x) + self.skip_shortcut(skip))
-
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V16
+# 5. MẠNG CHÍNH PICO-UNET V17
 # ==============================================================================
-class PicoUNet_v16_Edge(nn.Module):
+class PicoUNet_v17_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
         if input_size % 16 != 0:
             raise ValueError(f"Input_size phải chia hết cho 16.")
 
-        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
+        self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        self.e1 = CompressedEncoderBlock(16, 32, skip_c=16,  is_deep=False, act_type='relu6')   
-        self.e2 = CompressedEncoderBlock(32, 64, skip_c=24, is_deep=False, act_type='relu6')   
-        self.e3 = CompressedEncoderBlock(64, 128, skip_c=48, is_deep=True, act_type='hswish')  
-        self.e4 = CompressedEncoderBlock(128, 128, skip_c=64, is_deep=True, act_type='hswish') 
+        # ✓ TĂNG KÊNH TRUNK & SKIPS
+        self.e1 = CompressedEncoderBlock(32, 64,  skip_c=16, is_deep=False, act_type='relu6')   
+        self.e2 = CompressedEncoderBlock(64, 128, skip_c=32, is_deep=False, act_type='relu6')   
+        self.e3 = CompressedEncoderBlock(128, 192, skip_c=64, is_deep=True, act_type='hswish')  
+        self.e4 = CompressedEncoderBlock(192, 192, skip_c=96, is_deep=True, act_type='hswish') 
         
-        self.bottleneck = BottleneckWithGAP(128, act_type='hswish')
+        # Bottleneck ở max 192 kênh
+        self.bottleneck = BottleneckWithGAP(192, act_type='hswish')
         
-        self.d4 = SemanticDecoderBlock(in_c=128, skip_c=64, out_c=96, act_type='hswish') 
-        self.d3 = SemanticDecoderBlock(in_c=96,  skip_c=48, out_c=64, act_type='hswish')  
+        # ✓ DECODER ĐỒNG NHẤT, GỌN NHẸ
+        self.d4 = SimpleDecoderBlock(in_c=192, skip_c=96, out_c=128, act_type='hswish') 
+        self.d3 = SimpleDecoderBlock(in_c=128, skip_c=64, out_c=64,  act_type='hswish')  
+        self.d2 = SimpleDecoderBlock(in_c=64,  skip_c=32, out_c=32,  act_type='relu6')   
+        self.d1 = SimpleDecoderBlock(in_c=32,  skip_c=16, out_c=24,  act_type='relu6')   
         
-        self.d2 = GuidedDetailRefinementBlock(in_c=64, skip_c=24, out_c=32, mid_c=20, act_type='relu6')   
-        self.d1 = GuidedDetailRefinementBlock(in_c=32, skip_c=16,  out_c=16, mid_c=16, act_type='relu6')   
-        
-        # ✓ FIX 2: Loại bỏ hàm Activation thừa, chỉ dùng SquareDW
-        self.head_smooth = SquareDW(16, kernel_size=3, act_type='relu6')
-        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
+        self.head_smooth = SquareDW(24, kernel_size=3, act_type='relu6')
+        self.conv_out = nn.Conv2d(24, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
@@ -297,4 +242,4 @@ class PicoUNet_v16_Edge(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v16_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v17_Edge(num_classes=num_classes, input_size=input_size)
