@@ -271,5 +271,5 @@ class PicoUNet_v4_Ablation_ContextBneck(nn.Module):
         
         return self.conv_out(x)
 
-def build_ablation_context_model(num_classes=1, input_size=128):
+def build_model(num_classes=1, input_size=128):
     return PicoUNet_v4_Ablation_ContextBneck(num_classes=num_classes, input_size=input_size)

@@ -244,6 +244,6 @@ class PicoUNet_v4_Ablation_Seq(nn.Module):
         
         return self.conv_out(x)
 
-def build_ablation_seq_model(num_classes=1, input_size=128):
+def build_model(num_classes=1, input_size=128):
     return PicoUNet_v4_Ablation_Seq(num_classes=num_classes, input_size=input_size)
 #no multi-scale fusion, deep sequential design
