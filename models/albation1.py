@@ -3,252 +3,244 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# LƯU Ý TƯƠNG THÍCH ONNX / TORCH.FX / MCU:
-# - BOTTLE-NECK TĨNH: Không dùng AdaptiveAvgPool2d, tính trước kernel trong __init__.
-# - MULTI-SCALE SQUARE DW: Dùng (3x3, 5x5, 7x7) thay chập chéo để tối ưu NPU.
-# - NEAREST UPSAMPLE: Loại bỏ Bilinear.
-# - ✓ ĐÃ CẬP NHẬT: Thay Sigmoid bằng Hardsigmoid để NPU dịch bit (siêu nhanh).
-# - ✓ ĐÃ CẬP NHẬT: Thay AdaptiveAvgPool2d(1) bằng torch.mean() chống lỗi biên dịch.
-# - ✓ ĐÃ CẬP NHẬT: Xóa bỏ abs() trong TinyUAFM_v2, thay bằng torch.max() (CBAM style).
-# - ✓ ĐÃ CẬP NHẬT: Dùng biến 'B' explicit trong ECABlock để chốt Static Tensor Arena.
-# - ✓ ĐÃ CẬP NHẬT: Dùng permute() thay vì reshape() trong ECABlock.
-# - ✓ ĐÃ CẬP NHẬT: Dùng LightDecoderBlock (bản kết hợp SimpleConcatFusion).
+# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
 # ==============================================================================
-
-# ==============================================================================
-# ABLATION STUDY 1: BỎ MULTI-SCALE (CHỈ DÙNG 3x3)
-# - CHỈNH SỬA: Xóa bỏ nhánh 5x5, 7x7 và pw_fuse ở khối Encoder.
-# - GIỮ LẠI: SimpleConcatFusion (Decoder), SPP Bottleneck tĩnh, ECA, Detail Guidance.
-# ==============================================================================
-
-# ==============================================================================
-# 1. ATTENTION MODULES (ECA)
-# ==============================================================================
-class ECABlock(nn.Module):
-    def __init__(self, channels, k_size=3):
+class CustomHardsigmoid(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.conv = nn.Conv2d(1, 1, kernel_size=(1, k_size), padding=(0, k_size//2), bias=False)
-        self.hardsigmoid = nn.Hardsigmoid() 
+        self.relu6 = nn.ReLU6(inplace=True)
 
     def forward(self, x):
-        B, C, _, _ = x.shape 
-        y = torch.mean(x, dim=[2, 3], keepdim=True)              
-        y = y.permute(0, 2, 3, 1) # An toàn cho ONNX
-        y = self.hardsigmoid(self.conv(y))                     
-        y = y.permute(0, 3, 1, 2) 
+        return self.relu6(x + 3.0) / 6.0
+
+class CustomHardswish(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hardsigmoid = CustomHardsigmoid()
+
+    def forward(self, x):
+        return x * self.hardsigmoid(x)
+
+def get_activation(act_type):
+    if act_type == 'hswish':
+        return CustomHardswish()
+    return nn.ReLU6(inplace=True)
+
+# ==============================================================================
+# 1. ATTENTION MODULES
+# ==============================================================================
+class ECABlock(nn.Module):
+    def __init__(self, channels, act_type='hswish'):
+        super().__init__()
+        mid_channels = max(8, channels // 4)
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels, mid_channels, kernel_size=1, bias=False),
+            get_activation(act_type),
+            nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
+        )
+        self.hardsigmoid = CustomHardsigmoid()
+
+    def forward(self, x):
+        y = F.adaptive_avg_pool2d(x, 1) 
+        y = self.hardsigmoid(self.conv(y))
+        return x * y
+
+class SpatialAttention_MCU(nn.Module):
+    def __init__(self, kernel_size=3):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
+        self.hardsigmoid = CustomHardsigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        y = torch.cat([avg_out, max_out], dim=1) 
+        y = self.hardsigmoid(self.conv(y))
         return x * y
 
 # ==============================================================================
-# 2. NEAREST UPSAMPLE & SIMPLE FUSION (BASELINE MỚI)
-# ==============================================================================
-class NearestUpsample(nn.Module):
-    def __init__(self, channels, scale_factor=2):
-        super().__init__()
-        self.up     = nn.Upsample(scale_factor=scale_factor, mode='nearest')
-        self.refine = nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False)
-        self.bn     = nn.BatchNorm2d(channels)
-
-    def forward(self, x):
-        return self.bn(self.refine(self.up(x)))
-
-class SimpleConcatFusion(nn.Module):
-    def __init__(self, in_c, skip_c, out_c):
-        super().__init__()
-        self.fuse_conv = nn.Sequential(
-            nn.Conv2d(in_c + skip_c, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c),
-            nn.ReLU6(inplace=True)
-        )
-
-    def forward(self, x_up, x_skip):
-        fused = torch.cat([x_up, x_skip], dim=1)
-        return self.fuse_conv(fused)
-
-# ==============================================================================
-# 3. PFCU-DG NGUYÊN BẢN (KHÔNG ĐA TỶ LỆ)
+# 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE
 # ==============================================================================
 class SquareDW(nn.Module):
-    def __init__(self, dim, kernel_size):
+    def __init__(self, dim, kernel_size=3):
         super().__init__()
         padding = kernel_size // 2
         self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim) 
+        self.bn = nn.BatchNorm2d(dim)
 
     def forward(self, x):
-        return self.bn(self.dw(x)) 
+        return self.bn(self.dw(x))
 
-class DetailGuidance(nn.Module):
-    def __init__(self, dim):
+class NearestUpsample(nn.Module):
+    def __init__(self, channels):
         super().__init__()
-        self.dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim) 
-        
-    def forward(self, x):
-        return x + self.bn(self.dw(x))
-
-class NoMultiScale_PFCU_DG(nn.Module):
-    """
-    ✓ ABLATION ENCODER: Bỏ đa tỷ lệ (5x5, 7x7), chỉ giữ lại 3x3.
-    Đầu ra đi thẳng vào cộng Detail Guidance, không cần pw_fuse.
-    """
-    def __init__(self, dim):
-        super().__init__()
-        self.branch_3 = SquareDW(dim, kernel_size=3)
-        
-        self.dg_shortcut = DetailGuidance(dim)
-        self.eca = ECABlock(dim) 
-        self.act = nn.ReLU6(inplace=True)
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.refine = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels)
+        )
 
     def forward(self, x):
-        b3 = self.branch_3(x)
-        guided_details = self.dg_shortcut(x)
-        return self.eca(self.act(b3 + guided_details))
+        return self.refine(self.up(x))
 
 # ==============================================================================
-# 4. ENCODER, DECODER & BOTTLE-NECK TĨNH
+# 3. KHỐI ENCODER SONG SONG (PARALLEL MULTI-SCALE)
 # ==============================================================================
-class EncoderBlock_NoMultiScale(nn.Module):
-    def __init__(self, in_c, out_c):
+class ParallelMultiScale_PFCU_DG(nn.Module):
+    def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        self.same_channels = (in_c == out_c)
-        conv_out = out_c - in_c if not self.same_channels else out_c
+        self.dw_3x3 = SquareDW(dim, kernel_size=3)
+        self.dw_5x5 = SquareDW(dim, kernel_size=5) 
+        self.dw_7x7 = SquareDW(dim, kernel_size=7) 
+        
+        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn_fuse = nn.BatchNorm2d(dim)
+        self.act = get_activation(act_type)
 
-        # ✓ ĐÃ THAY THẾ: Dùng khối Ablation không có đa tỷ lệ
-        self.pfcu_dg   = NoMultiScale_PFCU_DG(in_c)
+    def forward(self, x):
+        # Tất cả các nhánh hoạt động độc lập (Parallel) và cùng nhận đầu vào x
+        b3 = self.dw_3x3(x)        
+        b5 = self.dw_5x5(x)        
+        b7 = self.dw_7x7(x)        
+        
+        fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
+        return self.act(fused + x)
+
+class EncoderBlock(nn.Module):
+    def __init__(self, in_c, out_c, act_type='relu6'):
+        super().__init__()
+        # Đồng nhất toàn bộ mạng dùng khối Parallel, bỏ cờ is_deep
+        self.pfcu_dg = ParallelMultiScale_PFCU_DG(in_c, act_type)
+            
         self.down_pool = nn.MaxPool2d((2, 2))
-
+        
+        self.same_channels = (in_c == out_c)
         if not self.same_channels:
-            self.pw      = nn.Conv2d(in_c, conv_out, kernel_size=1, bias=False)
-            self.bn_pw   = nn.BatchNorm2d(conv_out) 
+            self.pw = nn.Sequential(
+                nn.Conv2d(in_c, out_c - in_c, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_c - in_c)
+            )
             self.down_pw = nn.MaxPool2d((2, 2))
-
-        self.act = nn.ReLU6(inplace=True)
+            
+        self.act = get_activation(act_type)
 
     def forward(self, x):
-        feat = self.pfcu_dg(x) 
-
+        feat = self.pfcu_dg(x)
+        
         if self.same_channels:
             return self.act(self.down_pool(feat)), feat
         else:
-            feat_pw = self.bn_pw(self.pw(feat)) 
-            skip = torch.cat([feat, feat_pw], dim=1) 
+            feat_pw = self.pw(feat)
+            skip = torch.cat([feat, feat_pw], dim=1)
             
             pool_feat = self.down_pool(feat)
             pool_pw   = self.down_pw(feat_pw)
-            x = self.act(torch.cat([pool_feat, pool_pw], dim=1))
-            return x, skip
+            
+            out = self.act(torch.cat([pool_feat, pool_pw], dim=1))
+            return out, skip
 
-class LightDecoderBlock_NoUAFM(nn.Module):
-    def __init__(self, in_c, out_c):
+# ==============================================================================
+# 4. BOTTLE-NECK SONG SONG & DECODER
+# ==============================================================================
+class ParallelMultiScaleBottleneck(nn.Module):
+    def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        gc = max(out_c // 4, 4)
-
-        self.up   = NearestUpsample(in_c, scale_factor=2)
-        self.fusion = SimpleConcatFusion(in_c=in_c, skip_c=in_c, out_c=out_c)
-
-        self.pw_down = nn.Conv2d(out_c, gc, kernel_size=1, bias=False)
-        self.bn_down = nn.BatchNorm2d(gc)
+        self.dw_3x3 = SquareDW(dim, kernel_size=3)
+        self.dw_5x5 = SquareDW(dim, kernel_size=5) 
+        self.dw_7x7 = SquareDW(dim, kernel_size=7) 
         
-        self.refine_spatial = SquareDW(gc, kernel_size=5)
-        self.eca = ECABlock(gc) 
-        
-        self.pw_up   = nn.Conv2d(gc, out_c, kernel_size=1, bias=False)
-        self.bn_up  = nn.BatchNorm2d(out_c)
-        
-        self.act = nn.ReLU6(inplace=True)
-
-    def forward(self, x, skip):
-        x = self.up(x)
-        fused = self.fusion(x, skip)
-        
-        feat = self.act(self.bn_down(self.pw_down(fused)))
-        feat = self.refine_spatial(feat)
-        feat = self.eca(feat)
-        
-        out = self.bn_up(self.pw_up(feat))
-        return self.act(out + fused)
-
-class BottleNeckBlock_Static(nn.Module):
-    def __init__(self, dim, max_dim=128, input_size=256):
-        super().__init__()
-        hid = min(dim // 4, max_dim // 4)
-
-        feat_size = input_size // 16  
-        k1, k2, k3 = feat_size, feat_size // 2, feat_size // 4
-
-        if input_size == 128:
-            assert k3 >= 2, "input_size quá nhỏ"
-        elif input_size == 256:
-            pass
-        else:
-            raise ValueError(f"input_size={input_size} chưa được hỗ trợ.")
-
-        self._sf1, self._sf2, self._sf3 = int(k1), int(k2), int(k3)
-
-        self.pool1 = nn.Sequential(nn.AvgPool2d(k1, k1), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.ReLU6(True))
-        self.pool2 = nn.Sequential(nn.AvgPool2d(k2, k2), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.ReLU6(True))
-        self.pool3 = nn.Sequential(nn.AvgPool2d(k3, k3), nn.Conv2d(dim, hid, 1, bias=False), nn.BatchNorm2d(hid), nn.ReLU6(True))
-
-        self.spp_fuse = nn.Sequential(
-            nn.Conv2d(dim + hid * 3, dim, 1, bias=False),
-            nn.BatchNorm2d(dim), nn.ReLU6(inplace=True)
-        )
-        
-        self.square_refine = SquareDW(dim, kernel_size=5)
-        self.se = ECABlock(dim)
+        self.channel_attn = ECABlock(dim, act_type)
+        self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
     def forward(self, x):
-        x1 = F.interpolate(self.pool1(x), scale_factor=self._sf1, mode='nearest')
-        x2 = F.interpolate(self.pool2(x), scale_factor=self._sf2, mode='nearest')
-        x3 = F.interpolate(self.pool3(x), scale_factor=self._sf3, mode='nearest')
+        # TÍNH TOÁN SONG SONG (Parallel)
+        d1 = self.dw_3x3(x)        
+        d2 = self.dw_5x5(x)        
+        d3 = self.dw_7x7(x)        
+        
+        fused = d1 + d2 + d3
+        
+        out = self.channel_attn(fused)
+        out = self.spatial_attn(out)
+        
+        return x + out
 
-        spp = self.spp_fuse(torch.cat([x, x1, x2, x3], dim=1))
-        out = self.square_refine(spp)
-        return self.se(out) + x
+class AdditiveDecoderBlock(nn.Module):
+    def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
+        super().__init__()
+        self.up = NearestUpsample(in_c)
+        
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(skip_c)
+        )
+        
+        gc = max(out_c // 4, 4)
+        self.refine = nn.Sequential(
+            nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
+            nn.BatchNorm2d(gc), 
+            get_activation(act_type),
+            
+            SquareDW(gc, kernel_size=5), 
+            ECABlock(gc, act_type), 
+            
+            nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
+            nn.BatchNorm2d(out_c)
+        )
+        
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
+        self.act = get_activation(act_type)
+
+    def forward(self, x, skip):
+        fused = self.proj(self.up(x)) + skip
+        return self.act(self.refine(fused) + self.shortcut(fused))
 
 # ==============================================================================
-# 5. MẠNG CHÍNH: ABLATION KHÔNG ĐA TỶ LỆ
+# 5. MẠNG CHÍNH (ABLATION CASE: ĐỒNG BỘ TOÀN BỘ PARALLEL)
 # ==============================================================================
-class PicoUNet_Ablation_NoMultiScale(nn.Module):
-    def __init__(self, num_classes=1, input_size=256):
+class PicoUNet_v4_Ablation_Parallel(nn.Module):
+    def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
         if input_size % 16 != 0:
-            raise ValueError(f"PicoUNet yêu cầu input_size chia hết cho 16.")
+            raise ValueError(f"Input_size phải chia hết cho 16.")
 
-        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-
-        # ✓ ĐÃ THAY THẾ: Dùng bản Encoder không có Đa tỷ lệ
-        self.e1 = EncoderBlock_NoMultiScale(16,  32)
-        self.e2 = EncoderBlock_NoMultiScale(32,  64)
-        self.e3 = EncoderBlock_NoMultiScale(64,  128)
-        self.e4 = EncoderBlock_NoMultiScale(128, 256)
-
-        self.b4 = BottleNeckBlock_Static(256, max_dim=128, input_size=input_size)
-
-        self.d4 = LightDecoderBlock_NoUAFM(256, 128)
-        self.d3 = LightDecoderBlock_NoUAFM(128, 64)
-        self.d2 = LightDecoderBlock_NoUAFM(64,  32)
-        self.d1 = LightDecoderBlock_NoUAFM(32,  16)
-
+        self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        
+        # Cả 4 Encoder block và Bottleneck đều xài thiết kế Parallel
+        self.e1 = EncoderBlock(32, 64, act_type='relu6')   
+        self.e2 = EncoderBlock(64, 128, act_type='relu6')   
+        self.e3 = EncoderBlock(128, 192, act_type='hswish') 
+        self.e4 = EncoderBlock(192, 192, act_type='hswish') 
+        
+        self.bottleneck = ParallelMultiScaleBottleneck(192, act_type='hswish')
+        
+        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
+        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
+        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
         
-        x, skip1 = self.e1(x)
-        x, skip2 = self.e2(x)
-        x, skip3 = self.e3(x)
-        x, skip4 = self.e4(x)
+        x, s1 = self.e1(x)
+        x, s2 = self.e2(x)
+        x, s3 = self.e3(x)
+        x, s4 = self.e4(x)
         
-        x = self.b4(x)
+        x = self.bottleneck(x)
         
-        x = self.d4(x, skip4)
-        x = self.d3(x, skip3)
-        x = self.d2(x, skip2)
-        x = self.d1(x, skip1)
+        x = self.d4(x, s4)
+        x = self.d3(x, s3)
+        x = self.d2(x, s2)
+        x = self.d1(x, s1)
         
         return self.conv_out(x)
 
-def build_model(num_classes=1, input_size=256):
-    return PicoUNet_Ablation_NoMultiScale(num_classes=num_classes, input_size=input_size)
+def build_ablation_model(num_classes=1, input_size=128):
+    return PicoUNet_v4_Ablation_Parallel(num_classes=num_classes, input_size=input_size)
