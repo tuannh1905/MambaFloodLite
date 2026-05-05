@@ -28,9 +28,9 @@ def get_activation(act_type):
 
 # ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE 4: NO SKIP-CONNECTIONS
-# - Khôi phục Encoder, Bottleneck và Attention về chuẩn Baseline.
-# - Loại bỏ hoàn toàn skip-connection nối từ Encoder sang Decoder.
+# CASE 2: NO ECA Ở DECODER
+# - Khôi phục Bottleneck về nguyên bản (có Attention).
+# - Lược bỏ hoàn toàn ECABlock trong quá trình Refine của khối Decoder.
 # ==============================================================================
 
 # ==============================================================================
@@ -91,7 +91,7 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER (KHÔI PHỤC DUAL-SCALE VÀ MULTI-SCALE)
+# 3. KHỐI ENCODER (CHIA LÀM 2 LOẠI: DUAL-SCALE VÀ MULTI-SCALE)
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
@@ -165,7 +165,7 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK [ĐÃ SỬA ĐỔI CHO CASE 4]
+# 4. DECODER (ADDITIVE) & BOTTLE-NECK [ĐÃ SỬA ĐỔI CHO CASE 2]
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
@@ -178,13 +178,14 @@ class AdditiveDecoderBlock(nn.Module):
         )
         
         gc = max(out_c // 4, 4)
+        
+        # [CASE 2: ĐÃ XÓA ECABlock(gc, act_type) KHỎI self.refine]
         self.refine = nn.Sequential(
             nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
             SquareDW(gc, kernel_size=5), 
-            ECABlock(gc, act_type), 
             
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
@@ -196,10 +197,8 @@ class AdditiveDecoderBlock(nn.Module):
         )
         self.act = get_activation(act_type)
 
-    # [CASE 4: Xóa tham số skip ở đầu vào]
-    def forward(self, x):
-        # [CASE 4: Bỏ phép cộng '+ skip']
-        fused = self.proj(self.up(x)) 
+    def forward(self, x, skip):
+        fused = self.proj(self.up(x)) + skip
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
@@ -209,6 +208,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         self.dw_5x5 = SquareDW(dim) 
         self.dw_7x7 = SquareDW(dim) 
         
+        # KHÔI PHỤC LẠI ATTENTION MODULE CHO CASE 2
         self.channel_attn = ECABlock(dim, act_type)
         self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
@@ -225,7 +225,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - CASE 4 ABLATION
+# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - CASE 2 ABLATION
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -253,19 +253,17 @@ class PicoUNet_v4_Edge(nn.Module):
     def forward(self, x):
         x = self.conv_in(x)
         
-        # [CASE 4: Nhận output từ Encoder nhưng vứt bỏ biến skip (_)]
-        x, _ = self.e1(x)
-        x, _ = self.e2(x)
-        x, _ = self.e3(x)
-        x, _ = self.e4(x)
+        x, s1 = self.e1(x)
+        x, s2 = self.e2(x)
+        x, s3 = self.e3(x)
+        x, s4 = self.e4(x)
         
         x = self.bottleneck(x)
         
-        # [CASE 4: Decoder không nhận biến skip nữa]
-        x = self.d4(x)
-        x = self.d3(x)
-        x = self.d2(x)
-        x = self.d1(x)
+        x = self.d4(x, s4)
+        x = self.d3(x, s3)
+        x = self.d2(x, s2)
+        x = self.d1(x, s1)
         
         return self.conv_out(x)
 

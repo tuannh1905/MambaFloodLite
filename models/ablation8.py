@@ -27,7 +27,14 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# 1. ATTENTION MODULES
+# PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
+# CASE 8: POOLING STRATEGY (ECA ABLATION)
+# - Khôi phục toàn bộ kiến trúc về chuẩn Baseline.
+# - Loại bỏ "VACCINE 2", đổi F.adaptive_avg_pool2d về torch.mean trong khối ECA.
+# ==============================================================================
+
+# ==============================================================================
+# 1. ATTENTION MODULES [ĐÃ SỬA ĐỔI CHO CASE 8]
 # ==============================================================================
 class ECABlock(nn.Module):
     def __init__(self, channels, act_type='hswish'):
@@ -41,7 +48,8 @@ class ECABlock(nn.Module):
         self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
-        y = F.adaptive_avg_pool2d(x, 1) 
+        # [CASE 8: Bỏ F.adaptive_avg_pool2d, sử dụng torch.mean qua không gian (H, W)]
+        y = torch.mean(x, dim=(2, 3), keepdim=True)
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
@@ -84,42 +92,42 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER "SMART MUSCLE" (STACKED 3x3 RF EXPANSION)
+# 3. KHỐI ENCODER (DUAL-SCALE VÀ MULTI-SCALE BÌNH THƯỜNG)
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        self.dw_3x3_step1 = SquareDW(dim, kernel_size=3)
-        self.dw_3x3_step2 = SquareDW(dim, kernel_size=3) 
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        rf_3x3 = self.dw_3x3_step1(x)        
-        rf_5x5 = self.dw_3x3_step2(rf_3x3)        
+        b3 = self.dw_3x3(x)        
+        b5 = self.dw_5x5(b3)        
         
-        fused = self.bn_fuse(self.pw_fuse(rf_3x3 + rf_5x5))
+        fused = self.bn_fuse(self.pw_fuse(b3 + b5))
         return self.act(fused + x)
 
 class MultiScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        self.dw_3x3_step1 = SquareDW(dim, kernel_size=3)
-        self.dw_3x3_step2 = SquareDW(dim, kernel_size=3) 
-        self.dw_3x3_step3 = SquareDW(dim, kernel_size=3) 
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
+        self.dw_7x7 = SquareDW(dim) 
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        rf_3x3 = self.dw_3x3_step1(x)        
-        rf_5x5 = self.dw_3x3_step2(rf_3x3)        
-        rf_7x7 = self.dw_3x3_step3(rf_5x5)        
+        b3 = self.dw_3x3(x)        
+        b5 = self.dw_5x5(b3)        
+        b7 = self.dw_7x7(b5)        
         
-        fused = self.bn_fuse(self.pw_fuse(rf_3x3 + rf_5x5 + rf_7x7))
+        fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
         return self.act(fused + x)
 
 class EncoderBlock(nn.Module):
@@ -158,42 +166,8 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. BOTTLENECK (EDGE CONTEXT) & DECODER
+# 4. DECODER (ADDITIVE) & BOTTLE-NECK
 # ==============================================================================
-class EdgeContextBottleneck(nn.Module):
-    def __init__(self, dim, act_type='hswish'):
-        super().__init__()
-        
-        # Nhánh Local
-        self.local_dw = SquareDW(dim, kernel_size=3)
-        
-        # Nhánh Global
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.global_proj = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(dim),
-            get_activation(act_type)
-        )
-        
-        # Fusion
-        self.fuse_pw = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.fuse_bn = nn.BatchNorm2d(dim)
-        
-        self.channel_attn = ECABlock(dim, act_type)
-        self.act = get_activation(act_type)
-
-    def forward(self, x):
-        feat_local = self.local_dw(x)
-        feat_global = self.global_proj(self.global_pool(x))
-        
-        # Cộng broadcast
-        fused = feat_local + feat_global
-        
-        fused = self.act(self.fuse_bn(self.fuse_pw(fused)))
-        fused = self.channel_attn(fused)
-        
-        return x + fused
-
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
@@ -227,10 +201,32 @@ class AdditiveDecoderBlock(nn.Module):
         fused = self.proj(self.up(x)) + skip
         return self.act(self.refine(fused) + self.shortcut(fused))
 
+class SerialMultiScaleBottleneck(nn.Module):
+    def __init__(self, dim, act_type='hswish'):
+        super().__init__()
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
+        self.dw_7x7 = SquareDW(dim) 
+        
+        self.channel_attn = ECABlock(dim, act_type)
+        self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
+
+    def forward(self, x):
+        d1 = self.dw_3x3(x)        
+        d2 = self.dw_5x5(d1)        
+        d3 = self.dw_7x7(d2)        
+        
+        fused = d1 + d2 + d3
+        
+        out = self.channel_attn(fused)
+        out = self.spatial_attn(out)
+        
+        return x + out
+
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (ABLATION 3: CONTEXT BOTTLENECK)
+# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE)
 # ==============================================================================
-class PicoUNet_v4_Ablation_ContextBneck(nn.Module):
+class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
@@ -244,8 +240,7 @@ class PicoUNet_v4_Ablation_ContextBneck(nn.Module):
         self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
         self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
         
-        # Sử dụng Bottleneck mới
-        self.bottleneck = EdgeContextBottleneck(192, act_type='hswish')
+        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
         self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
         self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
@@ -272,4 +267,4 @@ class PicoUNet_v4_Ablation_ContextBneck(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v4_Ablation_ContextBneck(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v4_Edge(num_classes=num_classes, input_size=input_size)

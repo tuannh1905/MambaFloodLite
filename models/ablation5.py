@@ -28,9 +28,9 @@ def get_activation(act_type):
 
 # ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE 4: NO SKIP-CONNECTIONS
-# - Khôi phục Encoder, Bottleneck và Attention về chuẩn Baseline.
-# - Loại bỏ hoàn toàn skip-connection nối từ Encoder sang Decoder.
+# CASE 5: CONCAT FUSION THAY VÌ ADDITIVE
+# - Khôi phục Encoder và Bottleneck về chuẩn Baseline (có Attention, Multi-scale).
+# - Thay đổi cơ chế kết hợp đặc trưng ở Decoder từ Cộng dồn (Add) sang Nối (Concat).
 # ==============================================================================
 
 # ==============================================================================
@@ -165,15 +165,16 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK [ĐÃ SỬA ĐỔI CHO CASE 4]
+# 4. DECODER (CONCAT) & BOTTLE-NECK [ĐÃ SỬA ĐỔI CHO CASE 5]
 # ==============================================================================
-class AdditiveDecoderBlock(nn.Module):
+class ConcatDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
         
+        # [CASE 5: Nhận in_c + skip_c từ phép nối, sau đó giảm chiều về skip_c]
         self.proj = nn.Sequential(
-            nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
+            nn.Conv2d(in_c + skip_c, skip_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(skip_c)
         )
         
@@ -196,10 +197,15 @@ class AdditiveDecoderBlock(nn.Module):
         )
         self.act = get_activation(act_type)
 
-    # [CASE 4: Xóa tham số skip ở đầu vào]
-    def forward(self, x):
-        # [CASE 4: Bỏ phép cộng '+ skip']
-        fused = self.proj(self.up(x)) 
+    def forward(self, x, skip):
+        up_x = self.up(x)
+        
+        # [CASE 5: Dùng torch.cat thay vì phép cộng Additive]
+        concat_feat = torch.cat([up_x, skip], dim=1)
+        
+        # Giảm số kênh từ (in_c + skip_c) về skip_c để tương thích với phần sau
+        fused = self.proj(concat_feat)
+        
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
@@ -225,7 +231,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - CASE 4 ABLATION
+# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - CASE 5 ABLATION
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -243,29 +249,28 @@ class PicoUNet_v4_Edge(nn.Module):
         
         self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
-        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        # [CASE 5: Thay AdditiveDecoderBlock bằng ConcatDecoderBlock]
+        self.d4 = ConcatDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
+        self.d3 = ConcatDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
+        self.d2 = ConcatDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = ConcatDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
         
-        # [CASE 4: Nhận output từ Encoder nhưng vứt bỏ biến skip (_)]
-        x, _ = self.e1(x)
-        x, _ = self.e2(x)
-        x, _ = self.e3(x)
-        x, _ = self.e4(x)
+        x, s1 = self.e1(x)
+        x, s2 = self.e2(x)
+        x, s3 = self.e3(x)
+        x, s4 = self.e4(x)
         
         x = self.bottleneck(x)
         
-        # [CASE 4: Decoder không nhận biến skip nữa]
-        x = self.d4(x)
-        x = self.d3(x)
-        x = self.d2(x)
-        x = self.d1(x)
+        x = self.d4(x, s4)
+        x = self.d3(x, s3)
+        x = self.d2(x, s2)
+        x = self.d1(x, s1)
         
         return self.conv_out(x)
 

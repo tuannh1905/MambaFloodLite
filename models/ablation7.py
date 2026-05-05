@@ -3,28 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
+# 0. STANDARD ACTIVATIONS (CASE 7 ABLATION)
 # ==============================================================================
-class CustomHardsigmoid(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.relu6 = nn.ReLU6(inplace=True)
-
-    def forward(self, x):
-        return self.relu6(x + 3.0) / 6.0
-
-class CustomHardswish(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.hardsigmoid = CustomHardsigmoid()
-
-    def forward(self, x):
-        return x * self.hardsigmoid(x)
+# Đã xóa CustomHardsigmoid và CustomHardswish
 
 def get_activation(act_type):
     if act_type == 'hswish':
-        return CustomHardswish()
+        # [CASE 7: Sử dụng Hardswish mặc định của PyTorch]
+        return nn.Hardswish(inplace=True)
     return nn.ReLU6(inplace=True)
+
+# ==============================================================================
+# PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
+# CASE 7: STANDARD PYTORCH ACTIVATIONS
+# - Khôi phục toàn bộ kiến trúc (Attention, Decoder, Fusion, Encoder) về chuẩn Baseline.
+# - Sử dụng hàm kích hoạt mặc định của PyTorch để test tốc độ và tính tương thích ONNX.
+# ==============================================================================
 
 # ==============================================================================
 # 1. ATTENTION MODULES
@@ -38,7 +32,8 @@ class ECABlock(nn.Module):
             get_activation(act_type),
             nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
-        self.hardsigmoid = CustomHardsigmoid()
+        # [CASE 7: Sử dụng Hardsigmoid mặc định của PyTorch]
+        self.hardsigmoid = nn.Hardsigmoid()
 
     def forward(self, x):
         y = F.adaptive_avg_pool2d(x, 1) 
@@ -49,7 +44,8 @@ class SpatialAttention_MCU(nn.Module):
     def __init__(self, kernel_size=3):
         super().__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-        self.hardsigmoid = CustomHardsigmoid()
+        # [CASE 7: Sử dụng Hardsigmoid mặc định của PyTorch]
+        self.hardsigmoid = nn.Hardsigmoid()
 
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
@@ -84,36 +80,51 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER: DEEP SEQUENTIAL (KHÔNG FUSE MULTI-SCALE)
+# 3. KHỐI ENCODER (DUAL-SCALE VÀ MULTI-SCALE BÌNH THƯỜNG)
 # ==============================================================================
-class DeepSequential_PFCU_DG(nn.Module):
-    def __init__(self, dim, act_type='hswish'):
+class DualScale_PFCU_DG(nn.Module):
+    def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        # 3 khối DW 3x3 xếp chồng lên nhau
-        self.dw_3x3_step1 = SquareDW(dim, kernel_size=3)
-        self.dw_3x3_step2 = SquareDW(dim, kernel_size=3) 
-        self.dw_3x3_step3 = SquareDW(dim, kernel_size=3) 
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        # ĐI TUẦN TỰ QUA 3 LỚP (Tạo Receptive Field 7x7)
-        out_1 = self.dw_3x3_step1(x)        
-        out_2 = self.dw_3x3_step2(out_1)        
-        out_3 = self.dw_3x3_step3(out_2)        
+        b3 = self.dw_3x3(x)        
+        b5 = self.dw_5x5(b3)        
         
-        # BỎ BƯỚC FUSE (out_1 + out_2 + out_3) NHƯ BẢN GỐC
-        # Chỉ lấy thẳng kết quả cuối cùng (out_3) đi tiếp
-        fused = self.bn_fuse(self.pw_fuse(out_3))
+        fused = self.bn_fuse(self.pw_fuse(b3 + b5))
+        return self.act(fused + x)
+
+class MultiScale_PFCU_DG(nn.Module):
+    def __init__(self, dim, act_type='hswish'):
+        super().__init__()
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
+        self.dw_7x7 = SquareDW(dim) 
+        
+        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn_fuse = nn.BatchNorm2d(dim)
+        self.act = get_activation(act_type)
+
+    def forward(self, x):
+        b3 = self.dw_3x3(x)        
+        b5 = self.dw_5x5(b3)        
+        b7 = self.dw_7x7(b5)        
+        
+        fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
         return self.act(fused + x)
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, act_type='relu6'):
+    def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
         super().__init__()
-        # Áp dụng Deep Sequential cho toàn bộ Encoder
-        self.pfcu_dg = DeepSequential_PFCU_DG(in_c, act_type)
+        if is_deep:
+            self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
+        else:
+            self.pfcu_dg = DualScale_PFCU_DG(in_c, act_type)
             
         self.down_pool = nn.MaxPool2d((2, 2))
         
@@ -143,7 +154,7 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER & BOTTLE-NECK (DEEP SEQUENTIAL)
+# 4. DECODER (ADDITIVE) & BOTTLE-NECK
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
@@ -178,32 +189,32 @@ class AdditiveDecoderBlock(nn.Module):
         fused = self.proj(self.up(x)) + skip
         return self.act(self.refine(fused) + self.shortcut(fused))
 
-class DeepSequentialBottleneck(nn.Module):
+class SerialMultiScaleBottleneck(nn.Module):
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        self.dw_3x3_step1 = SquareDW(dim, kernel_size=3)
-        self.dw_3x3_step2 = SquareDW(dim, kernel_size=3) 
-        self.dw_3x3_step3 = SquareDW(dim, kernel_size=3) 
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
+        self.dw_7x7 = SquareDW(dim) 
         
         self.channel_attn = ECABlock(dim, act_type)
         self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
     def forward(self, x):
-        # ĐI TUẦN TỰ
-        out_1 = self.dw_3x3_step1(x)        
-        out_2 = self.dw_3x3_step2(out_1)        
-        out_3 = self.dw_3x3_step3(out_2)        
+        d1 = self.dw_3x3(x)        
+        d2 = self.dw_5x5(d1)        
+        d3 = self.dw_7x7(d2)        
         
-        # BỎ BƯỚC FUSE Ở GIỮA
-        out = self.channel_attn(out_3)
+        fused = d1 + d2 + d3
+        
+        out = self.channel_attn(fused)
         out = self.spatial_attn(out)
         
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH (ABLATION 2: DEEP SEQUENTIAL)
+# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE)
 # ==============================================================================
-class PicoUNet_v4_Ablation_Seq(nn.Module):
+class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
@@ -212,13 +223,12 @@ class PicoUNet_v4_Ablation_Seq(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # Áp dụng DeepSequential cho toàn mạng
-        self.e1 = EncoderBlock(32, 64, act_type='relu6')   
-        self.e2 = EncoderBlock(64, 128, act_type='relu6')   
-        self.e3 = EncoderBlock(128, 192, act_type='hswish') 
-        self.e4 = EncoderBlock(192, 192, act_type='hswish') 
+        self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
+        self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
+        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
+        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
         
-        self.bottleneck = DeepSequentialBottleneck(192, act_type='hswish')
+        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
         self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
         self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
@@ -245,5 +255,4 @@ class PicoUNet_v4_Ablation_Seq(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v4_Ablation_Seq(num_classes=num_classes, input_size=input_size)
-#no multi-scale fusion, deep sequential design
+    return PicoUNet_v4_Edge(num_classes=num_classes, input_size=input_size)
