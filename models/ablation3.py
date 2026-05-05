@@ -192,4 +192,58 @@ class SerialMultiScaleBottleneck(nn.Module):
 
     def forward(self, x):
         d1 = self.dw_3x3(x)        
-        d2 = self
+        d2 = self.dw_5x5(d1)        
+        d3 = self.dw_7x7(d2)        
+        
+        fused = d1 + d2 + d3
+        
+        out = self.channel_attn(fused)
+        out = self.spatial_attn(out)
+        
+        return x + out
+
+# ==============================================================================
+# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - CASE 3 ABLATION
+# ==============================================================================
+class PicoUNet_v4_Edge(nn.Module):
+    def __init__(self, num_classes=1, input_size=128):
+        super().__init__()
+        
+        if input_size % 16 != 0:
+            raise ValueError(f"Input_size phải chia hết cho 16.")
+
+        self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        
+        self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
+        self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
+        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
+        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
+        
+        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
+        
+        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
+        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
+        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        
+        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        x = self.conv_in(x)
+        
+        x, s1 = self.e1(x)
+        x, s2 = self.e2(x)
+        x, s3 = self.e3(x)
+        x, s4 = self.e4(x)
+        
+        x = self.bottleneck(x)
+        
+        x = self.d4(x, s4)
+        x = self.d3(x, s3)
+        x = self.d2(x, s2)
+        x = self.d1(x, s1)
+        
+        return self.conv_out(x)
+
+def build_model(num_classes=1, input_size=128):
+    return PicoUNet_v4_Edge(num_classes=num_classes, input_size=input_size)
