@@ -27,7 +27,7 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# 1. ATTENTION MODULES (ĐÃ BỎ SPATIAL ATTENTION)
+# 1. ATTENTION MODULES
 # ==============================================================================
 class ECABlock(nn.Module):
     def __init__(self, channels, act_type='hswish'):
@@ -41,8 +41,20 @@ class ECABlock(nn.Module):
         self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
-        # VACCINE 2: Dùng AdaptiveAvgPool thay vì torch.mean
         y = F.adaptive_avg_pool2d(x, 1) 
+        y = self.hardsigmoid(self.conv(y))
+        return x * y
+
+class SpatialAttention_MCU(nn.Module):
+    def __init__(self, kernel_size=3):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
+        self.hardsigmoid = CustomHardsigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        y = torch.cat([avg_out, max_out], dim=1) 
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
@@ -72,12 +84,13 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER (SINGLE-SCALE CHO TẦNG NÔNG, MULTI-SCALE CHO TẦNG SÂU)
+# 3. KHỐI ENCODER (CHIA LÀM 2 LOẠI: DUAL-SCALE VÀ MULTI-SCALE)
 # ==============================================================================
-class SingleScale_PFCU_DG(nn.Module):
+class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
         self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
@@ -85,8 +98,9 @@ class SingleScale_PFCU_DG(nn.Module):
 
     def forward(self, x):
         b3 = self.dw_3x3(x)        
+        b5 = self.dw_5x5(b3)        
         
-        fused = self.bn_fuse(self.pw_fuse(b3))
+        fused = self.bn_fuse(self.pw_fuse(b3 + b5))
         return self.act(fused + x)
 
 class MultiScale_PFCU_DG(nn.Module):
@@ -114,8 +128,7 @@ class EncoderBlock(nn.Module):
         if is_deep:
             self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
         else:
-            # Dùng Single-Scale thay vì Dual-Scale ở bản gốc
-            self.pfcu_dg = SingleScale_PFCU_DG(in_c, act_type)
+            self.pfcu_dg = DualScale_PFCU_DG(in_c, act_type)
             
         self.down_pool = nn.MaxPool2d((2, 2))
         
@@ -145,9 +158,9 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK (GỐC - ĐÃ BỎ SPATIAL ATTN)
+# 4. DECODER (WEIGHTED ADDITIVE) & BOTTLE-NECK
 # ==============================================================================
-class AdditiveDecoderBlock(nn.Module):
+class WeightedDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
@@ -156,6 +169,11 @@ class AdditiveDecoderBlock(nn.Module):
             nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(skip_c)
         )
+        
+        # --- LEARNABLE CHANNEL-WISE WEIGHTS ---
+        self.w_skip = nn.Parameter(torch.ones(1, skip_c, 1, 1))
+        self.w_up = nn.Parameter(torch.ones(1, skip_c, 1, 1))
+        self.relu_w = nn.ReLU() # Đảm bảo trọng số luôn dương
         
         gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
@@ -177,7 +195,16 @@ class AdditiveDecoderBlock(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        fused = self.proj(self.up(x)) + skip
+        up_feat = self.proj(self.up(x))
+        
+        # --- FAST NORMALIZED FUSION ---
+        w1 = self.relu_w(self.w_skip)
+        w2 = self.relu_w(self.w_up)
+        w_sum = w1 + w2 + 1e-4
+        
+        # Trộn có trọng số theo kênh
+        fused = (w1 * skip + w2 * up_feat) / w_sum
+        
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
@@ -188,6 +215,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         self.dw_7x7 = SquareDW(dim) 
         
         self.channel_attn = ECABlock(dim, act_type)
+        self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
     def forward(self, x):
         d1 = self.dw_3x3(x)        
@@ -197,12 +225,12 @@ class SerialMultiScaleBottleneck(nn.Module):
         fused = d1 + d2 + d3
         
         out = self.channel_attn(fused)
-        # Spatial Attention đã được gỡ bỏ hoàn toàn
+        out = self.spatial_attn(out)
         
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (ĐÃ CẬP NHẬT ABLATION)
+# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE + WEIGHTED DECODER)
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -220,10 +248,11 @@ class PicoUNet_v4_Edge(nn.Module):
         
         self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
-        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        # ---> SỬ DỤNG WEIGHTED DECODER BLOCK TẠI ĐÂY <---
+        self.d4 = WeightedDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
+        self.d3 = WeightedDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
+        self.d2 = WeightedDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = WeightedDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
