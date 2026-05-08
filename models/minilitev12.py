@@ -41,20 +41,8 @@ class ECABlock(nn.Module):
         self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
+        # VACCINE 2: Dùng AdaptiveAvgPool thay vì torch.mean
         y = F.adaptive_avg_pool2d(x, 1) 
-        y = self.hardsigmoid(self.conv(y))
-        return x * y
-
-class SpatialAttention_MCU(nn.Module):
-    def __init__(self, kernel_size=3):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-        self.hardsigmoid = CustomHardsigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        y = torch.cat([avg_out, max_out], dim=1) 
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
@@ -84,51 +72,50 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER (CHIA LÀM 2 LOẠI: DUAL-SCALE VÀ MULTI-SCALE)
+# 3. KHỐI ENCODER (SINGLE-SCALE VÀ MULTI-SCALE)
 # ==============================================================================
-class DualScale_PFCU_DG(nn.Module):
+class SingleScale_PFCU_DG(nn.Module):
+    # Dùng cho Tầng Nông: 1 nhánh 3x3 để tiết kiệm MACs
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
-        
+        self.dw_3x3 = SquareDW(dim, kernel_size=3)
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
         b3 = self.dw_3x3(x)        
-        b5 = self.dw_5x5(b3)        
-        
-        fused = self.bn_fuse(self.pw_fuse(b3 + b5))
+        fused = self.bn_fuse(self.pw_fuse(b3))
         return self.act(fused + x)
 
 class MultiScale_PFCU_DG(nn.Module):
+    # Dùng cho Tầng Sâu: Xếp chồng 3x3 để ESP-DL chạy Fast-path Vector
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
-        self.dw_7x7 = SquareDW(dim) 
+        self.dw_3x3_step1 = SquareDW(dim, kernel_size=3)
+        self.dw_3x3_step2 = SquareDW(dim, kernel_size=3) 
+        self.dw_3x3_step3 = SquareDW(dim, kernel_size=3) 
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        b3 = self.dw_3x3(x)        
-        b5 = self.dw_5x5(b3)        
-        b7 = self.dw_7x7(b5)        
+        rf_3x3 = self.dw_3x3_step1(x)        
+        rf_5x5 = self.dw_3x3_step2(rf_3x3)        
+        rf_7x7 = self.dw_3x3_step3(rf_5x5)        
         
-        fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
+        fused = self.bn_fuse(self.pw_fuse(rf_3x3 + rf_5x5 + rf_7x7))
         return self.act(fused + x)
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
+    def __init__(self, in_c, out_c, scale_type='single', act_type='relu6'):
         super().__init__()
-        if is_deep:
+        
+        if scale_type == 'multi':
             self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
         else:
-            self.pfcu_dg = DualScale_PFCU_DG(in_c, act_type)
+            self.pfcu_dg = SingleScale_PFCU_DG(in_c, act_type)
             
         self.down_pool = nn.MaxPool2d((2, 2))
         
@@ -158,9 +145,60 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (WEIGHTED ADDITIVE) & BOTTLE-NECK
+# 4. BOTTLENECK (LIGHTWEIGHT ORTHOGONAL) & DECODER (ADDITIVE)
 # ==============================================================================
-class WeightedDecoderBlock(nn.Module):
+class LightweightOrthogonalBottleneck(nn.Module):
+    def __init__(self, dim, act_type='hswish', reduction=4):
+        super().__init__()
+        
+        self.local_dw = SquareDW(dim, kernel_size=3)
+        
+        # Squeeze: Bóp kênh (vd 192 -> 48) để giảm params điểm X-Y
+        mid_dim = max(16, dim // reduction)
+        self.squeeze = nn.Sequential(
+            nn.Conv2d(dim, mid_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_dim),
+            get_activation(act_type)
+        )
+        
+        self.proj_h = nn.Sequential(
+            nn.Conv2d(mid_dim, mid_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_dim)
+        )
+        self.proj_w = nn.Sequential(
+            nn.Conv2d(mid_dim, mid_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mid_dim)
+        )
+        
+        # Expand: Phóng to lại số kênh ban đầu
+        self.expand = nn.Sequential(
+            nn.Conv2d(mid_dim, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim)
+        )
+        
+        self.channel_attn = ECABlock(dim, act_type)
+        self.act = get_activation(act_type)
+
+    def forward(self, x):
+        feat_local = self.local_dw(x)
+        
+        x_sq = self.squeeze(x)
+        
+        pool_h = torch.mean(x_sq, dim=3, keepdim=True)
+        feat_h = self.proj_h(pool_h)
+        
+        pool_w = torch.mean(x_sq, dim=2, keepdim=True)
+        feat_w = self.proj_w(pool_w)
+        
+        feat_global = feat_h + feat_w
+        feat_global = self.act(self.expand(feat_global))
+        
+        fused = feat_local + feat_global
+        fused = self.channel_attn(fused)
+        
+        return x + fused
+
+class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
@@ -169,11 +207,6 @@ class WeightedDecoderBlock(nn.Module):
             nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(skip_c)
         )
-        
-        # --- LEARNABLE CHANNEL-WISE WEIGHTS ---
-        self.w_skip = nn.Parameter(torch.ones(1, skip_c, 1, 1))
-        self.w_up = nn.Parameter(torch.ones(1, skip_c, 1, 1))
-        self.relu_w = nn.ReLU() # Đảm bảo trọng số luôn dương
         
         gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
@@ -195,64 +228,38 @@ class WeightedDecoderBlock(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        up_feat = self.proj(self.up(x))
-        
-        # --- FAST NORMALIZED FUSION ---
-        w1 = self.relu_w(self.w_skip)
-        w2 = self.relu_w(self.w_up)
-        w_sum = w1 + w2 + 1e-4
-        
-        # Trộn có trọng số theo kênh
-        fused = (w1 * skip + w2 * up_feat) / w_sum
-        
+        fused = self.proj(self.up(x)) + skip
         return self.act(self.refine(fused) + self.shortcut(fused))
 
-class SerialMultiScaleBottleneck(nn.Module):
-    def __init__(self, dim, act_type='hswish'):
-        super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
-        self.dw_7x7 = SquareDW(dim) 
-        
-        self.channel_attn = ECABlock(dim, act_type)
-        self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
-
-    def forward(self, x):
-        d1 = self.dw_3x3(x)        
-        d2 = self.dw_5x5(d1)        
-        d3 = self.dw_7x7(d2)        
-        
-        fused = d1 + d2 + d3
-        
-        out = self.channel_attn(fused)
-        out = self.spatial_attn(out)
-        
-        return x + out
-
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE + WEIGHTED DECODER)
+# 5. MẠNG CHÍNH PICO-UNET V4 (HARDWARE-AWARE SOTA)
 # ==============================================================================
-class PicoUNet_v4_Edge(nn.Module):
+class PicoUNet_v4_Proposed(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
         if input_size % 16 != 0:
             raise ValueError(f"Input_size phải chia hết cho 16.")
 
-        self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        # Khởi tạo: In -> 16
+        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
         
-        self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
-        self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
-        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
-        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
+        # Tầng Nông: Single-Scale (Giảm MACs)
+        self.e1 = EncoderBlock(16, 32,  scale_type='single', act_type='relu6')   
+        self.e2 = EncoderBlock(32, 64,  scale_type='single', act_type='relu6')   
         
-        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
+        # Tầng Sâu: Multi-Scale (Tăng Receptive Field)
+        self.e3 = EncoderBlock(64, 128, scale_type='multi',  act_type='hswish') 
+        self.e4 = EncoderBlock(128, 192, scale_type='multi', act_type='hswish') 
         
-        # ---> SỬ DỤNG WEIGHTED DECODER BLOCK TẠI ĐÂY <---
-        self.d4 = WeightedDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = WeightedDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = WeightedDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = WeightedDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        # Đáy: Lightweight Orthogonal Bottleneck (192)
+        self.bottleneck = LightweightOrthogonalBottleneck(192, act_type='hswish', reduction=4)
+        
+        # Decoder: Additive Fusion (Cứu RAM)
+        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
+        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=128, out_c=64,  act_type='hswish')  
+        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=64,  out_c=32,  act_type='hswish')   
+        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=32,  out_c=16,  act_type='hswish')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
@@ -274,4 +281,4 @@ class PicoUNet_v4_Edge(nn.Module):
         return self.conv_out(x)
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v4_Edge(num_classes=num_classes, input_size=input_size)
+    return PicoUNet_v4_Proposed(num_classes=num_classes, input_size=input_size)
