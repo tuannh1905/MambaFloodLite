@@ -28,9 +28,9 @@ def get_activation(act_type):
 
 # ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE F1: NO SHORTCUT IN DECODER ABLATION
+# CASE D1: CHANNEL ATTN ONLY (BOTTLENECK) ABLATION
 # - Khôi phục toàn bộ mạng về Baseline.
-# - Tại AdditiveDecoderBlock: Loại bỏ nhánh shortcut, ép dữ liệu qua nhánh refine.
+# - Tại Bottleneck: Xóa SpatialAttention_MCU, chỉ giữ lại ECABlock (Channel Attn).
 # ==============================================================================
 
 # ==============================================================================
@@ -165,7 +165,7 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER [SỬA ĐỔI CHO CASE F1] & BOTTLE-NECK 
+# 4. DECODER & BOTTLE-NECK [SỬA ĐỔI BOTTLENECK CHO CASE D1]
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
@@ -190,13 +190,15 @@ class AdditiveDecoderBlock(nn.Module):
             nn.BatchNorm2d(out_c)
         )
         
-        # [CASE F1]: Xóa bỏ nhánh self.shortcut
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
         fused = self.proj(self.up(x)) + skip
-        # [CASE F1]: Không cộng thêm shortcut, chỉ lấy kết quả từ refine
-        return self.act(self.refine(fused))
+        return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
     def __init__(self, dim, act_type='hswish'):
@@ -205,8 +207,11 @@ class SerialMultiScaleBottleneck(nn.Module):
         self.dw_5x5 = SquareDW(dim) 
         self.dw_7x7 = SquareDW(dim) 
         
+        # [CASE D1]: Giữ lại Channel Attention (ECA)
         self.channel_attn = ECABlock(dim, act_type)
-        self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
+        
+        # [CASE D1]: Xóa bỏ Spatial Attention
+        # self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
     def forward(self, x):
         d1 = self.dw_3x3(x)        
@@ -215,8 +220,8 @@ class SerialMultiScaleBottleneck(nn.Module):
         
         fused = d1 + d2 + d3
         
+        # [CASE D1]: Chỉ chạy qua Channel Attention
         out = self.channel_attn(fused)
-        out = self.spatial_attn(out)
         
         return x + out
 

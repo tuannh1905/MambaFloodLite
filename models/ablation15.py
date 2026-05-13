@@ -28,9 +28,10 @@ def get_activation(act_type):
 
 # ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE F1: NO SHORTCUT IN DECODER ABLATION
+# CASE F2: LEARNABLE FUSION WEIGHT ABLATION
 # - Khôi phục toàn bộ mạng về Baseline.
-# - Tại AdditiveDecoderBlock: Loại bỏ nhánh shortcut, ép dữ liệu qua nhánh refine.
+# - Tại AdditiveDecoderBlock: Thay thế phép cộng cứng (A + B) thành tổ hợp tuyến 
+#   tính có trọng số học được: alpha * A + (1 - alpha) * B.
 # ==============================================================================
 
 # ==============================================================================
@@ -165,7 +166,7 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER [SỬA ĐỔI CHO CASE F1] & BOTTLE-NECK 
+# 4. DECODER [SỬA ĐỔI CHO CASE F2] & BOTTLE-NECK 
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
@@ -176,6 +177,10 @@ class AdditiveDecoderBlock(nn.Module):
             nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(skip_c)
         )
+        
+        # [CASE F2]: Khởi tạo tham số alpha có thể học được. 
+        # Bắt đầu với 0.5 (tương đương với Additive tiêu chuẩn)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
         
         gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
@@ -190,13 +195,19 @@ class AdditiveDecoderBlock(nn.Module):
             nn.BatchNorm2d(out_c)
         )
         
-        # [CASE F1]: Xóa bỏ nhánh self.shortcut
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_c)
+        )
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        fused = self.proj(self.up(x)) + skip
-        # [CASE F1]: Không cộng thêm shortcut, chỉ lấy kết quả từ refine
-        return self.act(self.refine(fused))
+        up_feat = self.proj(self.up(x))
+        
+        # [CASE F2]: Dung hòa đặc trưng bằng trọng số học được
+        fused = (self.alpha * up_feat) + ((1.0 - self.alpha) * skip)
+        
+        return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
     def __init__(self, dim, act_type='hswish'):
