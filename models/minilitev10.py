@@ -28,9 +28,11 @@ def get_activation(act_type):
 
 # ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE: STRAIGHT 3X3 SHALLOW ENCODER (ULTRA-LOW MACS/RAM)
-# - San phẳng toàn bộ nhánh phức tạp ở tầng nông (E1, E2).
-# - Trôi thẳng tuột qua 3 lớp DW 3x3 nối tiếp, không có bất kỳ dấu '+' nào.
+# CASE: MAX-128 CHANNELS + STANDARD CONCAT ABLATION
+# - Giới hạn số kênh tối đa ở đáy mạng là 128 (thay vì 192).
+# - Sử dụng Concatenation chuẩn ở Decoder để tối đa hóa chi tiết ngữ nghĩa.
+# - Mục tiêu: Cân bằng lại VRAM nhờ việc gọt kênh sâu, đánh đổi lấy sức mạnh 
+#   của phép nối đặc trưng (Concat).
 # ==============================================================================
 
 # ==============================================================================
@@ -93,29 +95,23 @@ class NearestUpsample(nn.Module):
 # ==============================================================================
 # 3. KHỐI ENCODER 
 # ==============================================================================
-# [ABLATION MỚI]: Khối Straight 3x3 (Thay thế cho DualScale_PFCU_DG ở tầng nông)
-class Straight3x3Block(nn.Module):
+class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        # Trôi thẳng tuột 3 lớp 3x3
-        self.dw1 = SquareDW(dim, kernel_size=3)
-        self.dw2 = SquareDW(dim, kernel_size=3)
-        self.dw3 = SquareDW(dim, kernel_size=3)
+        self.dw_3x3 = SquareDW(dim)
+        self.dw_5x5 = SquareDW(dim) 
         
-        self.pw = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(dim)
+        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn_fuse = nn.BatchNorm2d(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        # Không chia nhánh, không cộng dồn, trôi tuột từ đầu đến cuối
-        out = self.dw1(x)
-        out = self.dw2(out)
-        out = self.dw3(out)
+        b3 = self.dw_3x3(x)        
+        b5 = self.dw_5x5(b3)        
         
-        out = self.bn(self.pw(out))
-        return self.act(out)  # Không có + x
+        fused = self.bn_fuse(self.pw_fuse(b3 + b5))
+        return self.act(fused + x)
 
-# (Giữ nguyên MultiScale cho E3, E4 nếu bạn vẫn muốn tầng sâu có đặc trưng đa phân giải)
 class MultiScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
@@ -139,11 +135,9 @@ class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
         super().__init__()
         if is_deep:
-            # Tầng sâu (ảnh nhỏ) vẫn dùng Multi-scale bình thường
             self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
         else:
-            # [ABLATION]: Tầng nông dùng Straight 3x3 để ép giảm GFLOPs và VRAM
-            self.pfcu_dg = Straight3x3Block(in_c, act_type)
+            self.pfcu_dg = DualScale_PFCU_DG(in_c, act_type)
             
         self.down_pool = nn.MaxPool2d((2, 2))
         
@@ -173,21 +167,20 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK 
+# 4. DECODER (STANDARD CONCAT) & BOTTLE-NECK 
 # ==============================================================================
-class AdditiveDecoderBlock(nn.Module):
+class ConcatDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
         
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(skip_c)
-        )
+        # [ABLATION: SỬ DỤNG CONCAT CHUẨN]
+        concat_channels = in_c + skip_c
         
         gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
-            nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
+            # Nhận toàn bộ số kênh sau khi nối
+            nn.Conv2d(concat_channels, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
@@ -199,13 +192,15 @@ class AdditiveDecoderBlock(nn.Module):
         )
         
         self.shortcut = nn.Sequential(
-            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.Conv2d(concat_channels, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
         )
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        fused = self.proj(self.up(x)) + skip
+        up_feat = self.up(x)
+        # Nối đặc trưng dọc theo chiều channel
+        fused = torch.cat([up_feat, skip], dim=1)
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
@@ -231,7 +226,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4
+# 5. MẠNG CHÍNH PICO-UNET V4 (MAX 128 CHANNELS + CONCAT)
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -242,20 +237,22 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # E1, E2 giờ đây sẽ dùng Straight3x3Block (Cực nhẹ, cực ít RAM)
-        self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
-        self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
+        # [ABLATION: GIỚI HẠN KÊNH TỐI ĐA LÀ 128]
+        self.e1 = EncoderBlock(32, 64,   is_deep=False, act_type='relu6')   
+        self.e2 = EncoderBlock(64, 128,  is_deep=False, act_type='relu6')   
+        # E3 không tăng kênh nữa, giữ nguyên 128
+        self.e3 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
+        # E4 giữ nguyên 128
+        self.e4 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
         
-        # E3, E4 giữ lại MultiScale vì ảnh đã nhỏ, MACs/RAM không còn là vấn đề
-        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
-        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
+        # Bottleneck cũng chỉ chạy trên 128 kênh
+        self.bottleneck = SerialMultiScaleBottleneck(128, act_type='hswish')
         
-        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
-        
-        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        # [ABLATION: DECODER DÙNG CONCAT]
+        self.d4 = ConcatDecoderBlock(in_c=128, skip_c=128, out_c=128, act_type='hswish') 
+        self.d3 = ConcatDecoderBlock(in_c=128, skip_c=128, out_c=64,  act_type='hswish')  
+        self.d2 = ConcatDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = ConcatDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
