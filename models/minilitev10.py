@@ -28,11 +28,8 @@ def get_activation(act_type):
 
 # ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE F2 (PROPOSED): PARAMETER-FREE VARIANCE-DRIVEN FUSION (PFVF)
-# - Khôi phục toàn bộ Encoder về chuẩn Baseline (chuỗi Serial Multi-scale).
-# - Bỏ hoàn toàn Spatial Attention ở Bottleneck (theo đánh giá thực nghiệm).
-# - Tại Decoder: Tính phương sai động (Variance) để tự quyết định tỉ lệ Alpha 
-#   kết hợp (fusion) giữa Up-feat và Skip-feat (0 param tốn thêm).
+# CASE F2 (PROPOSED): PARAMETER-FREE VARIANCE-DRIVEN FUSION (PFVF) - TỐI ƯU VRAM
+# - Đã vá lỗi tràn RAM: Sử dụng .detach() để ngắt đồ thị đạo hàm khi tính Phương sai.
 # ==============================================================================
 
 # ==============================================================================
@@ -190,15 +187,17 @@ class PFVF_DecoderBlock(nn.Module):
     def forward(self, x, skip):
         up_feat = self.proj(self.up(x))
         
-        # [ĐỀ XUẤT MỚI: TÍNH TOÁN ALPHA ĐỘNG DỰA TRÊN PHƯƠNG SAI]
-        # Tính var trên kích thước [C, H, W], giữ lại batch (dim=1,2,3)
-        var_up = torch.var(up_feat, dim=[1, 2, 3], keepdim=True)
-        var_skip = torch.var(skip, dim=[1, 2, 3], keepdim=True)
+        # [BẢN VÁ: THÊM .detach() ĐỂ NGẮT ĐỒ THỊ ĐẠO HÀM]
+        # PyTorch sẽ chỉ coi var_up và var_skip là con số để nhân, không lưu ma trận phụ.
+        # Tính var trên từng Channel (dim=[2,3]) để dung hòa mịn màng hơn (hoặc [1,2,3] đều ổn).
+        # Ở đây ta tính trên toàn cục [1,2,3] như thiết kế gốc.
+        var_up = torch.var(up_feat, dim=[1, 2, 3], keepdim=True).detach()
+        var_skip = torch.var(skip, dim=[1, 2, 3], keepdim=True).detach()
         
-        # Alpha động tự cân bằng nhánh Up và Skip (1e-6 để tránh chia cho 0)
+        # Alpha động (1e-6 để tránh chia cho 0)
         alpha = var_up / (var_up + var_skip + 1e-6)
         
-        # Dung hòa theo trọng số động
+        # Dung hòa (fused vẫn giữ nguyên gradient của up_feat và skip)
         fused = (alpha * up_feat) + ((1.0 - alpha) * skip)
         
         return self.act(self.refine(fused) + self.shortcut(fused))
@@ -211,7 +210,6 @@ class SerialMultiScaleBottleneck(nn.Module):
         self.dw_7x7 = SquareDW(dim) 
         
         self.channel_attn = ECABlock(dim, act_type)
-        # [ĐÃ LƯỢC BỎ SPATIAL ATTENTION]
 
     def forward(self, x):
         d1 = self.dw_3x3(x)        
@@ -243,7 +241,6 @@ class PicoUNet_v4_Edge(nn.Module):
         
         self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
-        # [SỬ DỤNG KHỐI DECODER DUNG HÒA ĐỘNG THEO PHƯƠNG SAI]
         self.d4 = PFVF_DecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
         self.d3 = PFVF_DecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
         self.d2 = PFVF_DecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
