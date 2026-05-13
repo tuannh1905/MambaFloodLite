@@ -28,8 +28,10 @@ def get_activation(act_type):
 
 # ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE F2 (PROPOSED): PARAMETER-FREE VARIANCE-DRIVEN FUSION (PFVF) - TỐI ƯU VRAM
-# - Đã vá lỗi tràn RAM: Sử dụng .detach() để ngắt đồ thị đạo hàm khi tính Phương sai.
+# CASE: NO SHORTCUT IN SHALLOW ENCODER ABLATION
+# - Khôi phục toàn bộ mạng về Baseline (Additive Fusion, Serial Encoder).
+# - Tại khối DualScale_PFCU_DG (dành cho E1, E2): Lược bỏ Residual Shortcut (+ x).
+# - Mục đích: Giảm Memory Bandwidth Overhead ở độ phân giải cao để tăng FPS.
 # ==============================================================================
 
 # ==============================================================================
@@ -51,7 +53,18 @@ class ECABlock(nn.Module):
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
-# [ĐÃ LƯỢC BỎ SPATIAL ATTENTION MCU THEO YÊU CẦU]
+class SpatialAttention_MCU(nn.Module):
+    def __init__(self, kernel_size=3):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
+        self.hardsigmoid = CustomHardsigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        y = torch.cat([avg_out, max_out], dim=1) 
+        y = self.hardsigmoid(self.conv(y))
+        return x * y
 
 # ==============================================================================
 # 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE
@@ -96,7 +109,10 @@ class DualScale_PFCU_DG(nn.Module):
         b5 = self.dw_5x5(b3)        
         
         fused = self.bn_fuse(self.pw_fuse(b3 + b5))
-        return self.act(fused + x)
+        
+        # [ABLATION]: Xóa bỏ '+ x' (Residual Shortcut) để tiết kiệm băng thông nhớ.
+        # Ở các tầng đầu, ảnh rất to, bỏ phép cộng này sẽ giúp tăng tốc R/W.
+        return self.act(fused)
 
 class MultiScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='hswish'):
@@ -115,6 +131,9 @@ class MultiScale_PFCU_DG(nn.Module):
         b7 = self.dw_7x7(b5)        
         
         fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
+        
+        # Ở tầng sâu (Ảnh nhỏ, kênh nhiều), phép cộng Residual vẫn được giữ
+        # để đảm bảo mượt gradient.
         return self.act(fused + x)
 
 class EncoderBlock(nn.Module):
@@ -153,9 +172,9 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (PFVF) & BOTTLE-NECK 
+# 4. DECODER & BOTTLE-NECK 
 # ==============================================================================
-class PFVF_DecoderBlock(nn.Module):
+class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
@@ -185,21 +204,7 @@ class PFVF_DecoderBlock(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        up_feat = self.proj(self.up(x))
-        
-        # [BẢN VÁ: THÊM .detach() ĐỂ NGẮT ĐỒ THỊ ĐẠO HÀM]
-        # PyTorch sẽ chỉ coi var_up và var_skip là con số để nhân, không lưu ma trận phụ.
-        # Tính var trên từng Channel (dim=[2,3]) để dung hòa mịn màng hơn (hoặc [1,2,3] đều ổn).
-        # Ở đây ta tính trên toàn cục [1,2,3] như thiết kế gốc.
-        var_up = torch.var(up_feat, dim=[1, 2, 3], keepdim=True).detach()
-        var_skip = torch.var(skip, dim=[1, 2, 3], keepdim=True).detach()
-        
-        # Alpha động (1e-6 để tránh chia cho 0)
-        alpha = var_up / (var_up + var_skip + 1e-6)
-        
-        # Dung hòa (fused vẫn giữ nguyên gradient của up_feat và skip)
-        fused = (alpha * up_feat) + ((1.0 - alpha) * skip)
-        
+        fused = self.proj(self.up(x)) + skip
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
@@ -210,6 +215,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         self.dw_7x7 = SquareDW(dim) 
         
         self.channel_attn = ECABlock(dim, act_type)
+        self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
     def forward(self, x):
         d1 = self.dw_3x3(x)        
@@ -219,11 +225,12 @@ class SerialMultiScaleBottleneck(nn.Module):
         fused = d1 + d2 + d3
         
         out = self.channel_attn(fused)
+        out = self.spatial_attn(out)
         
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE - PFVF EDITION)
+# 5. MẠNG CHÍNH PICO-UNET V4 
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -241,10 +248,10 @@ class PicoUNet_v4_Edge(nn.Module):
         
         self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
         
-        self.d4 = PFVF_DecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = PFVF_DecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = PFVF_DecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = PFVF_DecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
+        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
+        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
