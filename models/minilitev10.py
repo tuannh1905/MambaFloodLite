@@ -179,13 +179,12 @@ class ConcatDecoderBlock(nn.Module):
         
         gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
-            # Nhận toàn bộ số kênh sau khi nối
             nn.Conv2d(concat_channels, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
             SquareDW(gc, kernel_size=5), 
-            ECABlock(gc, act_type), 
+            ECABlock(gc, act_type),  # <----- ATTENTION ĐANG NẰM CHÌNH ÌNH Ở ĐÂY NÀY!
             
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
