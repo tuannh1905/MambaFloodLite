@@ -28,10 +28,9 @@ def get_activation(act_type):
 
 # ==============================================================================
 # PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE: NO SHORTCUT IN SHALLOW ENCODER ABLATION
-# - Khôi phục toàn bộ mạng về Baseline (Additive Fusion, Serial Encoder).
-# - Tại khối DualScale_PFCU_DG (dành cho E1, E2): Lược bỏ Residual Shortcut (+ x).
-# - Mục đích: Giảm Memory Bandwidth Overhead ở độ phân giải cao để tăng FPS.
+# CASE: STRAIGHT 3X3 SHALLOW ENCODER (ULTRA-LOW MACS/RAM)
+# - San phẳng toàn bộ nhánh phức tạp ở tầng nông (E1, E2).
+# - Trôi thẳng tuột qua 3 lớp DW 3x3 nối tiếp, không có bất kỳ dấu '+' nào.
 # ==============================================================================
 
 # ==============================================================================
@@ -94,26 +93,29 @@ class NearestUpsample(nn.Module):
 # ==============================================================================
 # 3. KHỐI ENCODER 
 # ==============================================================================
-class DualScale_PFCU_DG(nn.Module):
+# [ABLATION MỚI]: Khối Straight 3x3 (Thay thế cho DualScale_PFCU_DG ở tầng nông)
+class Straight3x3Block(nn.Module):
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
+        # Trôi thẳng tuột 3 lớp 3x3
+        self.dw1 = SquareDW(dim, kernel_size=3)
+        self.dw2 = SquareDW(dim, kernel_size=3)
+        self.dw3 = SquareDW(dim, kernel_size=3)
         
-        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
+        self.pw = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        b3 = self.dw_3x3(x)        
-        b5 = self.dw_5x5(b3)        
+        # Không chia nhánh, không cộng dồn, trôi tuột từ đầu đến cuối
+        out = self.dw1(x)
+        out = self.dw2(out)
+        out = self.dw3(out)
         
-        fused = self.bn_fuse(self.pw_fuse(b3 + b5))
-        
-        # [ABLATION]: Xóa bỏ '+ x' (Residual Shortcut) để tiết kiệm băng thông nhớ.
-        # Ở các tầng đầu, ảnh rất to, bỏ phép cộng này sẽ giúp tăng tốc R/W.
-        return self.act(fused)
+        out = self.bn(self.pw(out))
+        return self.act(out)  # Không có + x
 
+# (Giữ nguyên MultiScale cho E3, E4 nếu bạn vẫn muốn tầng sâu có đặc trưng đa phân giải)
 class MultiScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='hswish'):
         super().__init__()
@@ -131,18 +133,17 @@ class MultiScale_PFCU_DG(nn.Module):
         b7 = self.dw_7x7(b5)        
         
         fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
-        
-        # Ở tầng sâu (Ảnh nhỏ, kênh nhiều), phép cộng Residual vẫn được giữ
-        # để đảm bảo mượt gradient.
         return self.act(fused + x)
 
 class EncoderBlock(nn.Module):
     def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
         super().__init__()
         if is_deep:
+            # Tầng sâu (ảnh nhỏ) vẫn dùng Multi-scale bình thường
             self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
         else:
-            self.pfcu_dg = DualScale_PFCU_DG(in_c, act_type)
+            # [ABLATION]: Tầng nông dùng Straight 3x3 để ép giảm GFLOPs và VRAM
+            self.pfcu_dg = Straight3x3Block(in_c, act_type)
             
         self.down_pool = nn.MaxPool2d((2, 2))
         
@@ -172,7 +173,7 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER & BOTTLE-NECK 
+# 4. DECODER (ADDITIVE) & BOTTLE-NECK 
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
@@ -230,7 +231,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 
+# 5. MẠNG CHÍNH PICO-UNET V4
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -241,8 +242,11 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
+        # E1, E2 giờ đây sẽ dùng Straight3x3Block (Cực nhẹ, cực ít RAM)
         self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
         self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
+        
+        # E3, E4 giữ lại MultiScale vì ảnh đã nhỏ, MACs/RAM không còn là vấn đề
         self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
         self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
         
