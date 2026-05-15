@@ -27,10 +27,11 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE: ALL HARDSWISH ACCURACY ABLATION
-# - Thay thế toàn bộ ReLU6 bằng HardSwish ở nửa đầu của mạng (E1, E2).
-# - Mục đích: Test xem HSwish toàn mạng có mang lại đột phá về Accuracy bù lại FPS hay không.
+# PICO-UNET V4: BẢN BASELINE MỚI (MAX-128 + CONCAT)
+# ABLATION 11: ALL HARD-SWISH
+# - Áp dụng hàm kích hoạt Hard-Swish cho TẤT CẢ các tầng từ E1 đến Output.
+# - Mục tiêu: Tối đa hóa khả năng học phi tuyến tính (Non-linearity) để xem 
+#   mIOU có đột phá hay không, chấp nhận hy sinh FPS.
 # ==============================================================================
 
 # ==============================================================================
@@ -42,7 +43,7 @@ class ECABlock(nn.Module):
         mid_channels = max(8, channels // 4)
         self.conv = nn.Sequential(
             nn.Conv2d(channels, mid_channels, kernel_size=1, bias=False),
-            get_activation(act_type),
+            get_activation(act_type), # Sẽ nhận 'hswish'
             nn.Conv2d(mid_channels, channels, kernel_size=1, bias=False)
         )
         self.hardsigmoid = CustomHardsigmoid()
@@ -91,10 +92,10 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER (CHIA LÀM 2 LOẠI: DUAL-SCALE VÀ MULTI-SCALE)
+# 3. KHỐI ENCODER 
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
-    def __init__(self, dim, act_type='relu6'):
+    def __init__(self, dim, act_type='hswish'):
         super().__init__()
         self.dw_3x3 = SquareDW(dim)
         self.dw_5x5 = SquareDW(dim) 
@@ -130,7 +131,7 @@ class MultiScale_PFCU_DG(nn.Module):
         return self.act(fused + x)
 
 class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
+    def __init__(self, in_c, out_c, is_deep=False, act_type='hswish'):
         super().__init__()
         if is_deep:
             self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
@@ -165,21 +166,18 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK
+# 4. DECODER (CONCAT) & BOTTLE-NECK 
 # ==============================================================================
-class AdditiveDecoderBlock(nn.Module):
+class ConcatDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
         
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(skip_c)
-        )
+        concat_channels = in_c + skip_c
         
         gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
-            nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
+            nn.Conv2d(concat_channels, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
@@ -191,13 +189,14 @@ class AdditiveDecoderBlock(nn.Module):
         )
         
         self.shortcut = nn.Sequential(
-            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.Conv2d(concat_channels, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
         )
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        fused = self.proj(self.up(x)) + skip
+        up_feat = self.up(x)
+        fused = torch.cat([up_feat, skip], dim=1)
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
@@ -223,7 +222,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - ALL HARDSWISH ABLATION
+# 5. MẠNG CHÍNH PICO-UNET V4 
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -234,18 +233,18 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # [ABLATION] Thay đổi relu6 thành hswish ở E1, E2
-        self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='hswish')   
-        self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='hswish')   
-        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
-        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
+        # [ABLATION: TẤT CẢ CÁC TẦNG ĐỀU SỬ DỤNG HSWISH]
+        self.e1 = EncoderBlock(32, 64,   is_deep=False, act_type='hswish')   
+        self.e2 = EncoderBlock(64, 128,  is_deep=False, act_type='hswish')   
+        self.e3 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
+        self.e4 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
         
-        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
+        self.bottleneck = SerialMultiScaleBottleneck(128, act_type='hswish')
         
-        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        self.d4 = ConcatDecoderBlock(in_c=128, skip_c=128, out_c=128, act_type='hswish') 
+        self.d3 = ConcatDecoderBlock(in_c=128, skip_c=128, out_c=64,  act_type='hswish')  
+        self.d2 = ConcatDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = ConcatDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 

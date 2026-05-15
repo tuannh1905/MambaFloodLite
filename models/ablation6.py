@@ -27,10 +27,12 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE 6: FULL MULTI-SCALE ENCODER
-# - Khôi phục toàn bộ kiến trúc (Attention, Decoder, Fusion) về chuẩn Baseline.
-# - Bật is_deep=True cho toàn bộ Encoder (e1, e2, e3, e4) để dùng Multi-Scale.
+# PICO-UNET V4: BẢN BASELINE MỚI (MAX-128)
+# ABLATION 6: REPLACE CONCAT WITH ADD
+# - Giữ nguyên kiến trúc gọt kênh tối đa 128.
+# - Giữ nguyên ECABlock ở Decoder, KHÔNG có Attention ở Bottleneck.
+# - Đổi phép Fusion ở Decoder từ Concat sang Additive (Cộng).
+# - Mục đích: Tìm ra giới hạn tối ưu tuyệt đối về VRAM và MACs.
 # ==============================================================================
 
 # ==============================================================================
@@ -49,19 +51,6 @@ class ECABlock(nn.Module):
 
     def forward(self, x):
         y = F.adaptive_avg_pool2d(x, 1) 
-        y = self.hardsigmoid(self.conv(y))
-        return x * y
-
-class SpatialAttention_MCU(nn.Module):
-    def __init__(self, kernel_size=3):
-        super().__init__()
-        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2, bias=False)
-        self.hardsigmoid = CustomHardsigmoid()
-
-    def forward(self, x):
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        y = torch.cat([avg_out, max_out], dim=1) 
         y = self.hardsigmoid(self.conv(y))
         return x * y
 
@@ -91,7 +80,7 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER
+# 3. KHỐI ENCODER 
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
@@ -165,26 +154,30 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK
+# 4. DECODER (ADDITIVE) & BOTTLE-NECK (NO ATTENTION)
 # ==============================================================================
 class AdditiveDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
         
+        # Vì phép Add yêu cầu 2 Tensor phải cùng số kênh, 
+        # ta cần 1 lớp 1x1 Conv để ép in_c bằng với skip_c trước khi cộng.
         self.proj = nn.Sequential(
             nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(skip_c)
         )
         
         gc = max(out_c // 4, 4)
+        
+        # [ABLATION: Đầu vào của Refine giờ chỉ là skip_c, thay vì (in_c + skip_c) như Concat]
         self.refine = nn.Sequential(
             nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
             SquareDW(gc, kernel_size=5), 
-            ECABlock(gc, act_type), 
+            ECABlock(gc, act_type),  # Vẫn có Attention để gạn lọc
             
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
@@ -197,7 +190,9 @@ class AdditiveDecoderBlock(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        fused = self.proj(self.up(x)) + skip
+        up_feat = self.proj(self.up(x))
+        # [ABLATION: THAY CONCAT BẰNG ADD]
+        fused = up_feat + skip
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
@@ -206,9 +201,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         self.dw_3x3 = SquareDW(dim)
         self.dw_5x5 = SquareDW(dim) 
         self.dw_7x7 = SquareDW(dim) 
-        
-        self.channel_attn = ECABlock(dim, act_type)
-        self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
+        # Không Attention
 
     def forward(self, x):
         d1 = self.dw_3x3(x)        
@@ -216,14 +209,10 @@ class SerialMultiScaleBottleneck(nn.Module):
         d3 = self.dw_7x7(d2)        
         
         fused = d1 + d2 + d3
-        
-        out = self.channel_attn(fused)
-        out = self.spatial_attn(out)
-        
-        return x + out
+        return x + fused
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - CASE 6 ABLATION
+# 5. MẠNG CHÍNH PICO-UNET V4 
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -234,16 +223,16 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # [CASE 6: Đổi is_deep=True cho toàn bộ cấu trúc mạng Encoder]
-        self.e1 = EncoderBlock(32, 64,  is_deep=True, act_type='relu6')   
-        self.e2 = EncoderBlock(64, 128, is_deep=True, act_type='relu6')   
-        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
-        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
+        self.e1 = EncoderBlock(32, 64,   is_deep=False, act_type='relu6')   
+        self.e2 = EncoderBlock(64, 128,  is_deep=False, act_type='relu6')   
+        self.e3 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
+        self.e4 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
         
-        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
+        self.bottleneck = SerialMultiScaleBottleneck(128, act_type='hswish')
         
-        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
+        # [ABLATION: ADDITIVE DECODER]
+        self.d4 = AdditiveDecoderBlock(in_c=128, skip_c=128, out_c=128, act_type='hswish') 
+        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=128, out_c=64,  act_type='hswish')  
         self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
         self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
         

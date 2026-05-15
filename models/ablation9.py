@@ -27,10 +27,11 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE 9: SCALE DOWN CHANNELS
-# - Khôi phục toàn bộ kiến trúc lõi về chuẩn Baseline.
-# - Giảm số kênh từ (32, 64, 128, 192) xuống (16, 32, 64, 128).
+# PICO-UNET V4: BẢN BASELINE MỚI (MAX-128 + CONCAT)
+# ABLATION 9: BILINEAR UPSAMPLING
+# - Thay thế nn.Upsample(mode='nearest') bằng mode='bilinear', align_corners=False.
+# - Mục đích: So sánh chi phí phần cứng (Latency) và độ chính xác (mIOU) giữa 
+#   nội suy "nhân bản" (rẻ) và nội suy "làm mượt" (đắt).
 # ==============================================================================
 
 # ==============================================================================
@@ -66,7 +67,7 @@ class SpatialAttention_MCU(nn.Module):
         return x * y
 
 # ==============================================================================
-# 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE
+# 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE (ABLATION 9: BILINEAR)
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size=3):
@@ -78,10 +79,15 @@ class SquareDW(nn.Module):
     def forward(self, x):
         return self.bn(self.dw(x))
 
-class NearestUpsample(nn.Module):
+class BilinearUpsample(nn.Module):
+    """
+    Khối Upsample sử dụng Bilinear thay vì Nearest.
+    align_corners=False là best practice chuẩn của PyTorch cho bài toán Segmentation.
+    """
     def __init__(self, channels):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        # [ABLATION]: Chuyển đổi phương pháp nội suy
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.refine = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
             nn.BatchNorm2d(channels)
@@ -91,7 +97,7 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER (DUAL-SCALE VÀ MULTI-SCALE BÌNH THƯỜNG)
+# 3. KHỐI ENCODER 
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
@@ -165,21 +171,19 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK
+# 4. DECODER (DÙNG BILINEAR) & BOTTLE-NECK 
 # ==============================================================================
-class AdditiveDecoderBlock(nn.Module):
+class ConcatDecoderBlock(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
         super().__init__()
-        self.up = NearestUpsample(in_c)
+        # [ABLATION: Gọi BilinearUpsample]
+        self.up = BilinearUpsample(in_c)
         
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(skip_c)
-        )
+        concat_channels = in_c + skip_c
         
         gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
-            nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
+            nn.Conv2d(concat_channels, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
@@ -191,13 +195,14 @@ class AdditiveDecoderBlock(nn.Module):
         )
         
         self.shortcut = nn.Sequential(
-            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.Conv2d(concat_channels, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
         )
         self.act = get_activation(act_type)
 
     def forward(self, x, skip):
-        fused = self.proj(self.up(x)) + skip
+        up_feat = self.up(x)
+        fused = torch.cat([up_feat, skip], dim=1)
         return self.act(self.refine(fused) + self.shortcut(fused))
 
 class SerialMultiScaleBottleneck(nn.Module):
@@ -223,7 +228,7 @@ class SerialMultiScaleBottleneck(nn.Module):
         return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - CASE 9 ABLATION
+# 5. MẠNG CHÍNH PICO-UNET V4 
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -232,26 +237,21 @@ class PicoUNet_v4_Edge(nn.Module):
         if input_size % 16 != 0:
             raise ValueError(f"Input_size phải chia hết cho 16.")
 
-        # [CASE 9: Giảm kênh đầu vào từ 32 xuống 16]
-        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
+        self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # [CASE 9: Thay đổi toàn bộ số kênh ở cấu hình Encoder]
-        self.e1 = EncoderBlock(16, 32,  is_deep=False, act_type='relu6')   
-        self.e2 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
-        self.e3 = EncoderBlock(64, 128, is_deep=True, act_type='hswish') 
-        self.e4 = EncoderBlock(128, 128, is_deep=True, act_type='hswish') 
+        self.e1 = EncoderBlock(32, 64,   is_deep=False, act_type='relu6')   
+        self.e2 = EncoderBlock(64, 128,  is_deep=False, act_type='relu6')   
+        self.e3 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
+        self.e4 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
         
-        # [CASE 9: Giảm kênh Bottleneck xuống 128]
         self.bottleneck = SerialMultiScaleBottleneck(128, act_type='hswish')
         
-        # [CASE 9: Thay đổi cấu hình khớp nối của Decoder (Giảm một nửa)]
-        self.d4 = AdditiveDecoderBlock(in_c=128, skip_c=128, out_c=64, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32, act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16, act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=16,  skip_c=32,  out_c=8,  act_type='hswish')   
+        self.d4 = ConcatDecoderBlock(in_c=128, skip_c=128, out_c=128, act_type='hswish') 
+        self.d3 = ConcatDecoderBlock(in_c=128, skip_c=128, out_c=64,  act_type='hswish')  
+        self.d2 = ConcatDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
+        self.d1 = ConcatDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
         
-        # [CASE 9: Đầu ra giờ chỉ còn 8 kênh trước khi phân loại]
-        self.conv_out = nn.Conv2d(8, num_classes, kernel_size=1)
+        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)

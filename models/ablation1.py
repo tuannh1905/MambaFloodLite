@@ -27,14 +27,14 @@ def get_activation(act_type):
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4: BẢN "SMART MUSCLE" (~300K PARAMS - LOW FLOPS)
-# CASE 1: NO ATTENTION Ở BOTTLENECK
-# - Lược bỏ hoàn toàn Channel & Spatial Attention ở đáy mạng U-Net
+# PICO-UNET V4: BẢN BASELINE MỚI (MAX-128 + CONCAT)
+# ABLATION 1: NO SKIP CONNECTION
+# - Lược bỏ hoàn toàn các nhánh Skip Connection từ Encoder sang Decoder.
+# - Decoder bị "mù" không gian, chỉ có thể khôi phục ảnh từ đặc trưng ngữ nghĩa.
 # ==============================================================================
 
 # ==============================================================================
-# 1. ATTENTION MODULES 
-# (Vẫn giữ lại khai báo vì Decoder ở Case 1 vẫn dùng ECA)
+# 1. ATTENTION MODULES
 # ==============================================================================
 class ECABlock(nn.Module):
     def __init__(self, channels, act_type='hswish'):
@@ -48,7 +48,6 @@ class ECABlock(nn.Module):
         self.hardsigmoid = CustomHardsigmoid()
 
     def forward(self, x):
-        # VACCINE 2: Dùng AdaptiveAvgPool thay vì torch.mean
         y = F.adaptive_avg_pool2d(x, 1) 
         y = self.hardsigmoid(self.conv(y))
         return x * y
@@ -92,7 +91,7 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 3. KHỐI ENCODER (CHIA LÀM 2 LOẠI: DUAL-SCALE VÀ MULTI-SCALE)
+# 3. KHỐI ENCODER 
 # ==============================================================================
 class DualScale_PFCU_DG(nn.Module):
     def __init__(self, dim, act_type='relu6'):
@@ -166,40 +165,39 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (ADDITIVE) & BOTTLE-NECK [ĐÃ SỬA ĐỔI CHO CASE 1]
+# 4. DECODER (NO SKIP) & BOTTLE-NECK 
 # ==============================================================================
-class AdditiveDecoderBlock(nn.Module):
-    def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
+class NoSkipDecoderBlock(nn.Module):
+    def __init__(self, in_c, out_c, act_type='hswish'):
         super().__init__()
         self.up = NearestUpsample(in_c)
         
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_c, skip_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(skip_c)
-        )
-        
+        # [ABLATION: KHÔNG CÓ SKIP CONNECTION]
+        # Đầu vào của bộ Refine lúc này chỉ là in_c (từ tầng dưới nội suy lên)
         gc = max(out_c // 4, 4)
         self.refine = nn.Sequential(
-            nn.Conv2d(skip_c, gc, kernel_size=1, bias=False), 
+            nn.Conv2d(in_c, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
             
             SquareDW(gc, kernel_size=5), 
-            ECABlock(gc, act_type), 
+            ECABlock(gc, act_type),  
             
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
         )
         
         self.shortcut = nn.Sequential(
-            nn.Conv2d(skip_c, out_c, kernel_size=1, bias=False),
+            nn.Conv2d(in_c, out_c, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_c)
         )
         self.act = get_activation(act_type)
 
-    def forward(self, x, skip):
-        fused = self.proj(self.up(x)) + skip
-        return self.act(self.refine(fused) + self.shortcut(fused))
+    # Đã bỏ tham số `skip`
+    def forward(self, x):
+        up_feat = self.up(x)
+        # Chỉ xử lý nhánh Up, không có thao tác Concat hay Add nào cả
+        return self.act(self.refine(up_feat) + self.shortcut(up_feat))
 
 class SerialMultiScaleBottleneck(nn.Module):
     def __init__(self, dim, act_type='hswish'):
@@ -208,21 +206,23 @@ class SerialMultiScaleBottleneck(nn.Module):
         self.dw_5x5 = SquareDW(dim) 
         self.dw_7x7 = SquareDW(dim) 
         
-        # [CASE 1: ĐÃ XÓA CHANNEL_ATTN VÀ SPATIAL_ATTN]
+        self.channel_attn = ECABlock(dim, act_type)
+        self.spatial_attn = SpatialAttention_MCU(kernel_size=3)
 
     def forward(self, x):
         d1 = self.dw_3x3(x)        
         d2 = self.dw_5x5(d1)        
         d3 = self.dw_7x7(d2)        
         
-        # Chỉ giữ lại phần cộng d1 + d2 + d3
         fused = d1 + d2 + d3
         
-        # Trả về x + fused (bỏ qua bước chạy qua attn module)
-        return x + fused
+        out = self.channel_attn(fused)
+        out = self.spatial_attn(out)
+        
+        return x + out
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 (SMART MUSCLE) - CASE 1 ABLATION
+# 5. MẠNG CHÍNH PICO-UNET V4 (ABLATION: NO SKIP CONNECTION)
 # ==============================================================================
 class PicoUNet_v4_Edge(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -233,34 +233,38 @@ class PicoUNet_v4_Edge(nn.Module):
 
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        self.e1 = EncoderBlock(32, 64,  is_deep=False, act_type='relu6')   
-        self.e2 = EncoderBlock(64, 128, is_deep=False, act_type='relu6')   
-        self.e3 = EncoderBlock(128, 192, is_deep=True, act_type='hswish') 
-        self.e4 = EncoderBlock(192, 192, is_deep=True, act_type='hswish') 
+        # Encoder giữ nguyên kích thước kênh (Max 128)
+        self.e1 = EncoderBlock(32, 64,   is_deep=False, act_type='relu6')   
+        self.e2 = EncoderBlock(64, 128,  is_deep=False, act_type='relu6')   
+        self.e3 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
+        self.e4 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
         
-        self.bottleneck = SerialMultiScaleBottleneck(192, act_type='hswish')
+        self.bottleneck = SerialMultiScaleBottleneck(128, act_type='hswish')
         
-        self.d4 = AdditiveDecoderBlock(in_c=192, skip_c=192, out_c=128, act_type='hswish') 
-        self.d3 = AdditiveDecoderBlock(in_c=128, skip_c=192, out_c=64,  act_type='hswish')  
-        self.d2 = AdditiveDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = AdditiveDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        # [ABLATION: SỬ DỤNG DECODER KHÔNG NHẬN SKIP]
+        self.d4 = NoSkipDecoderBlock(in_c=128, out_c=128, act_type='hswish') 
+        self.d3 = NoSkipDecoderBlock(in_c=128, out_c=64,  act_type='hswish')  
+        self.d2 = NoSkipDecoderBlock(in_c=64,  out_c=32,  act_type='hswish')   
+        self.d1 = NoSkipDecoderBlock(in_c=32,  out_c=16,  act_type='hswish')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
         x = self.conv_in(x)
         
-        x, s1 = self.e1(x)
-        x, s2 = self.e2(x)
-        x, s3 = self.e3(x)
-        x, s4 = self.e4(x)
+        # Lấy Output (x) nhưng VỨT BỎ các Skip Tensor (s1, s2, s3, s4)
+        x, _ = self.e1(x)
+        x, _ = self.e2(x)
+        x, _ = self.e3(x)
+        x, _ = self.e4(x)
         
         x = self.bottleneck(x)
         
-        x = self.d4(x, s4)
-        x = self.d3(x, s3)
-        x = self.d2(x, s2)
-        x = self.d1(x, s1)
+        # Decoder đi thẳng một mạch từ dưới lên, không nhận nhánh rẽ
+        x = self.d4(x)
+        x = self.d3(x)
+        x = self.d2(x)
+        x = self.d1(x)
         
         return self.conv_out(x)
 
