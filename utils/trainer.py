@@ -1,8 +1,48 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
+# ==============================================================================
+# 1. HÀM TỰ SINH NHÃN VIỀN & CUSTOM BOUNDARY LOSS CHO MINILITEV11
+# ==============================================================================
+def extract_boundaries(masks, kernel_size=3):
+    """
+    Tự động trích xuất đường viền từ Segmentation Mask gốc (Morphological Gradient).
+    """
+    # Phình to mask
+    dilated = F.max_pool2d(masks, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+    # Co rút mask
+    eroded = -F.max_pool2d(-masks, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+    # Lấy phần rìa
+    boundary = dilated - eroded
+    # Ép về nhị phân cứng
+    boundary = (boundary > 0.5).float()
+    return boundary
+
+class BoundaryLoss(nn.Module):
+    def __init__(self, pos_weight_val=10.0, dice_weight=0.5):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val]))
+        self.dice_weight = dice_weight
+
+    def dice_loss(self, pred, target, smooth=1e-5):
+        pred = torch.sigmoid(pred)
+        intersection = (pred * target).sum(dim=(2, 3))
+        union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+        dice = (2. * intersection + smooth) / (union + smooth)
+        return 1.0 - dice.mean()
+
+    def forward(self, pred_boundary, gt_mask):
+        gt_boundary = extract_boundaries(gt_mask)
+        loss_bce = self.bce(pred_boundary, gt_boundary)
+        loss_dice = self.dice_loss(pred_boundary, gt_boundary)
+        return loss_bce + self.dice_weight * loss_dice
+
+# ==============================================================================
+# 2. SEED & TRAINER
+# ==============================================================================
 def set_seed(seed):
     import random
     import numpy as np
@@ -101,6 +141,14 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     
     best_val_loss = float('inf')
     
+    # -------------------------------------------------------------
+    # KHỞI TẠO BOUNDARY LOSS CHO MINILITEV11
+    # -------------------------------------------------------------
+    boundary_criterion = None
+    if 'minilitev11' in model_name.lower():
+        print(f"✓ Detected minilitev11: Initializing BoundaryLoss for Auxiliary Head")
+        boundary_criterion = BoundaryLoss(pos_weight_val=10.0, dice_weight=0.5).to(device)
+
     print(f"\n{'='*70}")
     print(f"TRAINING START - {epochs} EPOCHS")
     print(f"{'='*70}")
@@ -121,22 +169,25 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             outputs = model(images)
             
             # -------------------------------------------------------------
-            # KIỂM TRA MÔ HÌNH ĐỂ ĐẶT TRỌNG SỐ AUX (AUX_WEIGHT)
-            # - LiteV8: Dùng 1.0 để phạt gắt, ép học sâu.
-            # - BiSeNetV2 / Fast-SCNN: Giữ nguyên 0.4 (Tiêu chuẩn gốc).
+            # XỬ LÝ ĐA NHÁNH (AUXILIARY HEADS)
             # -------------------------------------------------------------
-            aux_weight = 1.0 if 'litev8' in model_name.lower() else 0.4
-            
-            # Xử lý thông minh: Chấp nhận mọi mô hình có từ 1 đến N nhánh Aux
-            if isinstance(outputs, tuple):
-                # 1. Nhánh chính luôn nằm ở index 0
+            if isinstance(outputs, (list, tuple)):
+                # 1. Tính loss cho nhánh chính (luôn nằm ở index 0)
                 loss = criterion(outputs[0], masks)
                 
-                # 2. Duyệt qua tất cả các nhánh Aux còn lại và cộng dồn Loss
-                for aux_out in outputs[1:]:
-                    loss += aux_weight * criterion(aux_out, masks)
+                # 2. Tính loss cho nhánh phụ
+                if 'minilitev11' in model_name.lower() and boundary_criterion is not None:
+                    # Chuyên biệt cho minilitev11: Dùng Boundary Loss ép học viền
+                    aux_weight = 0.4
+                    aux_loss = boundary_criterion(outputs[1], masks)
+                    loss += aux_weight * aux_loss
+                else:
+                    # Fallback cho các mạng khác (vd Fast-SCNN): Cùng dùng criterion chính
+                    aux_weight = 0.4
+                    for aux_out in outputs[1:]:
+                        loss += aux_weight * criterion(aux_out, masks)
             else:
-                # Fallback cho các mô hình bình thường không có nhánh Aux
+                # Các mô hình bình thường không có nhánh Aux
                 loss = criterion(outputs, masks)
             
             loss.backward()
@@ -157,6 +208,11 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
                 masks = masks.to(device, non_blocking=False)
                 
                 outputs = model(images)
+                
+                # Bảo vệ an toàn: Nếu mô hình vẫn trả về tuple lúc eval
+                if isinstance(outputs, (list, tuple)):
+                    outputs = outputs[0]
+                    
                 loss = criterion(outputs, masks)
                 val_loss += loss.item()
         
@@ -218,12 +274,14 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             masks = masks.to(device, non_blocking=False)
             
             outputs = model(images)
-            loss = criterion(outputs, masks)
-            test_loss += loss.item()
-            # --- Thêm 2 dòng bảo vệ này ---
+            
+            # --- Chốt bảo vệ (Safeguard) ---
             if isinstance(outputs, (list, tuple)):
                 outputs = outputs[0]  # Chỉ lấy tensor dự đoán chính
             # ------------------------------
+            
+            loss = criterion(outputs, masks)
+            test_loss += loss.item()
             
             if num_classes == 1:
                 preds = torch.sigmoid(outputs)
