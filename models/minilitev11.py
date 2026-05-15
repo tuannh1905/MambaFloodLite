@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 
+# 0. CUSTOM ACTIVATIONS CHO MCU
 # ==============================================================================
 def get_activation(act_type):
-    # Dùng ReLU6 cho toàn bộ để tối đa hóa FPS trên MCU
+    # Dùng ReLU6 cho toàn bộ để tối đa hóa FPS
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
@@ -40,8 +40,6 @@ class NearestUpsample(nn.Module):
 class Straight3x3Block(nn.Module):
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        # 3 lớp 3x3 nối tiếp nhau tạo ra trường nhìn (Receptive Field) 7x7 
-        # nhưng tuyệt đối không có sự phân nhánh Multi-scale
         self.dw1 = SquareDW(dim, kernel_size=3)
         self.dw2 = SquareDW(dim, kernel_size=3)
         self.dw3 = SquareDW(dim, kernel_size=3)
@@ -99,7 +97,6 @@ class ConcatDecoderBlock_NoAttn(nn.Module):
         concat_channels = in_c + skip_c
         gc = max(out_c // 4, 4)
         
-        # [LOẠI BỎ HOÀN TOÀN ECABlock]
         self.refine = nn.Sequential(
             nn.Conv2d(concat_channels, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
@@ -135,24 +132,22 @@ class SerialBottleneck_NoAttn(nn.Module):
         return x + fused
 
 # ==============================================================================
-# 4. MẠNG CHÍNH PICO-UNET-MICRO (CÓ AUXILIARY HEAD)
+# 4. MẠNG CHÍNH MINILITEV11 (CÓ AUXILIARY HEAD THÍCH ỨNG DYNAMIC SIZE)
 # ==============================================================================
-class PicoUNet_Micro_Aux(nn.Module):
+class MiniLiteV11(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
-        if input_size % 16 != 0:
-            raise ValueError("Input_size phải chia hết cho 16.")
-
+        # Không cần check bắt buộc input_size vì đã dùng Dynamic Interpolation
         self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         
-        # Encoder: Sử dụng Straight 3x3 Block
+        # Encoder
         self.e1 = EncoderBlock(32, 64,   act_type='relu6')   
         self.e2 = EncoderBlock(64, 128,  act_type='relu6')   
         self.e3 = EncoderBlock(128, 128, act_type='relu6') 
         self.e4 = EncoderBlock(128, 128, act_type='relu6') 
         
-        # Nhánh phụ (Auxiliary Head) chĩa ra từ E4 (kích thước H/16, W/16)
+        # Nhánh phụ (Auxiliary Head) chĩa ra từ E4
         aux_dim = 64
         self.aux_head = nn.Sequential(
             nn.Conv2d(128, aux_dim, kernel_size=3, padding=1, bias=False),
@@ -160,9 +155,9 @@ class PicoUNet_Micro_Aux(nn.Module):
             nn.ReLU6(inplace=True),
             nn.Conv2d(aux_dim, num_classes, kernel_size=1)
         )
-        self.aux_upsample = nn.Upsample(scale_factor=16, mode='bilinear', align_corners=False)
+        # BỎ LỚP UPSAMPLE CỨNG TẠI ĐÂY!
         
-        # Bottleneck & Decoder (Hoàn toàn không Attention)
+        # Bottleneck & Decoder 
         self.bottleneck = SerialBottleneck_NoAttn(128, act_type='relu6')
         
         self.d4 = ConcatDecoderBlock_NoAttn(in_c=128, skip_c=128, out_c=128, act_type='relu6') 
@@ -173,6 +168,9 @@ class PicoUNet_Micro_Aux(nn.Module):
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
+        # 1. Trích xuất kích thước ảnh gốc ngay từ đầu (vd: H=256, W=256)
+        input_shape = x.shape[2:] 
+
         x = self.conv_in(x)
         
         x, s1 = self.e1(x)
@@ -180,12 +178,15 @@ class PicoUNet_Micro_Aux(nn.Module):
         x, s3 = self.e3(x)
         x, s4 = self.e4(x)
         
-        # Tách nhánh Aux Head (Chỉ chạy khi đang Training)
+        # 2. Xử lý Aux Head (Chỉ kích hoạt lúc Train)
         aux_out = None
         if self.training:
+            # Sinh ra mask thu nhỏ từ s4
             aux_out = self.aux_head(s4)
-            aux_out = self.aux_upsample(aux_out)
+            # DYNAMIC INTERPOLATION: Phóng to bằng đúng kích thước gốc
+            aux_out = F.interpolate(aux_out, size=input_shape, mode='bilinear', align_corners=False)
         
+        # 3. Luồng chính tiếp tục
         x = self.bottleneck(x)
         
         x = self.d4(x, s4)
@@ -199,5 +200,6 @@ class PicoUNet_Micro_Aux(nn.Module):
             return main_out, aux_out
         return main_out
 
+# Hàm build chuẩn cho file get_model của bạn
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_Micro_Aux(num_classes=num_classes, input_size=input_size)
+    return MiniLiteV11(num_classes=num_classes, input_size=input_size)
