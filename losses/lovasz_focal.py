@@ -73,12 +73,14 @@ class LovaszHingeLoss(nn.Module):
 # 3. HÀM MAIN LOSS TỔNG HỢP 
 # ==============================================================================
 class MainLovaszFocalLoss(nn.Module):
-    def __init__(self, focal_weight=0.5, lovasz_weight=0.5):
+    def __init__(self, num_classes=1, focal_weight=0.5, lovasz_weight=0.5):
         """
+        num_classes: Truyền vào để đồng bộ format, thiết kế hiện tại dùng cho Binary (num_classes=1)
         focal_weight: Trọng số cho Focal Loss (trị nhiễu màu sắc)
         lovasz_weight: Trọng số cho Lovász Loss (nối liền các vũng nước)
         """
         super().__init__()
+        self.num_classes = num_classes
         self.focal = BinaryFocalLoss(alpha=0.5, gamma=2.0)
         self.lovasz = LovaszHingeLoss()
         self.fw = focal_weight
@@ -88,3 +90,10 @@ class MainLovaszFocalLoss(nn.Module):
         loss_focal = self.focal(logits, targets)
         loss_lovasz = self.lovasz(logits, targets)
         return self.fw * loss_focal + self.lw * loss_lovasz
+
+# ==============================================================================
+# 4. HÀM BUILD LOSS THEO FORMAT
+# ==============================================================================
+def build_loss(num_classes=1):
+    # Khởi tạo loss với trọng số mặc định là 50/50
+    return MainLovaszFocalLoss(num_classes=num_classes, focal_weight=0.5, lovasz_weight=0.5)
