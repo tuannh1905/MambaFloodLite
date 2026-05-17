@@ -3,46 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO ONNX OPSET 11 (VACCINE)
+# 0. CUSTOM ACTIVATIONS CHO MCU
 # ==============================================================================
-class CustomHardsigmoid(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.relu6 = nn.ReLU6(inplace=True)
-
-    def forward(self, x):
-        return self.relu6(x + 3.0) / 6.0
-
-class CustomHardswish(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.hardsigmoid = CustomHardsigmoid()
-
-    def forward(self, x):
-        return x * self.hardsigmoid(x)
-
 def get_activation(act_type):
-    if act_type == 'hswish':
-        return CustomHardswish()
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# PICO-UNET V4: BẢN BASELINE MỚI (MAX-128 + CONCAT)
-# ABLATION 3: NO ATTENTION ANYWHERE (NO DECODER ATTENTION)
-# - Giữ nguyên kiến trúc Concat ở Decoder.
-# - Loại bỏ ECABlock khỏi Decoder.
-# - Đáy mạng (Bottleneck) cũng KHÔNG CÓ Attention (thừa kế từ Ablation 2).
-# - Mục đích: Ép mạng trở thành một U-Net thuần túy, hoàn toàn không có cơ chế 
-#   đánh trọng số kênh (Channel Attention) để xem mAP sẽ tụt bao nhiêu.
-# ==============================================================================
-
-# ==============================================================================
-# 1. ATTENTION MODULES
-# (Đã bị loại bỏ khỏi kiến trúc, không còn sử dụng)
-# ==============================================================================
-
-# ==============================================================================
-# 2. KHỐI TÍCH CHẬP VÀ UPSAMPLE
+# 1. KHỐI TÍCH CHẬP, UPSAMPLE VÀ CBAM MODULE
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size=3):
@@ -66,53 +33,86 @@ class NearestUpsample(nn.Module):
     def forward(self, x):
         return self.refine(self.up(x))
 
+# --- CBAM: CHANNEL ATTENTION MODULE ---
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=4):
+        super().__init__()
+        mid_channels = max(4, channels // reduction)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # Dùng Conv2d 1x1 thay cho Linear để tương thích tốt với MCU
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, mid_channels, 1, bias=False),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(mid_channels, channels, 1, bias=False)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.mlp(self.avg_pool(x))
+        max_out = self.mlp(self.max_pool(x))
+        out = avg_out + max_out # Ép mạng học cả đặc trưng trung bình và đặc trưng gắt
+        return self.sigmoid(out)
+
+# --- CBAM: SPATIAL ATTENTION MODULE ---
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        padding = kernel_size // 2
+        # Nhận vào 2 kênh (1 kênh max, 1 kênh avg) và xuất ra 1 kênh attention map
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # Nén dọc theo trục channel
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv(x_cat)
+        return self.sigmoid(out)
+
+# --- CBAM TỔNG HỢP ---
+class CBAMModule(nn.Module):
+    def __init__(self, channels, reduction=4, spatial_kernel_size=7):
+        super().__init__()
+        self.ca = ChannelAttention(channels, reduction)
+        self.sa = SpatialAttention(spatial_kernel_size)
+
+    def forward(self, x):
+        x = x * self.ca(x) # 1. Chú ý Kênh (Cái gì quan trọng?)
+        x = x * self.sa(x) # 2. Chú ý Không gian (Nằm ở đâu?)
+        return x
+
 # ==============================================================================
-# 3. KHỐI ENCODER 
+# 2. ENCODER TỐI GIẢN (TÍCH HỢP CBAM)
 # ==============================================================================
-class DualScale_PFCU_DG(nn.Module):
+class Straight3x3Block_CBAM(nn.Module):
     def __init__(self, dim, act_type='relu6'):
         super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
+        self.dw1 = SquareDW(dim, kernel_size=3)
+        self.dw2 = SquareDW(dim, kernel_size=3)
+        self.dw3 = SquareDW(dim, kernel_size=3)
         
         self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
         self.bn_fuse = nn.BatchNorm2d(dim)
+        
+        self.cbam = CBAMModule(dim)
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        b3 = self.dw_3x3(x)        
-        b5 = self.dw_5x5(b3)        
+        out = self.dw1(x)        
+        out = self.dw2(out)        
+        out = self.dw3(out)        
         
-        fused = self.bn_fuse(self.pw_fuse(b3 + b5))
+        fused = self.bn_fuse(self.pw_fuse(out))
+        fused = self.cbam(fused) # Kích hoạt CBAM
         return self.act(fused + x)
 
-class MultiScale_PFCU_DG(nn.Module):
-    def __init__(self, dim, act_type='hswish'):
+class EncoderBlock_CBAM(nn.Module):
+    def __init__(self, in_c, out_c, act_type='relu6'):
         super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
-        self.dw_7x7 = SquareDW(dim) 
-        
-        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
-        self.act = get_activation(act_type)
-
-    def forward(self, x):
-        b3 = self.dw_3x3(x)        
-        b5 = self.dw_5x5(b3)        
-        b7 = self.dw_7x7(b5)        
-        
-        fused = self.bn_fuse(self.pw_fuse(b3 + b5 + b7))
-        return self.act(fused + x)
-
-class EncoderBlock(nn.Module):
-    def __init__(self, in_c, out_c, is_deep=False, act_type='relu6'):
-        super().__init__()
-        if is_deep:
-            self.pfcu_dg = MultiScale_PFCU_DG(in_c, act_type)
-        else:
-            self.pfcu_dg = DualScale_PFCU_DG(in_c, act_type)
-            
+        self.block = Straight3x3Block_CBAM(in_c, act_type)
         self.down_pool = nn.MaxPool2d((2, 2))
         
         self.same_channels = (in_c == out_c)
@@ -126,7 +126,7 @@ class EncoderBlock(nn.Module):
         self.act = get_activation(act_type)
 
     def forward(self, x):
-        feat = self.pfcu_dg(x)
+        feat = self.block(x)
         
         if self.same_channels:
             return self.act(self.down_pool(feat)), feat
@@ -141,27 +141,25 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 4. DECODER (CONCAT ONLY - NO ATTENTION) & BOTTLE-NECK (NO ATTENTION)
+# 3. DECODER & BOTTLE-NECK (TÍCH HỢP CBAM)
 # ==============================================================================
-class NoAttnConcatDecoderBlock(nn.Module):
-    def __init__(self, in_c, skip_c, out_c, act_type='hswish'):
+class ConcatDecoderBlock_CBAM(nn.Module):
+    def __init__(self, in_c, skip_c, out_c, act_type='relu6'):
         super().__init__()
         self.up = NearestUpsample(in_c)
-        
         concat_channels = in_c + skip_c
-        
         gc = max(out_c // 4, 4)
+        
         self.refine = nn.Sequential(
             nn.Conv2d(concat_channels, gc, kernel_size=1, bias=False), 
             nn.BatchNorm2d(gc), 
             get_activation(act_type),
-            
             SquareDW(gc, kernel_size=5), 
-            # [ABLATION: LƯỢC BỎ ECABlock(gc, act_type) Ở ĐÂY]
-            
             nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
             nn.BatchNorm2d(out_c)
         )
+        
+        self.cbam = CBAMModule(out_c)
         
         self.shortcut = nn.Sequential(
             nn.Conv2d(concat_channels, out_c, kernel_size=1, bias=False),
@@ -172,60 +170,75 @@ class NoAttnConcatDecoderBlock(nn.Module):
     def forward(self, x, skip):
         up_feat = self.up(x)
         fused = torch.cat([up_feat, skip], dim=1)
-        return self.act(self.refine(fused) + self.shortcut(fused))
-
-class SerialMultiScaleBottleneck(nn.Module):
-    def __init__(self, dim, act_type='hswish'):
-        super().__init__()
-        self.dw_3x3 = SquareDW(dim)
-        self.dw_5x5 = SquareDW(dim) 
-        self.dw_7x7 = SquareDW(dim) 
         
-        # [KẾ THỪA TỪ ABLATION 2: KHÔNG CÓ ATTENTION Ở ĐÁY]
+        refined = self.refine(fused)
+        refined = self.cbam(refined) # Kích hoạt CBAM
+        
+        return self.act(refined + self.shortcut(fused))
+
+class SerialBottleneck_CBAM(nn.Module):
+    def __init__(self, dim, act_type='relu6'):
+        super().__init__()
+        self.dw1 = SquareDW(dim, kernel_size=3)
+        self.dw2 = SquareDW(dim, kernel_size=3) 
+        self.dw3 = SquareDW(dim, kernel_size=3) 
+        self.cbam = CBAMModule(dim) 
 
     def forward(self, x):
-        d1 = self.dw_3x3(x)        
-        d2 = self.dw_5x5(d1)        
-        d3 = self.dw_7x7(d2)        
-        
+        d1 = self.dw1(x)        
+        d2 = self.dw2(d1)        
+        d3 = self.dw3(d2)        
         fused = d1 + d2 + d3
+        fused = self.cbam(fused)
         return x + fused
 
 # ==============================================================================
-# 5. MẠNG CHÍNH PICO-UNET V4 
+# 4. MẠNG ABLATION 3: MINILITEV11 + CBAM
 # ==============================================================================
-class PicoUNet_v4_Edge(nn.Module):
+class Ablation3_CBAM(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
-        if input_size % 16 != 0:
-            raise ValueError(f"Input_size phải chia hết cho 16.")
-
-        self.conv_in = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        # Phiên bản ép cân: 16 -> 32 -> 64 -> 128
+        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
         
-        self.e1 = EncoderBlock(32, 64,   is_deep=False, act_type='relu6')   
-        self.e2 = EncoderBlock(64, 128,  is_deep=False, act_type='relu6')   
-        self.e3 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
-        self.e4 = EncoderBlock(128, 128, is_deep=True,  act_type='hswish') 
+        self.e1 = EncoderBlock_CBAM(16, 32,   act_type='relu6')   
+        self.e2 = EncoderBlock_CBAM(32, 64,   act_type='relu6')   
+        self.e3 = EncoderBlock_CBAM(64, 128,  act_type='relu6') 
+        self.e4 = EncoderBlock_CBAM(128, 128, act_type='relu6') 
         
-        # Bottleneck (Max 128 channels, Không Attention)
-        self.bottleneck = SerialMultiScaleBottleneck(128, act_type='hswish')
+        # Nhánh phụ (Aux Head) - Kích thước 32
+        aux_dim = 32
+        self.aux_head = nn.Sequential(
+            nn.Conv2d(128, aux_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(aux_dim),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(aux_dim, num_classes, kernel_size=1)
+        )
         
-        # [ABLATION: DECODER CONCAT HOÀN TOÀN KHÔNG CÓ ATTENTION]
-        self.d4 = NoAttnConcatDecoderBlock(in_c=128, skip_c=128, out_c=128, act_type='hswish') 
-        self.d3 = NoAttnConcatDecoderBlock(in_c=128, skip_c=128, out_c=64,  act_type='hswish')  
-        self.d2 = NoAttnConcatDecoderBlock(in_c=64,  skip_c=128, out_c=32,  act_type='hswish')   
-        self.d1 = NoAttnConcatDecoderBlock(in_c=32,  skip_c=64,  out_c=16,  act_type='hswish')   
+        self.bottleneck = SerialBottleneck_CBAM(128, act_type='relu6')
+        
+        self.d4 = ConcatDecoderBlock_CBAM(in_c=128, skip_c=128, out_c=128, act_type='relu6') 
+        self.d3 = ConcatDecoderBlock_CBAM(in_c=128, skip_c=128, out_c=64,  act_type='relu6')  
+        self.d2 = ConcatDecoderBlock_CBAM(in_c=64,  skip_c=64,  out_c=32,  act_type='relu6')   
+        self.d1 = ConcatDecoderBlock_CBAM(in_c=32,  skip_c=32,  out_c=16,  act_type='relu6')   
         
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
+        input_shape = x.shape[2:] 
+
         x = self.conv_in(x)
         
         x, s1 = self.e1(x)
         x, s2 = self.e2(x)
         x, s3 = self.e3(x)
         x, s4 = self.e4(x)
+        
+        aux_out = None
+        if self.training:
+            aux_out = self.aux_head(s4)
+            aux_out = F.interpolate(aux_out, size=input_shape, mode='bilinear', align_corners=False)
         
         x = self.bottleneck(x)
         
@@ -234,7 +247,11 @@ class PicoUNet_v4_Edge(nn.Module):
         x = self.d2(x, s2)
         x = self.d1(x, s1)
         
-        return self.conv_out(x)
+        main_out = self.conv_out(x)
+        
+        if self.training:
+            return main_out, aux_out
+        return main_out
 
 def build_model(num_classes=1, input_size=128):
-    return PicoUNet_v4_Edge(num_classes=num_classes, input_size=input_size)
+    return Ablation3_CBAM(num_classes=num_classes, input_size=input_size)
