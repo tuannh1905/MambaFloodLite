@@ -169,25 +169,28 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             outputs = model(images)
             
             # -------------------------------------------------------------
-            # XỬ LÝ ĐA NHÁNH (AUXILIARY HEADS)
+            # XỬ LÝ ĐA NHÁNH (AUXILIARY HEADS / DEEP SUPERVISION)
             # -------------------------------------------------------------
             if isinstance(outputs, (list, tuple)):
                 # 1. Tính loss cho nhánh chính (luôn nằm ở index 0)
                 loss = criterion(outputs[0], masks)
                 
-                # 2. Tính loss cho nhánh phụ
-                if 'minilitev11' in model_name.lower() and boundary_criterion is not None:
-                    # Chuyên biệt cho minilitev11: Dùng Boundary Loss ép học viền
-                    aux_weight = 0.4
-                    aux_loss = boundary_criterion(outputs[1], masks)
-                    loss += aux_weight * aux_loss
+                # 2. Tính loss cho các nhánh phụ
+                if boundary_criterion is not None and ('minilitev11' in model_name.lower() or 'ablation16' in model_name.lower()):
+                    # Mức trọng số giảm dần cho các tầng nông hơn (E4: 0.4, E3: 0.3, E2: 0.2, E1: 0.1)
+                    aux_weights = [0.4, 0.3, 0.2, 0.1]
+                    
+                    # Duyệt qua các aux_out (từ outputs[1] trở đi)
+                    for i, aux_out in enumerate(outputs[1:]):
+                        # Lấy trọng số tương ứng (nếu mô hình chỉ có 1 aux thì lấy 0.4)
+                        weight = aux_weights[i] if i < len(aux_weights) else 0.1
+                        aux_loss = boundary_criterion(aux_out, masks)
+                        loss += weight * aux_loss
                 else:
-                    # Fallback cho các mạng khác (vd Fast-SCNN): Cùng dùng criterion chính
                     aux_weight = 0.4
                     for aux_out in outputs[1:]:
                         loss += aux_weight * criterion(aux_out, masks)
             else:
-                # Các mô hình bình thường không có nhánh Aux
                 loss = criterion(outputs, masks)
             
             loss.backward()

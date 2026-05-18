@@ -6,11 +6,10 @@ import torch.nn.functional as F
 # 0. CUSTOM ACTIVATIONS CHO MCU
 # ==============================================================================
 def get_activation(act_type):
-    # Dùng ReLU6 cho toàn bộ để tối đa hóa FPS
     return nn.ReLU6(inplace=True)
 
 # ==============================================================================
-# 1. KHỐI TÍCH CHẬP VÀ UPSAMPLE CƠ BẢN
+# 1. KHỐI TÍCH CHẬP VÀ UPSAMPLE
 # ==============================================================================
 class SquareDW(nn.Module):
     def __init__(self, dim, kernel_size=3):
@@ -35,7 +34,7 @@ class NearestUpsample(nn.Module):
         return self.refine(self.up(x))
 
 # ==============================================================================
-# 2. ENCODER TỐI GIẢN: CHỈ DÙNG 3 LỚP 3x3 NỐI TIẾP (KHÔNG MULTI-SCALE)
+# 2. ENCODER TỐI GIẢN
 # ==============================================================================
 class Straight3x3Block(nn.Module):
     def __init__(self, dim, act_type='relu6'):
@@ -88,7 +87,7 @@ class EncoderBlock(nn.Module):
             return out, skip
 
 # ==============================================================================
-# 3. DECODER & BOTTLE-NECK (KHÔNG ATTENTION)
+# 3. DECODER & BOTTLE-NECK
 # ==============================================================================
 class ConcatDecoderBlock_NoAttn(nn.Module):
     def __init__(self, in_c, skip_c, out_c, act_type='relu6'):
@@ -132,48 +131,42 @@ class SerialBottleneck_NoAttn(nn.Module):
         return x + fused
 
 # ==============================================================================
-# 4. MẠNG CHÍNH MINILITEV11 (PHIÊN BẢN ÉP CÂN: 16 -> 32 -> 64 -> 128)
+# 4. MẠNG ABLATION 16: DEEP SUPERVISION (AUX HEADS Ở TẤT CẢ CÁC TẦNG)
 # ==============================================================================
-class MiniLiteV11(nn.Module):
+class Ablation16_DeepSupervision(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
         super().__init__()
         
-        # Giảm số kênh đầu vào từ 32 xuống 16
         self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
         
-        # Encoder: Tiến trình 16 -> 32 -> 64 -> 128
-        self.e1 = EncoderBlock(16, 32,   act_type='relu6')   # skip 1 (s1): 32
-        self.e2 = EncoderBlock(32, 64,   act_type='relu6')   # skip 2 (s2): 64
-        self.e3 = EncoderBlock(64, 128,  act_type='relu6')   # skip 3 (s3): 128
-        self.e4 = EncoderBlock(128, 128, act_type='relu6')   # skip 4 (s4): 128
+        # Encoder 16 -> 32 -> 64 -> 128
+        self.e1 = EncoderBlock(16, 32,   act_type='relu6')   # skip 1: 32 channels
+        self.e2 = EncoderBlock(32, 64,   act_type='relu6')   # skip 2: 64 channels
+        self.e3 = EncoderBlock(64, 128,  act_type='relu6')   # skip 3: 128 channels
+        self.e4 = EncoderBlock(128, 128, act_type='relu6')   # skip 4: 128 channels
         
-        # Nhánh phụ (Auxiliary Head) chĩa ra từ E4
-        # Giảm aux_dim từ 64 xuống 32 cho đồng bộ độ nhẹ
-        aux_dim = 32
-        self.aux_head = nn.Sequential(
-            nn.Conv2d(128, aux_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(aux_dim),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(aux_dim, num_classes, kernel_size=1)
-        )
+        # --- KHỞI TẠO 4 AUX HEADS CHO 4 TẦNG ---
+        def create_aux_head(in_dim, aux_dim=32):
+            return nn.Sequential(
+                nn.Conv2d(in_dim, aux_dim, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(aux_dim),
+                nn.ReLU6(inplace=True),
+                nn.Conv2d(aux_dim, num_classes, kernel_size=1)
+            )
+            
+        self.aux_head1 = create_aux_head(in_dim=32)
+        self.aux_head2 = create_aux_head(in_dim=64)
+        self.aux_head3 = create_aux_head(in_dim=128)
+        self.aux_head4 = create_aux_head(in_dim=128)
+        # ----------------------------------------
         
-        # Bottleneck (Giữ nguyên 128 để duy trì khả năng trích xuất ngữ nghĩa sâu)
         self.bottleneck = SerialBottleneck_NoAttn(128, act_type='relu6')
         
-        # Decoder: Đối xứng hoàn hảo với Encoder
-        # D4: nhận 128 từ Bottleneck + 128 từ s4 -> xuất 128
         self.d4 = ConcatDecoderBlock_NoAttn(in_c=128, skip_c=128, out_c=128, act_type='relu6') 
-        
-        # D3: nhận 128 từ D4 + 128 từ s3 -> xuất 64 (giảm 1 nửa)
         self.d3 = ConcatDecoderBlock_NoAttn(in_c=128, skip_c=128, out_c=64,  act_type='relu6')  
-        
-        # D2: nhận 64 từ D3 + 64 từ s2 -> xuất 32 (giảm 1 nửa)
         self.d2 = ConcatDecoderBlock_NoAttn(in_c=64,  skip_c=64,  out_c=32,  act_type='relu6')   
-        
-        # D1: nhận 32 từ D2 + 32 từ s1 -> xuất 16 (giảm 1 nửa)
         self.d1 = ConcatDecoderBlock_NoAttn(in_c=32,  skip_c=32,  out_c=16,  act_type='relu6')   
         
-        # Output: 16 -> 1 (num_classes)
         self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
 
     def forward(self, x):
@@ -186,10 +179,23 @@ class MiniLiteV11(nn.Module):
         x, s3 = self.e3(x)
         x, s4 = self.e4(x)
         
-        aux_out = None
+        # --- TÍNH TOÁN 4 AUX OUTPUTS KHI TRAINING ---
+        aux_outputs = []
         if self.training:
-            aux_out = self.aux_head(s4)
-            aux_out = F.interpolate(aux_out, size=input_shape, mode='bilinear', align_corners=False)
+            a1 = self.aux_head1(s1)
+            a2 = self.aux_head2(s2)
+            a3 = self.aux_head3(s3)
+            a4 = self.aux_head4(s4)
+            
+            # Phóng to tất cả về kích thước gốc
+            a1 = F.interpolate(a1, size=input_shape, mode='bilinear', align_corners=False)
+            a2 = F.interpolate(a2, size=input_shape, mode='bilinear', align_corners=False)
+            a3 = F.interpolate(a3, size=input_shape, mode='bilinear', align_corners=False)
+            a4 = F.interpolate(a4, size=input_shape, mode='bilinear', align_corners=False)
+            
+            # Đóng gói thành tuple
+            aux_outputs = (a4, a3, a2, a1) # Sắp xếp từ tầng sâu nhất đến nông nhất
+        # ---------------------------------------------
         
         x = self.bottleneck(x)
         
@@ -201,9 +207,9 @@ class MiniLiteV11(nn.Module):
         main_out = self.conv_out(x)
         
         if self.training:
-            return main_out, aux_out
+            # Trả về main_out và cả 4 aux_out
+            return main_out, aux_outputs[0], aux_outputs[1], aux_outputs[2], aux_outputs[3]
         return main_out
 
-# Hàm build chuẩn cho file get_model của bạn
 def build_model(num_classes=1, input_size=128):
-    return MiniLiteV11(num_classes=num_classes, input_size=input_size)
+    return Ablation16_DeepSupervision(num_classes=num_classes, input_size=input_size)
