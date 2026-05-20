@@ -1,6 +1,7 @@
 from .bce import build_loss as build_bce
 from .dice import build_loss as build_dice
 from .bce_dice import build_loss as build_bce_dice
+from .boundary_loss import build_loss as build_BoundaryLoss
 from .lovasz_focal import build_loss as build_lovasz_focal
 import inspect
 
@@ -9,7 +10,8 @@ def get_loss(loss_name, num_classes=1):
         'bce': build_bce,
         'dice': build_dice,
         'bce_dice' : build_bce_dice,
-        'lovasz_focal': build_lovasz_focal
+        'lovasz_focal': build_lovasz_focal,
+        'boundary_loss': build_BoundaryLoss
     }
     
     if loss_name not in all_losses:

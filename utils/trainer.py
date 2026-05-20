@@ -1,47 +1,10 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from tqdm import tqdm
 
 # ==============================================================================
-# 1. HÀM TỰ SINH NHÃN VIỀN & CUSTOM BOUNDARY LOSS CHO MINILITEV11
-# ==============================================================================
-def extract_boundaries(masks, kernel_size=3):
-    """
-    Tự động trích xuất đường viền từ Segmentation Mask gốc (Morphological Gradient).
-    """
-    # Phình to mask
-    dilated = F.max_pool2d(masks, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-    # Co rút mask
-    eroded = -F.max_pool2d(-masks, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
-    # Lấy phần rìa
-    boundary = dilated - eroded
-    # Ép về nhị phân cứng
-    boundary = (boundary > 0.5).float()
-    return boundary
-
-class BoundaryLoss(nn.Module):
-    def __init__(self, pos_weight_val=10.0, dice_weight=0.5):
-        super().__init__()
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val]))
-        self.dice_weight = dice_weight
-
-    def dice_loss(self, pred, target, smooth=1e-5):
-        pred = torch.sigmoid(pred)
-        intersection = (pred * target).sum(dim=(2, 3))
-        union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
-        dice = (2. * intersection + smooth) / (union + smooth)
-        return 1.0 - dice.mean()
-
-    def forward(self, pred_boundary, gt_mask):
-        gt_boundary = extract_boundaries(gt_mask)
-        loss_bce = self.bce(pred_boundary, gt_boundary)
-        loss_dice = self.dice_loss(pred_boundary, gt_boundary)
-        return loss_bce + self.dice_weight * loss_dice
-
-# ==============================================================================
-# 2. SEED & TRAINER
+# SEED & TRAINER
 # ==============================================================================
 def set_seed(seed):
     import random
@@ -121,8 +84,10 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     
     set_seed(seed)
     
+    # Chỉ gọi hàm nhà máy (get_loss) từ module losses
     from losses import get_loss
 
+    # 1. Khởi tạo Main Loss (Loss chính) thông qua Factory
     criterion = get_loss(loss_name, num_classes=num_classes)
     
     optimizer = torch.optim.Adam(
@@ -132,7 +97,7 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     )
     
     print(f"✓ Optimizer: Adam (fused=False for determinism)")
-    print(f"✓ Loss: {loss_name}")
+    print(f"✓ Main Loss: {loss_name}")
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
@@ -142,12 +107,15 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     best_val_loss = float('inf')
     
     # -------------------------------------------------------------
-    # KHỞI TẠO BOUNDARY LOSS CHO MINILITEV11
+    # 2. Khởi tạo Aux Boundary Loss thông qua Factory
     # -------------------------------------------------------------
     boundary_criterion = None
-    if 'minilitev11' in model_name.lower():
-        print(f"✓ Detected minilitev11: Initializing BoundaryLoss for Auxiliary Head")
-        boundary_criterion = BoundaryLoss(pos_weight_val=10.0, dice_weight=0.5).to(device)
+    target_models = ['minilitev11', 'ablation16', 'ablation17', 'ablation18']
+    
+    if any(name in model_name.lower() for name in target_models):
+        print(f"✓ Detected Aux Head architecture: Initializing BoundaryLoss via Factory")
+        # Gọi qua nhà máy thay vì import class trực tiếp
+        boundary_criterion = get_loss('boundary_loss', num_classes=num_classes).to(device)
 
     print(f"\n{'='*70}")
     print(f"TRAINING START - {epochs} EPOCHS")
