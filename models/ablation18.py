@@ -2,12 +2,108 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# (Giữ nguyên các khối get_activation, SquareDW, NearestUpsample, Straight3x3Block, EncoderBlock, ConcatDecoderBlock, SerialBottleneck như bản Base)
+# ==============================================================================
+# 1. CÁC KHỐI CƠ BẢN (BASE BLOCKS)
+# ==============================================================================
+def get_activation(act_type):
+    return nn.ReLU6(inplace=True)
 
-# ... [BẠN DÁN CÁC KHỐI CƠ BẢN VÀO ĐÂY] ...
+class SquareDW(nn.Module):
+    def __init__(self, dim, kernel_size=3):
+        super().__init__()
+        self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=kernel_size//2, groups=dim, bias=False)
+        self.bn = nn.BatchNorm2d(dim)
+        
+    def forward(self, x): 
+        return self.bn(self.dw(x))
+
+class NearestUpsample(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='nearest')
+        self.refine = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels)
+        )
+        
+    def forward(self, x): 
+        return self.refine(self.up(x))
+
+class Straight3x3Block(nn.Module):
+    def __init__(self, dim, act_type='relu6'):
+        super().__init__()
+        self.dw1 = SquareDW(dim)
+        self.dw2 = SquareDW(dim)
+        self.dw3 = SquareDW(dim)
+        self.pw_fuse = nn.Conv2d(dim, dim, 1, bias=False)
+        self.bn_fuse = nn.BatchNorm2d(dim)
+        self.act = get_activation(act_type)
+        
+    def forward(self, x):
+        fused = self.bn_fuse(self.pw_fuse(self.dw3(self.dw2(self.dw1(x)))))
+        return self.act(fused + x)
+
+class EncoderBlock(nn.Module):
+    def __init__(self, in_c, out_c, act_type='relu6'):
+        super().__init__()
+        self.block = Straight3x3Block(in_c, act_type)
+        self.down_pool = nn.MaxPool2d((2, 2))
+        self.same_channels = (in_c == out_c)
+        
+        if not self.same_channels:
+            self.pw = nn.Sequential(nn.Conv2d(in_c, out_c - in_c, 1, bias=False), nn.BatchNorm2d(out_c - in_c))
+            self.down_pw = nn.MaxPool2d((2, 2))
+            
+        self.act = get_activation(act_type)
+        
+    def forward(self, x):
+        feat = self.block(x)
+        if self.same_channels: 
+            return self.act(self.down_pool(feat)), feat
+        else:
+            feat_pw = self.pw(feat)
+            skip = torch.cat([feat, feat_pw], dim=1)
+            out = self.act(torch.cat([self.down_pool(feat), self.down_pw(feat_pw)], dim=1))
+            return out, skip
+
+class ConcatDecoderBlock_NoAttn(nn.Module):
+    def __init__(self, in_c, skip_c, out_c, act_type='relu6'):
+        super().__init__()
+        self.up = NearestUpsample(in_c)
+        gc = max(out_c // 4, 4)
+        
+        self.refine = nn.Sequential(
+            nn.Conv2d(in_c + skip_c, gc, 1, bias=False), 
+            nn.BatchNorm2d(gc), 
+            get_activation(act_type), 
+            SquareDW(gc, 5), 
+            nn.Conv2d(gc, out_c, 1, bias=False), 
+            nn.BatchNorm2d(out_c)
+        )
+        
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_c + skip_c, out_c, 1, bias=False), 
+            nn.BatchNorm2d(out_c)
+        )
+        self.act = get_activation(act_type)
+        
+    def forward(self, x, skip):
+        fused = torch.cat([self.up(x), skip], dim=1)
+        return self.act(self.refine(fused) + self.shortcut(fused))
+
+class SerialBottleneck_NoAttn(nn.Module):
+    def __init__(self, dim, act_type='relu6'):
+        super().__init__()
+        self.dw1 = SquareDW(dim)
+        self.dw2 = SquareDW(dim)
+        self.dw3 = SquareDW(dim)
+        
+    def forward(self, x): 
+        return x + self.dw1(x) + self.dw2(self.dw1(x)) + self.dw3(self.dw2(self.dw1(x)))
+
 
 # ==============================================================================
-# 5. ABLATION 18: SHALLOW BOUNDARY-ONLY SUPERVISION (CHỈ DÙNG AUX Ở E2)
+# 2. ABLATION 18: SHALLOW BOUNDARY-ONLY SUPERVISION (CHỈ DÙNG AUX Ở E2)
 # ==============================================================================
 class Ablation18_ShallowAuxOnly(nn.Module):
     def __init__(self, num_classes=1, input_size=128):
@@ -67,5 +163,9 @@ class Ablation18_ShallowAuxOnly(nn.Module):
             return main_out, out_detail
         return main_out
 
+
 def build_model(num_classes=1, input_size=128):
+    """
+    Hàm gọi khởi tạo mô hình dùng cho file init của models/
+    """
     return Ablation18_ShallowAuxOnly(num_classes=num_classes, input_size=input_size)
