@@ -110,10 +110,11 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     # 2. Khởi tạo Aux Boundary Loss thông qua Factory
     # -------------------------------------------------------------
     boundary_criterion = None
-    target_models = ['minilitev11', 'ablation16', 'ablation17', 'ablation18']
+    # CHỈ CÓ Ablation 17 và 18 là có nhánh Aux ở E2 để học Viền
+    target_models = ['ablation17', 'ablation18']
     
     if any(name in model_name.lower() for name in target_models):
-        print(f"✓ Detected Aux Head architecture: Initializing BoundaryLoss via Factory")
+        print(f"✓ Detected Shallow Aux Head: Initializing BoundaryLoss via Factory")
         # Gọi qua nhà máy thay vì import class trực tiếp
         boundary_criterion = get_loss('boundary_loss', num_classes=num_classes).to(device)
 
@@ -143,11 +144,11 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
                 # 1. Tính loss cho nhánh chính (luôn nằm ở index 0)
                 loss = criterion(outputs[0], masks)
                 
-                # 2. Xử lý Ablation 17 (BiSeNet Style - 2 Aux)
+                # 2. Xử lý Ablation 17 (BiSeNet Style - 2 Aux: 1 Semantic, 1 Boundary)
                 if 'ablation17' in model_name.lower() and len(outputs) == 3:
-                    # outputs[1] là out_semantic từ E4 -> Semantic Loss
+                    # outputs[1] là out_semantic từ E4 -> Dùng Main Loss (Semantic)
                     loss += 0.4 * criterion(outputs[1], masks)
-                    # outputs[2] là out_detail từ E2 -> Boundary Loss
+                    # outputs[2] là out_detail từ E2 -> Dùng Boundary Loss
                     if boundary_criterion is not None:
                         loss += 0.4 * boundary_criterion(outputs[2], masks)
                     else:
@@ -155,20 +156,18 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
                         
                 # 3. Xử lý Ablation 18 (Shallow Aux Only - 1 Aux ở E2)
                 elif 'ablation18' in model_name.lower() and len(outputs) == 2:
-                    # outputs[1] là out_detail từ E2 -> Ép dùng Boundary Loss
+                    # outputs[1] là out_detail từ E2 -> Dùng Boundary Loss
                     if boundary_criterion is not None:
                         loss += 0.4 * boundary_criterion(outputs[1], masks)
                     else:
                         loss += 0.4 * criterion(outputs[1], masks)
                         
-                # 4. Xử lý MiniLiteV11 và các Ablation khác (1 Aux ở E4)
+                # 4. Xử lý MiniLiteV11 bản gốc và các mạng khác (Chỉ gom khối bằng Semantic Loss)
                 else:
                     aux_weight = 0.4
+                    # Mọi Aux ở tầng sâu đều dùng chung Main Loss để học ngữ nghĩa
                     for aux_out in outputs[1:]:
-                        if boundary_criterion is not None and 'minilitev11' in model_name.lower():
-                            loss += aux_weight * boundary_criterion(aux_out, masks)
-                        else:
-                            loss += aux_weight * criterion(aux_out, masks)
+                        loss += aux_weight * criterion(aux_out, masks)
             else:
                 loss = criterion(outputs, masks)
             
