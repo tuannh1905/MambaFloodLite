@@ -169,24 +169,31 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             outputs = model(images)
             
             # -------------------------------------------------------------
-            # XỬ LÝ ĐA NHÁNH (TASK-DECOUPLED DEEP SUPERVISION)
+            # XỬ LÝ ĐA NHÁNH (AUXILIARY HEADS / DEEP SUPERVISION)
             # -------------------------------------------------------------
             if isinstance(outputs, (list, tuple)):
-                # 1. Nhánh chính (Index 0): Dùng Loss tổng hợp (hoặc Lovasz nếu có)
+                # 1. Tính loss cho nhánh chính (luôn nằm ở index 0)
                 loss = criterion(outputs[0], masks)
                 
-                # 2. Xử lý Ablation 17 (BiSeNet Style)
+                # 2. Xử lý Ablation 17 (BiSeNet Style - 2 Aux)
                 if 'ablation17' in model_name.lower() and len(outputs) == 3:
-                    # outputs[1] là out_semantic từ E4 -> Dùng Loss ngữ nghĩa chuẩn (criterion)
+                    # outputs[1] là out_semantic từ E4 -> Semantic Loss
                     loss += 0.4 * criterion(outputs[1], masks)
-                    
-                    # outputs[2] là out_detail từ E2 -> Dùng Boundary Loss chuyên biệt
+                    # outputs[2] là out_detail từ E2 -> Boundary Loss
                     if boundary_criterion is not None:
                         loss += 0.4 * boundary_criterion(outputs[2], masks)
                     else:
                         loss += 0.4 * criterion(outputs[2], masks)
                         
-                # 3. Xử lý các mô hình có Aux cũ (MiniLiteV11)
+                # 3. Xử lý Ablation 18 (Shallow Aux Only - 1 Aux ở E2)
+                elif 'ablation18' in model_name.lower() and len(outputs) == 2:
+                    # outputs[1] là out_detail từ E2 -> Ép dùng Boundary Loss
+                    if boundary_criterion is not None:
+                        loss += 0.4 * boundary_criterion(outputs[1], masks)
+                    else:
+                        loss += 0.4 * criterion(outputs[1], masks)
+                        
+                # 4. Xử lý MiniLiteV11 và các Ablation khác (1 Aux ở E4)
                 else:
                     aux_weight = 0.4
                     for aux_out in outputs[1:]:
