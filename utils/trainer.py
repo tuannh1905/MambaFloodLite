@@ -1,10 +1,47 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 # ==============================================================================
-# SEED & TRAINER
+# 1. HÀM TỰ SINH NHÃN VIỀN & CUSTOM BOUNDARY LOSS CHO MINILITEV11
+# ==============================================================================
+def extract_boundaries(masks, kernel_size=3):
+    """
+    Tự động trích xuất đường viền từ Segmentation Mask gốc (Morphological Gradient).
+    """
+    # Phình to mask
+    dilated = F.max_pool2d(masks, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+    # Co rút mask
+    eroded = -F.max_pool2d(-masks, kernel_size=kernel_size, stride=1, padding=kernel_size//2)
+    # Lấy phần rìa
+    boundary = dilated - eroded
+    # Ép về nhị phân cứng
+    boundary = (boundary > 0.5).float()
+    return boundary
+
+class BoundaryLoss(nn.Module):
+    def __init__(self, pos_weight_val=10.0, dice_weight=0.5):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight_val]))
+        self.dice_weight = dice_weight
+
+    def dice_loss(self, pred, target, smooth=1e-5):
+        pred = torch.sigmoid(pred)
+        intersection = (pred * target).sum(dim=(2, 3))
+        union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+        dice = (2. * intersection + smooth) / (union + smooth)
+        return 1.0 - dice.mean()
+
+    def forward(self, pred_boundary, gt_mask):
+        gt_boundary = extract_boundaries(gt_mask)
+        loss_bce = self.bce(pred_boundary, gt_boundary)
+        loss_dice = self.dice_loss(pred_boundary, gt_boundary)
+        return loss_bce + self.dice_weight * loss_dice
+
+# ==============================================================================
+# 2. SEED & TRAINER
 # ==============================================================================
 def set_seed(seed):
     import random
@@ -84,10 +121,8 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     
     set_seed(seed)
     
-    # Chỉ gọi hàm nhà máy (get_loss) từ module losses
     from losses import get_loss
 
-    # 1. Khởi tạo Main Loss (Loss chính) thông qua Factory
     criterion = get_loss(loss_name, num_classes=num_classes)
     
     optimizer = torch.optim.Adam(
@@ -97,7 +132,6 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     )
     
     print(f"✓ Optimizer: Adam (fused=False for determinism)")
-    print(f"✓ Main Loss: {loss_name}")
     
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
@@ -107,16 +141,31 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     best_val_loss = float('inf')
     
     # -------------------------------------------------------------
-    # 2. Khởi tạo Aux Boundary Loss thông qua Factory
+    # KHỞI TẠO BOUNDARY LOSS CHO MINILITEV11
     # -------------------------------------------------------------
     boundary_criterion = None
-    # CHỈ CÓ Ablation 17 và 18 là có nhánh Aux ở E2 để học Viền
-    target_models = ['ablation17', 'ablation18']
+    if 'minilitev11' in model_name.lower():
+        boundary_criterion = BoundaryLoss(pos_weight_val=10.0, dice_weight=0.5).to(device)
+
+    # =============================================================
+    # 🔍 BẢNG THEO DÕI LOSS (XÁC NHẬN CHÍNH XÁC ĐANG DÙNG GÌ)
+    # =============================================================
+    print(f"\n{'='*70}")
+    print("🔍 BẢNG THEO DÕI LOSS (LOSS CONFIGURATION LOGGER)")
+    print(f"{'='*70}")
+    print(f"🎯 Nhánh chính (Main Loss) : {loss_name.upper()}")
     
-    if any(name in model_name.lower() for name in target_models):
-        print(f"✓ Detected Shallow Aux Head: Initializing BoundaryLoss via Factory")
-        # Gọi qua nhà máy thay vì import class trực tiếp
-        boundary_criterion = get_loss('boundary_loss', num_classes=num_classes).to(device)
+    if 'minilitev11' in model_name.lower() and boundary_criterion is not None:
+        print(f"🎯 Nhánh phụ (Aux - E4)    : CUSTOM BOUNDARY LOSS (Đã khởi tạo!)")
+        print(f"   + Trọng số (Aux Weight) : 0.4 (Ép học viền tại E4)")
+    elif 'litev8' in model_name.lower():
+        print(f"🎯 Nhánh phụ (Aux Loss)    : Dùng chung {loss_name.upper()}")
+        print(f"   + Trọng số (Aux Weight) : 1.0 (Phạt gắt cho LiteV8)")
+    else:
+        print(f"🎯 Nhánh phụ (Aux Loss)    : Dùng chung {loss_name.upper()}")
+        print(f"   + Trọng số (Aux Weight) : 0.4 (Tiêu chuẩn)")
+    print(f"{'='*70}\n")
+    # =============================================================
 
     print(f"\n{'='*70}")
     print(f"TRAINING START - {epochs} EPOCHS")
@@ -138,37 +187,30 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             outputs = model(images)
             
             # -------------------------------------------------------------
-            # XỬ LÝ ĐA NHÁNH (AUXILIARY HEADS / DEEP SUPERVISION)
+            # KIỂM TRA MÔ HÌNH ĐỂ ĐẶT TRỌNG SỐ AUX (AUX_WEIGHT)
+            # - LiteV8: Dùng 1.0 để phạt gắt, ép học sâu.
+            # - BiSeNetV2 / Fast-SCNN: Giữ nguyên 0.4 (Tiêu chuẩn gốc).
+            # XỬ LÝ ĐA NHÁNH (AUXILIARY HEADS)
             # -------------------------------------------------------------
+            aux_weight = 1.0 if 'litev8' in model_name.lower() else 0.4
+            
+            # Xử lý thông minh: Chấp nhận mọi mô hình có từ 1 đến N nhánh Aux
             if isinstance(outputs, (list, tuple)):
                 # 1. Tính loss cho nhánh chính (luôn nằm ở index 0)
                 loss = criterion(outputs[0], masks)
                 
-                # 2. Xử lý Ablation 17 (BiSeNet Style - 2 Aux: 1 Semantic, 1 Boundary)
-                if 'ablation17' in model_name.lower() and len(outputs) == 3:
-                    # outputs[1] là out_semantic từ E4 -> Dùng Main Loss (Semantic)
-                    loss += 0.4 * criterion(outputs[1], masks)
-                    # outputs[2] là out_detail từ E2 -> Dùng Boundary Loss
-                    if boundary_criterion is not None:
-                        loss += 0.4 * boundary_criterion(outputs[2], masks)
-                    else:
-                        loss += 0.4 * criterion(outputs[2], masks)
-                        
-                # 3. Xử lý Ablation 18 (Shallow Aux Only - 1 Aux ở E2)
-                elif 'ablation18' in model_name.lower() and len(outputs) == 2:
-                    # outputs[1] là out_detail từ E2 -> Dùng Boundary Loss
-                    if boundary_criterion is not None:
-                        loss += 0.4 * boundary_criterion(outputs[1], masks)
-                    else:
-                        loss += 0.4 * criterion(outputs[1], masks)
-                        
-                # 4. Xử lý MiniLiteV11 bản gốc và các mạng khác (Chỉ gom khối bằng Semantic Loss)
-                else:
+                # 2. Tính loss cho nhánh phụ
+                if 'minilitev11' in model_name.lower() and boundary_criterion is not None:
+                    # Chuyên biệt cho minilitev11: Dùng Boundary Loss ép học viền
                     aux_weight = 0.4
-                    # Mọi Aux ở tầng sâu đều dùng chung Main Loss để học ngữ nghĩa
+                    aux_loss = boundary_criterion(outputs[1], masks)
+                    loss += aux_weight * aux_loss
+                else:
+                    # Fallback cho các mạng khác (vd Fast-SCNN, LiteV8): Cùng dùng criterion chính
                     for aux_out in outputs[1:]:
                         loss += aux_weight * criterion(aux_out, masks)
             else:
+                # Các mô hình bình thường không có nhánh Aux
                 loss = criterion(outputs, masks)
             
             loss.backward()
