@@ -1,36 +1,31 @@
-from .bce import build_loss as build_bce
-from .dice import build_loss as build_dice
-from .bce_dice import build_loss as build_bce_dice
-from .boundary_loss import build_loss as build_BoundaryLoss
+from .bce          import build_loss as build_bce
+from .dice         import build_loss as build_dice
+from .focal        import build_loss as build_focal
+from .tversky      import build_loss as build_tversky
+from .lovasz       import build_loss as build_lovasz
 from .lovasz_focal import build_loss as build_lovasz_focal
 import inspect
 
 def get_loss(loss_name, num_classes=1):
     all_losses = {
-        'bce': build_bce,
-        'dice': build_dice,
-        'bce_dice' : build_bce_dice,
-        'lovasz_focal': build_lovasz_focal,
-        'boundary_loss': build_BoundaryLoss
+        'bce':          build_bce,
+        'dice':         build_dice,
+        'focal':        build_focal,
+        'tversky':      build_tversky,
+        'lovasz':       build_lovasz,         # ← standalone Lovász-Hinge
+        'lovasz_focal': build_lovasz_focal,   # ← Focal + Lovász hybrid
     }
-    
+
     if loss_name not in all_losses:
-        raise ValueError(f"Unknown loss: {loss_name}. Available: {list(all_losses.keys())}")
-    
-    if num_classes == 1:
-        print(f"✓ Using {loss_name.upper()} for BINARY")
-    else:
-        if loss_name == 'bce':
-            print("⚠️  Warning: BCE loss với multi-class - recommend CE/Dice")
-        print(f"✓ Using {loss_name.upper()} for {num_classes}-class")
-    
-    # Check if build_loss accepts num_classes
+        raise ValueError(
+            f"Unknown loss: '{loss_name}'. "
+            f"Available: {list(all_losses.keys())}"
+        )
+
+    tag = "BINARY" if num_classes == 1 else f"{num_classes}-class"
+    print(f"✓ Using {loss_name.upper()} for {tag}")
+
     build_fn = all_losses[loss_name]
-    sig = inspect.signature(build_fn)
-    
-    if 'num_classes' in sig.parameters:
+    if 'num_classes' in inspect.signature(build_fn).parameters:
         return build_fn(num_classes=num_classes)
-    else:
-        # Backward compatibility: loss cũ không có num_classes param
-        print(f"⚠️  {loss_name} không hỗ trợ num_classes, dùng default")
-        return build_fn()
+    return build_fn()
