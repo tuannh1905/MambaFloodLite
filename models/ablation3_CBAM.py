@@ -2,256 +2,195 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO MCU
-# ==============================================================================
-def get_activation(act_type):
-    return nn.ReLU6(inplace=True)
+from fsenet import DepthwiseConvBN, NearestUpsampleRefine, AuxiliaryBoundaryHead
 
-# ==============================================================================
-# 1. KHỐI TÍCH CHẬP, UPSAMPLE VÀ CBAM MODULE
-# ==============================================================================
-class SquareDW(nn.Module):
-    def __init__(self, dim, kernel_size=3):
-        super().__init__()
-        padding = kernel_size // 2
-        self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim)
 
-    def forward(self, x):
-        return self.bn(self.dw(x))
-
-class NearestUpsample(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='nearest')
-        self.refine = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels)
-        )
-
-    def forward(self, x):
-        return self.refine(self.up(x))
-
-# --- CBAM: CHANNEL ATTENTION MODULE ---
 class ChannelAttention(nn.Module):
-    def __init__(self, channels, reduction=4):
+    def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
-        mid_channels = max(4, channels // reduction)
+        hidden_channels = max(4, channels // reduction)
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
-        
-        # Dùng Conv2d 1x1 thay cho Linear để tương thích tốt với MCU
         self.mlp = nn.Sequential(
-            nn.Conv2d(channels, mid_channels, 1, bias=False),
+            nn.Conv2d(channels, hidden_channels, kernel_size=1, bias=False),
             nn.ReLU6(inplace=True),
-            nn.Conv2d(mid_channels, channels, 1, bias=False)
+            nn.Conv2d(hidden_channels, channels, kernel_size=1, bias=False),
         )
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        avg_out = self.mlp(self.avg_pool(x))
-        max_out = self.mlp(self.max_pool(x))
-        out = avg_out + max_out # Ép mạng học cả đặc trưng trung bình và đặc trưng gắt
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.mlp(self.avg_pool(x)) + self.mlp(self.max_pool(x))
         return self.sigmoid(out)
 
-# --- CBAM: SPATIAL ATTENTION MODULE ---
+
 class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
+    def __init__(self, kernel_size: int = 7):
         super().__init__()
-        padding = kernel_size // 2
-        # Nhận vào 2 kênh (1 kênh max, 1 kênh avg) và xuất ra 1 kênh attention map
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        # Nén dọc theo trục channel
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x_cat = torch.cat([avg_out, max_out], dim=1)
-        out = self.conv(x_cat)
+        out = self.conv(torch.cat([avg_out, max_out], dim=1))
         return self.sigmoid(out)
 
-# --- CBAM TỔNG HỢP ---
-class CBAMModule(nn.Module):
-    def __init__(self, channels, reduction=4, spatial_kernel_size=7):
-        super().__init__()
-        self.ca = ChannelAttention(channels, reduction)
-        self.sa = SpatialAttention(spatial_kernel_size)
 
-    def forward(self, x):
-        x = x * self.ca(x) # 1. Chú ý Kênh (Cái gì quan trọng?)
-        x = x * self.sa(x) # 2. Chú ý Không gian (Nằm ở đâu?)
+class CBAMModule(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4, spatial_kernel_size: int = 7):
+        super().__init__()
+        self.channel_attention = ChannelAttention(channels, reduction)
+        self.spatial_attention = SpatialAttention(spatial_kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x * self.channel_attention(x)
+        x = x * self.spatial_attention(x)
         return x
 
-# ==============================================================================
-# 2. ENCODER TỐI GIẢN (TÍCH HỢP CBAM)
-# ==============================================================================
-class Straight3x3Block_CBAM(nn.Module):
-    def __init__(self, dim, act_type='relu6'):
-        super().__init__()
-        self.dw1 = SquareDW(dim, kernel_size=3)
-        self.dw2 = SquareDW(dim, kernel_size=3)
-        self.dw3 = SquareDW(dim, kernel_size=3)
-        
-        self.pw_fuse = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
-        
-        self.cbam = CBAMModule(dim)
-        self.act = get_activation(act_type)
 
-    def forward(self, x):
-        out = self.dw1(x)        
-        out = self.dw2(out)        
-        out = self.dw3(out)        
-        
-        fused = self.bn_fuse(self.pw_fuse(out))
-        fused = self.cbam(fused) # Kích hoạt CBAM
-        return self.act(fused + x)
-
-class EncoderBlock_CBAM(nn.Module):
-    def __init__(self, in_c, out_c, act_type='relu6'):
+class SerialDepthwiseBlockCBAM(nn.Module):
+    def __init__(self, channels: int):
         super().__init__()
-        self.block = Straight3x3Block_CBAM(in_c, act_type)
-        self.down_pool = nn.MaxPool2d((2, 2))
-        
-        self.same_channels = (in_c == out_c)
-        if not self.same_channels:
-            self.pw = nn.Sequential(
-                nn.Conv2d(in_c, out_c - in_c, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_c - in_c)
+        self.dw1 = DepthwiseConvBN(channels, kernel_size=3)
+        self.dw2 = DepthwiseConvBN(channels, kernel_size=3)
+        self.dw3 = DepthwiseConvBN(channels, kernel_size=3)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.cbam = CBAMModule(channels)
+        self.act = nn.ReLU6(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.dw1(x)
+        out = self.dw2(out)
+        out = self.dw3(out)
+        out = self.fuse(out)
+        out = self.cbam(out)
+        return self.act(out + x)
+
+
+class EncoderStageCBAM(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.block = SerialDepthwiseBlockCBAM(in_channels)
+        self.pool = nn.MaxPool2d(kernel_size=2)
+        self.act = nn.ReLU6(inplace=True)
+
+        self.channels_match = in_channels == out_channels
+        if not self.channels_match:
+            extra_channels = out_channels - in_channels
+            self.expand = nn.Sequential(
+                nn.Conv2d(in_channels, extra_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(extra_channels),
             )
-            self.down_pw = nn.MaxPool2d((2, 2))
-            
-        self.act = get_activation(act_type)
+            self.expand_pool = nn.MaxPool2d(kernel_size=2)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.block(x)
-        
-        if self.same_channels:
-            return self.act(self.down_pool(feat)), feat
-        else:
-            feat_pw = self.pw(feat)
-            skip = torch.cat([feat, feat_pw], dim=1)
-            
-            pool_feat = self.down_pool(feat)
-            pool_pw   = self.down_pw(feat_pw)
-            
-            out = self.act(torch.cat([pool_feat, pool_pw], dim=1))
-            return out, skip
 
-# ==============================================================================
-# 3. DECODER & BOTTLE-NECK (TÍCH HỢP CBAM)
-# ==============================================================================
-class ConcatDecoderBlock_CBAM(nn.Module):
-    def __init__(self, in_c, skip_c, out_c, act_type='relu6'):
+        if self.channels_match:
+            return self.act(self.pool(feat)), feat
+
+        extra_feat = self.expand(feat)
+        skip = torch.cat([feat, extra_feat], dim=1)
+        out = self.act(torch.cat([self.pool(feat), self.expand_pool(extra_feat)], dim=1))
+        return out, skip
+
+
+class SerialBottleneckCBAM(nn.Module):
+    def __init__(self, channels: int):
         super().__init__()
-        self.up = NearestUpsample(in_c)
-        concat_channels = in_c + skip_c
-        gc = max(out_c // 4, 4)
-        
-        self.refine = nn.Sequential(
-            nn.Conv2d(concat_channels, gc, kernel_size=1, bias=False), 
-            nn.BatchNorm2d(gc), 
-            get_activation(act_type),
-            SquareDW(gc, kernel_size=5), 
-            nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
-            nn.BatchNorm2d(out_c)
-        )
-        
-        self.cbam = CBAMModule(out_c)
-        
-        self.shortcut = nn.Sequential(
-            nn.Conv2d(concat_channels, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c)
-        )
-        self.act = get_activation(act_type)
+        self.dw1 = DepthwiseConvBN(channels, kernel_size=3)
+        self.dw2 = DepthwiseConvBN(channels, kernel_size=3)
+        self.dw3 = DepthwiseConvBN(channels, kernel_size=3)
+        self.cbam = CBAMModule(channels)
 
-    def forward(self, x, skip):
-        up_feat = self.up(x)
-        fused = torch.cat([up_feat, skip], dim=1)
-        
-        refined = self.refine(fused)
-        refined = self.cbam(refined) # Kích hoạt CBAM
-        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        d1 = self.dw1(x)
+        d2 = self.dw2(d1)
+        d3 = self.dw3(d2)
+        return x + self.cbam(d1 + d2 + d3)
+
+
+class DecoderStageCBAM(nn.Module):
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
+        super().__init__()
+        self.upsample = NearestUpsampleRefine(in_channels)
+
+        concat_channels = in_channels + skip_channels
+        hidden_channels = max(out_channels // 4, 4)
+
+        self.refine = nn.Sequential(
+            nn.Conv2d(concat_channels, hidden_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU6(inplace=True),
+            DepthwiseConvBN(hidden_channels, kernel_size=5),
+            nn.Conv2d(hidden_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+        self.cbam = CBAMModule(out_channels)
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(concat_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+        self.act = nn.ReLU6(inplace=True)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        fused = torch.cat([self.upsample(x), skip], dim=1)
+        refined = self.cbam(self.refine(fused))
         return self.act(refined + self.shortcut(fused))
 
-class SerialBottleneck_CBAM(nn.Module):
-    def __init__(self, dim, act_type='relu6'):
+
+class FSENetCBAM(nn.Module):
+    # Ablation 3: FSENet + CBAM (channel + spatial attention) on every stage.
+    # Uses a narrower channel schedule (16-32-64-128) than base FSENet (32-64-128-128).
+    ENCODER_CHANNELS = (16, 32, 64, 128, 128)  # stem, e1, e2, e3, e4
+    DECODER_CHANNELS = (128, 64, 32, 16)       # d4, d3, d2, d1
+
+    def __init__(self, num_classes: int = 1, aux_hidden_channels: int = 32):
         super().__init__()
-        self.dw1 = SquareDW(dim, kernel_size=3)
-        self.dw2 = SquareDW(dim, kernel_size=3) 
-        self.dw3 = SquareDW(dim, kernel_size=3) 
-        self.cbam = CBAMModule(dim) 
+        c_stem, c1, c2, c3, c4 = self.ENCODER_CHANNELS
 
-    def forward(self, x):
-        d1 = self.dw1(x)        
-        d2 = self.dw2(d1)        
-        d3 = self.dw3(d2)        
-        fused = d1 + d2 + d3
-        fused = self.cbam(fused)
-        return x + fused
+        self.stem = nn.Conv2d(3, c_stem, kernel_size=3, padding=1)
 
-# ==============================================================================
-# 4. MẠNG ABLATION 3: MINILITEV11 + CBAM
-# ==============================================================================
-class Ablation3_CBAM(nn.Module):
-    def __init__(self, num_classes=1, input_size=128):
-        super().__init__()
-        
-        # Phiên bản ép cân: 16 -> 32 -> 64 -> 128
-        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        
-        self.e1 = EncoderBlock_CBAM(16, 32,   act_type='relu6')   
-        self.e2 = EncoderBlock_CBAM(32, 64,   act_type='relu6')   
-        self.e3 = EncoderBlock_CBAM(64, 128,  act_type='relu6') 
-        self.e4 = EncoderBlock_CBAM(128, 128, act_type='relu6') 
-        
-        # Nhánh phụ (Aux Head) - Kích thước 32
-        aux_dim = 32
-        self.aux_head = nn.Sequential(
-            nn.Conv2d(128, aux_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(aux_dim),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(aux_dim, num_classes, kernel_size=1)
-        )
-        
-        self.bottleneck = SerialBottleneck_CBAM(128, act_type='relu6')
-        
-        self.d4 = ConcatDecoderBlock_CBAM(in_c=128, skip_c=128, out_c=128, act_type='relu6') 
-        self.d3 = ConcatDecoderBlock_CBAM(in_c=128, skip_c=128, out_c=64,  act_type='relu6')  
-        self.d2 = ConcatDecoderBlock_CBAM(in_c=64,  skip_c=64,  out_c=32,  act_type='relu6')   
-        self.d1 = ConcatDecoderBlock_CBAM(in_c=32,  skip_c=32,  out_c=16,  act_type='relu6')   
-        
-        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
+        self.e1 = EncoderStageCBAM(c_stem, c1)
+        self.e2 = EncoderStageCBAM(c1, c2)
+        self.e3 = EncoderStageCBAM(c2, c3)
+        self.e4 = EncoderStageCBAM(c3, c4)
 
-    def forward(self, x):
-        input_shape = x.shape[2:] 
+        self.aux_head = AuxiliaryBoundaryHead(c4, aux_hidden_channels, num_classes)
 
-        x = self.conv_in(x)
-        
+        self.bottleneck = SerialBottleneckCBAM(c4)
+
+        d4, d3, d2, d1 = self.DECODER_CHANNELS
+        self.d4 = DecoderStageCBAM(in_channels=c4, skip_channels=c4, out_channels=d4)
+        self.d3 = DecoderStageCBAM(in_channels=d4, skip_channels=c3, out_channels=d3)
+        self.d2 = DecoderStageCBAM(in_channels=d3, skip_channels=c2, out_channels=d2)
+        self.d1 = DecoderStageCBAM(in_channels=d2, skip_channels=c1, out_channels=d1)
+
+        self.head = nn.Conv2d(d1, num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor):
+        input_size = x.shape[2:]
+
+        x = self.stem(x)
         x, s1 = self.e1(x)
         x, s2 = self.e2(x)
         x, s3 = self.e3(x)
         x, s4 = self.e4(x)
-        
-        aux_out = None
-        if self.training:
-            aux_out = self.aux_head(s4)
-            aux_out = F.interpolate(aux_out, size=input_shape, mode='bilinear', align_corners=False)
-        
+
+        aux_out = self.aux_head(s4, input_size) if self.training else None
+
         x = self.bottleneck(x)
-        
         x = self.d4(x, s4)
         x = self.d3(x, s3)
         x = self.d2(x, s2)
         x = self.d1(x, s1)
-        
-        main_out = self.conv_out(x)
-        
-        if self.training:
-            return main_out, aux_out
-        return main_out
+        main_out = self.head(x)
 
-def build_model(num_classes=1, input_size=128):
-    return Ablation3_CBAM(num_classes=num_classes, input_size=input_size)
+        return (main_out, aux_out) if self.training else main_out
+
+
+def build_model(num_classes: int = 1, **kwargs) -> FSENetCBAM:
+    return FSENetCBAM(num_classes=num_classes, **kwargs)

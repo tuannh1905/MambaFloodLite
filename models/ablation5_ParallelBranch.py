@@ -1,214 +1,120 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-# ==============================================================================
-# 0. CUSTOM ACTIVATIONS CHO MCU
-# ==============================================================================
-def get_activation(act_type):
-    return nn.ReLU6(inplace=True)
+from fsenet import DepthwiseConvBN, DecoderStage, AuxiliaryBoundaryHead
 
-# ==============================================================================
-# 1. KHỐI TÍCH CHẬP VÀ UPSAMPLE CƠ BẢN
-# ==============================================================================
-class SquareDW(nn.Module):
-    def __init__(self, dim, kernel_size=3):
-        super().__init__()
-        padding = kernel_size // 2
-        # Depthwise Convolution
-        self.dw = nn.Conv2d(dim, dim, kernel_size=kernel_size, padding=padding, groups=dim, bias=False)
-        self.bn = nn.BatchNorm2d(dim)
 
-    def forward(self, x):
-        return self.bn(self.dw(x))
-
-class NearestUpsample(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='nearest')
-        self.refine = nn.Sequential(
-            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
-            nn.BatchNorm2d(channels)
-        )
-
-    def forward(self, x):
-        return self.refine(self.up(x))
-
-# ==============================================================================
-# 2. KHỐI MULTI-SCALE PARALLEL (ĐA TỶ LỆ SONG SONG)
-# ==============================================================================
 class MultiScaleBlock(nn.Module):
-    def __init__(self, dim, act_type='relu6'):
+    def __init__(self, channels: int):
         super().__init__()
-        # 3 nhánh song song bắt các đặc trưng từ vi mô đến vĩ mô
-        self.branch_3x3 = SquareDW(dim, kernel_size=3)
-        self.branch_5x5 = SquareDW(dim, kernel_size=5)
-        self.branch_7x7 = SquareDW(dim, kernel_size=7)
-        
-        # Nén 3 nhánh (dim * 3) trở lại kích thước gốc (dim)
-        self.pw_fuse = nn.Conv2d(dim * 3, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
-        self.act = get_activation(act_type)
+        self.branch_3x3 = DepthwiseConvBN(channels, kernel_size=3)
+        self.branch_5x5 = DepthwiseConvBN(channels, kernel_size=5)
+        self.branch_7x7 = DepthwiseConvBN(channels, kernel_size=7)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.act = nn.ReLU6(inplace=True)
 
-    def forward(self, x):
-        # Dữ liệu đi song song vào cả 3 nhánh
-        out_3 = self.branch_3x3(x)
-        out_5 = self.branch_5x5(x)
-        out_7 = self.branch_7x7(x)
-        
-        # Ghép nối dọc theo trục channel
-        concat_out = torch.cat([out_3, out_5, out_7], dim=1)
-        
-        # Trộn đặc trưng và giảm chiều
-        fused = self.bn_fuse(self.pw_fuse(concat_out))
-        
-        # Kết nối thặng dư (Residual Connection)
-        return self.act(fused + x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.cat([self.branch_3x3(x), self.branch_5x5(x), self.branch_7x7(x)], dim=1)
+        out = self.fuse(out)
+        return self.act(out + x)
 
-class EncoderBlock_MultiScale(nn.Module):
-    def __init__(self, in_c, out_c, act_type='relu6'):
+
+class EncoderStageMultiScale(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        # Sử dụng khối Multi-scale mới
-        self.block = MultiScaleBlock(in_c, act_type)
-        self.down_pool = nn.MaxPool2d((2, 2))
-        
-        self.same_channels = (in_c == out_c)
-        if not self.same_channels:
-            self.pw = nn.Sequential(
-                nn.Conv2d(in_c, out_c - in_c, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_c - in_c)
+        self.block = MultiScaleBlock(in_channels)
+        self.pool = nn.MaxPool2d(kernel_size=2)
+        self.act = nn.ReLU6(inplace=True)
+
+        self.channels_match = in_channels == out_channels
+        if not self.channels_match:
+            extra_channels = out_channels - in_channels
+            self.expand = nn.Sequential(
+                nn.Conv2d(in_channels, extra_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(extra_channels),
             )
-            self.down_pw = nn.MaxPool2d((2, 2))
-            
-        self.act = get_activation(act_type)
+            self.expand_pool = nn.MaxPool2d(kernel_size=2)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.block(x)
-        
-        if self.same_channels:
-            return self.act(self.down_pool(feat)), feat
-        else:
-            feat_pw = self.pw(feat)
-            skip = torch.cat([feat, feat_pw], dim=1)
-            
-            pool_feat = self.down_pool(feat)
-            pool_pw   = self.down_pw(feat_pw)
-            
-            out = self.act(torch.cat([pool_feat, pool_pw], dim=1))
-            return out, skip
 
-# ==============================================================================
-# 3. DECODER & BOTTLE-NECK (MULTI-SCALE)
-# ==============================================================================
-class SerialBottleneck_MultiScale(nn.Module):
-    def __init__(self, dim, act_type='relu6'):
+        if self.channels_match:
+            return self.act(self.pool(feat)), feat
+
+        extra_feat = self.expand(feat)
+        skip = torch.cat([feat, extra_feat], dim=1)
+        out = self.act(torch.cat([self.pool(feat), self.expand_pool(extra_feat)], dim=1))
+        return out, skip
+
+
+class SerialBottleneckMultiScale(nn.Module):
+    def __init__(self, channels: int):
         super().__init__()
-        # Bottleneck cũng được hưởng lợi rất lớn từ Multi-scale
-        # vì đây là tầng chứa ngữ nghĩa sâu nhất
-        self.branch_3x3 = SquareDW(dim, kernel_size=3)
-        self.branch_5x5 = SquareDW(dim, kernel_size=5)
-        self.branch_7x7 = SquareDW(dim, kernel_size=7)
-        self.pw_fuse = nn.Conv2d(dim * 3, dim, kernel_size=1, bias=False)
-        self.bn_fuse = nn.BatchNorm2d(dim)
+        self.branch_3x3 = DepthwiseConvBN(channels, kernel_size=3)
+        self.branch_5x5 = DepthwiseConvBN(channels, kernel_size=5)
+        self.branch_7x7 = DepthwiseConvBN(channels, kernel_size=7)
+        self.fuse = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
 
-    def forward(self, x):
-        out_3 = self.branch_3x3(x)
-        out_5 = self.branch_5x5(x)
-        out_7 = self.branch_7x7(x)
-        
-        concat_out = torch.cat([out_3, out_5, out_7], dim=1)
-        fused = self.bn_fuse(self.pw_fuse(concat_out))
-        return x + fused
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.cat([self.branch_3x3(x), self.branch_5x5(x), self.branch_7x7(x)], dim=1)
+        return x + self.fuse(out)
 
-class ConcatDecoderBlock_NoAttn(nn.Module):
-    def __init__(self, in_c, skip_c, out_c, act_type='relu6'):
+
+class FSENetMultiScale(nn.Module):
+    # Ablation 5: parallel multi-scale (3x3/5x5/7x7) encoder and bottleneck
+    # in place of the serial depthwise design.
+    ENCODER_CHANNELS = (16, 32, 64, 128, 128)  # stem, e1, e2, e3, e4
+    DECODER_CHANNELS = (128, 64, 32, 16)       # d4, d3, d2, d1
+
+    def __init__(self, num_classes: int = 1, aux_hidden_channels: int = 32):
         super().__init__()
-        self.up = NearestUpsample(in_c)
-        concat_channels = in_c + skip_c
-        gc = max(out_c // 4, 4)
-        
-        self.refine = nn.Sequential(
-            nn.Conv2d(concat_channels, gc, kernel_size=1, bias=False), 
-            nn.BatchNorm2d(gc), 
-            get_activation(act_type),
-            SquareDW(gc, kernel_size=5), 
-            nn.Conv2d(gc, out_c, kernel_size=1, bias=False), 
-            nn.BatchNorm2d(out_c)
-        )
-        
-        self.shortcut = nn.Sequential(
-            nn.Conv2d(concat_channels, out_c, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_c)
-        )
-        self.act = get_activation(act_type)
+        c_stem, c1, c2, c3, c4 = self.ENCODER_CHANNELS
 
-    def forward(self, x, skip):
-        up_feat = self.up(x)
-        fused = torch.cat([up_feat, skip], dim=1)
-        return self.act(self.refine(fused) + self.shortcut(fused))
+        self.stem = nn.Conv2d(3, c_stem, kernel_size=3, padding=1)
 
-# ==============================================================================
-# 4. MẠNG ABLATION 5: MULTI-SCALE PARALLEL 3x3, 5x5, 7x7
-# ==============================================================================
-class Ablation5_MultiScale(nn.Module):
-    def __init__(self, num_classes=1, input_size=128):
-        super().__init__()
-        
-        # Phiên bản ép cân: 16 -> 32 -> 64 -> 128
-        self.conv_in = nn.Conv2d(3, 16, kernel_size=3, padding=1)
-        
-        # Áp dụng Encoder Multi-scale
-        self.e1 = EncoderBlock_MultiScale(16, 32,   act_type='relu6')   
-        self.e2 = EncoderBlock_MultiScale(32, 64,   act_type='relu6')   
-        self.e3 = EncoderBlock_MultiScale(64, 128,  act_type='relu6') 
-        self.e4 = EncoderBlock_MultiScale(128, 128, act_type='relu6') 
-        
-        # Nhánh phụ (Aux Head) - Kích thước 32
-        aux_dim = 32
-        self.aux_head = nn.Sequential(
-            nn.Conv2d(128, aux_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(aux_dim),
-            nn.ReLU6(inplace=True),
-            nn.Conv2d(aux_dim, num_classes, kernel_size=1)
-        )
-        
-        # Áp dụng Bottleneck Multi-scale
-        self.bottleneck = SerialBottleneck_MultiScale(128, act_type='relu6')
-        
-        self.d4 = ConcatDecoderBlock_NoAttn(in_c=128, skip_c=128, out_c=128, act_type='relu6') 
-        self.d3 = ConcatDecoderBlock_NoAttn(in_c=128, skip_c=128, out_c=64,  act_type='relu6')  
-        self.d2 = ConcatDecoderBlock_NoAttn(in_c=64,  skip_c=64,  out_c=32,  act_type='relu6')   
-        self.d1 = ConcatDecoderBlock_NoAttn(in_c=32,  skip_c=32,  out_c=16,  act_type='relu6')   
-        
-        self.conv_out = nn.Conv2d(16, num_classes, kernel_size=1)
+        self.e1 = EncoderStageMultiScale(c_stem, c1)
+        self.e2 = EncoderStageMultiScale(c1, c2)
+        self.e3 = EncoderStageMultiScale(c2, c3)
+        self.e4 = EncoderStageMultiScale(c3, c4)
 
-    def forward(self, x):
-        input_shape = x.shape[2:] 
+        self.aux_head = AuxiliaryBoundaryHead(c4, aux_hidden_channels, num_classes)
 
-        x = self.conv_in(x)
-        
+        self.bottleneck = SerialBottleneckMultiScale(c4)
+
+        d4, d3, d2, d1 = self.DECODER_CHANNELS
+        self.d4 = DecoderStage(in_channels=c4, skip_channels=c4, out_channels=d4)
+        self.d3 = DecoderStage(in_channels=d4, skip_channels=c3, out_channels=d3)
+        self.d2 = DecoderStage(in_channels=d3, skip_channels=c2, out_channels=d2)
+        self.d1 = DecoderStage(in_channels=d2, skip_channels=c1, out_channels=d1)
+
+        self.head = nn.Conv2d(d1, num_classes, kernel_size=1)
+
+    def forward(self, x: torch.Tensor):
+        input_size = x.shape[2:]
+
+        x = self.stem(x)
         x, s1 = self.e1(x)
         x, s2 = self.e2(x)
         x, s3 = self.e3(x)
         x, s4 = self.e4(x)
-        
-        aux_out = None
-        if self.training:
-            aux_out = self.aux_head(s4)
-            aux_out = F.interpolate(aux_out, size=input_shape, mode='bilinear', align_corners=False)
-        
+
+        aux_out = self.aux_head(s4, input_size) if self.training else None
+
         x = self.bottleneck(x)
-        
         x = self.d4(x, s4)
         x = self.d3(x, s3)
         x = self.d2(x, s2)
         x = self.d1(x, s1)
-        
-        main_out = self.conv_out(x)
-        
-        if self.training:
-            return main_out, aux_out
-        return main_out
+        main_out = self.head(x)
 
-def build_model(num_classes=1, input_size=128):
-    return Ablation5_MultiScale(num_classes=num_classes, input_size=input_size)
+        return (main_out, aux_out) if self.training else main_out
+
+
+def build_model(num_classes: int = 1, **kwargs) -> FSENetMultiScale:
+    return FSENetMultiScale(num_classes=num_classes, **kwargs)

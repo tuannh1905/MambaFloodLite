@@ -1,30 +1,34 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fsenet import DepthwiseConvBN, NearestUpsampleRefine, AuxiliaryBoundaryHead
 
-
-class ECAModule(nn.Module):
-    def __init__(self, channels: int, gamma: int = 2, beta: int = 1):
+class DepthwiseConvBN(nn.Module):
+    def __init__(self, channels: int, kernel_size: int = 3):
         super().__init__()
-        t = int(abs((math.log(channels, 2) + beta) / gamma))
-        kernel_size = t if t % 2 else t + 1
-
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2, bias=False)
-        self.sigmoid = nn.Sigmoid()
+        self.op = nn.Sequential(
+            nn.Conv2d(
+                channels, channels, kernel_size=kernel_size,
+                padding=kernel_size // 2, groups=channels, bias=False,
+            ),
+            nn.BatchNorm2d(channels),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.avg_pool(x)
-        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
-        y = self.sigmoid(y)
-        return x * y.expand_as(x)
+        return self.op(x)
 
 
-class SerialDepthwiseBlockECA(nn.Module):
+class NearestUpsampleRefine(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
+        self.refine = DepthwiseConvBN(channels, kernel_size=3)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.refine(self.upsample(x))
+
+
+class SerialDepthwiseBlock(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
         self.dw1 = DepthwiseConvBN(channels, kernel_size=3)
@@ -34,7 +38,6 @@ class SerialDepthwiseBlockECA(nn.Module):
             nn.Conv2d(channels, channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(channels),
         )
-        self.eca = ECAModule(channels)
         self.act = nn.ReLU6(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -42,14 +45,13 @@ class SerialDepthwiseBlockECA(nn.Module):
         out = self.dw2(out)
         out = self.dw3(out)
         out = self.fuse(out)
-        out = self.eca(out)
         return self.act(out + x)
 
 
-class EncoderStageECA(nn.Module):
+class EncoderStage(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.block = SerialDepthwiseBlockECA(in_channels)
+        self.block = SerialDepthwiseBlock(in_channels)
         self.pool = nn.MaxPool2d(kernel_size=2)
         self.act = nn.ReLU6(inplace=True)
 
@@ -74,22 +76,21 @@ class EncoderStageECA(nn.Module):
         return out, skip
 
 
-class SerialBottleneckECA(nn.Module):
+class SerialBottleneck(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
         self.dw1 = DepthwiseConvBN(channels, kernel_size=3)
         self.dw2 = DepthwiseConvBN(channels, kernel_size=3)
         self.dw3 = DepthwiseConvBN(channels, kernel_size=3)
-        self.eca = ECAModule(channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         d1 = self.dw1(x)
         d2 = self.dw2(d1)
         d3 = self.dw3(d2)
-        return x + self.eca(d1 + d2 + d3)
+        return x + d1 + d2 + d3
 
 
-class DecoderStageECA(nn.Module):
+class DecoderStage(nn.Module):
     def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
         super().__init__()
         self.upsample = NearestUpsampleRefine(in_channels)
@@ -105,7 +106,6 @@ class DecoderStageECA(nn.Module):
             nn.Conv2d(hidden_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
         )
-        self.eca = ECAModule(out_channels)
         self.shortcut = nn.Sequential(
             nn.Conv2d(concat_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
@@ -114,36 +114,49 @@ class DecoderStageECA(nn.Module):
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         fused = torch.cat([self.upsample(x), skip], dim=1)
-        refined = self.eca(self.refine(fused))
-        return self.act(refined + self.shortcut(fused))
+        return self.act(self.refine(fused) + self.shortcut(fused))
 
 
-class FSENetECA(nn.Module):
-    # Ablation 2: FSENet + Efficient Channel Attention (ECA) on every stage.
-    # Uses a narrower channel schedule (16-32-64-128) than base FSENet (32-64-128-128).
-    ENCODER_CHANNELS = (16, 32, 64, 128, 128)  # stem, e1, e2, e3, e4
-    DECODER_CHANNELS = (128, 64, 32, 16)       # d4, d3, d2, d1
+class AuxiliaryBoundaryHead(nn.Module):
+    def __init__(self, in_channels: int, hidden_channels: int, num_classes: int):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(hidden_channels, num_classes, kernel_size=1),
+        )
 
-    def __init__(self, num_classes: int = 1, aux_hidden_channels: int = 32):
+    def forward(self, x: torch.Tensor, output_size: torch.Size) -> torch.Tensor:
+        out = self.head(x)
+        return F.interpolate(out, size=output_size, mode="bilinear", align_corners=False)
+
+
+class FSENet(nn.Module):
+    # aux_head included: ~0.22M params (training). Dropped for deployment: ~0.14M params.
+    ENCODER_CHANNELS = (32, 64, 128, 128, 128)  # stem, e1, e2, e3, e4
+    DECODER_CHANNELS = (128, 64, 32, 16)        # d4, d3, d2, d1
+
+    def __init__(self, num_classes: int = 1, aux_hidden_channels: int = 64):
         super().__init__()
         c_stem, c1, c2, c3, c4 = self.ENCODER_CHANNELS
 
         self.stem = nn.Conv2d(3, c_stem, kernel_size=3, padding=1)
 
-        self.e1 = EncoderStageECA(c_stem, c1)
-        self.e2 = EncoderStageECA(c1, c2)
-        self.e3 = EncoderStageECA(c2, c3)
-        self.e4 = EncoderStageECA(c3, c4)
+        self.e1 = EncoderStage(c_stem, c1)
+        self.e2 = EncoderStage(c1, c2)
+        self.e3 = EncoderStage(c2, c3)
+        self.e4 = EncoderStage(c3, c4)
 
         self.aux_head = AuxiliaryBoundaryHead(c4, aux_hidden_channels, num_classes)
 
-        self.bottleneck = SerialBottleneckECA(c4)
+        self.bottleneck = SerialBottleneck(c4)
 
         d4, d3, d2, d1 = self.DECODER_CHANNELS
-        self.d4 = DecoderStageECA(in_channels=c4, skip_channels=c4, out_channels=d4)
-        self.d3 = DecoderStageECA(in_channels=d4, skip_channels=c3, out_channels=d3)
-        self.d2 = DecoderStageECA(in_channels=d3, skip_channels=c2, out_channels=d2)
-        self.d1 = DecoderStageECA(in_channels=d2, skip_channels=c1, out_channels=d1)
+        self.d4 = DecoderStage(in_channels=c4, skip_channels=c4, out_channels=d4)
+        self.d3 = DecoderStage(in_channels=d4, skip_channels=c3, out_channels=d3)
+        self.d2 = DecoderStage(in_channels=d3, skip_channels=c2, out_channels=d2)
+        self.d1 = DecoderStage(in_channels=d2, skip_channels=c1, out_channels=d1)
 
         self.head = nn.Conv2d(d1, num_classes, kernel_size=1)
 
@@ -168,5 +181,5 @@ class FSENetECA(nn.Module):
         return (main_out, aux_out) if self.training else main_out
 
 
-def build_model(num_classes: int = 1, **kwargs) -> FSENetECA:
-    return FSENetECA(num_classes=num_classes, **kwargs)
+def build_model(num_classes: int = 1, **kwargs) -> FSENet:
+    return FSENet(num_classes=num_classes, **kwargs)
