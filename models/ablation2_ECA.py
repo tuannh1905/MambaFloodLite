@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fsenet import DepthwiseConvBN, NearestUpsampleRefine, AuxiliaryBoundaryHead
+from models.fsenet import DepthwiseConvBN, NearestUpsampleRefine, AuxiliaryBoundaryHead
 
 
 class ECAModule(nn.Module):

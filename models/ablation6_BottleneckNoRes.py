@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from fsenet import DepthwiseConvBN, EncoderStage, DecoderStage, AuxiliaryBoundaryHead
+from models.fsenet import DepthwiseConvBN, EncoderStage, DecoderStage, AuxiliaryBoundaryHead
 
 
 class SerialBottleneckNoResidual(nn.Module):

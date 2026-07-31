@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from fsenet import DepthwiseConvBN, NearestUpsampleRefine, EncoderStage, SerialBottleneck, AuxiliaryBoundaryHead
+from models.fsenet import DepthwiseConvBN, NearestUpsampleRefine, EncoderStage, SerialBottleneck, AuxiliaryBoundaryHead
 
 
 class DecoderStageNoSkip(nn.Module):

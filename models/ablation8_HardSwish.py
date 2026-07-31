@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from fsenet import DepthwiseConvBN
+from models.fsenet import DepthwiseConvBN
 
 
 class NearestUpsampleRefineHardSwish(nn.Module):

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from fsenet import DepthwiseConvBN, DecoderStage, AuxiliaryBoundaryHead
+from models.fsenet import DepthwiseConvBN, DecoderStage, AuxiliaryBoundaryHead
 
 
 class MultiScaleBlock(nn.Module):
