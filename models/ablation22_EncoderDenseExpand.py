@@ -1,54 +1,38 @@
 import torch
 import torch.nn as nn
 
-from models.fsenet import DepthwiseConvBN, SerialDepthwiseBlock, SerialBottleneck, DecoderStage, AuxiliaryBoundaryHead
+from models.fsenet import SerialDepthwiseBlock, SerialBottleneck, DecoderStage, AuxiliaryBoundaryHead
 
 
-class StridedDepthwiseConvBN(nn.Module):
-    def __init__(self, channels: int, kernel_size: int = 3, stride: int = 2):
-        super().__init__()
-        self.op = nn.Sequential(
-            nn.Conv2d(
-                channels, channels, kernel_size=kernel_size, stride=stride,
-                padding=kernel_size // 2, groups=channels, bias=False,
-            ),
-            nn.BatchNorm2d(channels),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.op(x)
-
-
-class EncoderStageStridedDW(nn.Module):
+class EncoderStageDenseExpand(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.block = SerialDepthwiseBlock(in_channels)
-        self.down = StridedDepthwiseConvBN(in_channels, kernel_size=3, stride=2)
+        self.pool = nn.MaxPool2d(kernel_size=2)
         self.act = nn.ReLU6(inplace=True)
 
         self.channels_match = in_channels == out_channels
         if not self.channels_match:
-            extra_channels = out_channels - in_channels
-            self.expand = nn.Sequential(
-                nn.Conv2d(in_channels, extra_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(extra_channels),
+            self.project = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels),
             )
-            self.expand_down = StridedDepthwiseConvBN(extra_channels, kernel_size=3, stride=2)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.block(x)
 
         if self.channels_match:
-            return self.act(self.down(feat)), feat
+            return self.act(self.pool(feat)), feat
 
-        extra_feat = self.expand(feat)
-        skip = torch.cat([feat, extra_feat], dim=1)
-        out = self.act(torch.cat([self.down(feat), self.expand_down(extra_feat)], dim=1))
+        skip = self.project(feat)
+        out = self.act(self.pool(skip))
         return out, skip
 
 
-class FSENetStridedDW(nn.Module):
-    # Ablation 24: strided depthwise convolution downsampling instead of max-pooling.
+class FSENetDenseExpand(nn.Module):
+    # Ablation: channel expansion between encoder stages via a dense 1x1
+    # projection of the full feature map, instead of computing only the
+    # additional channels and concatenating them with the pooled input.
     ENCODER_CHANNELS = (32, 64, 128, 128, 128)  # stem, e1, e2, e3, e4
     DECODER_CHANNELS = (128, 64, 32, 16)        # d4, d3, d2, d1
 
@@ -58,10 +42,10 @@ class FSENetStridedDW(nn.Module):
 
         self.stem = nn.Conv2d(3, c_stem, kernel_size=3, padding=1)
 
-        self.e1 = EncoderStageStridedDW(c_stem, c1)
-        self.e2 = EncoderStageStridedDW(c1, c2)
-        self.e3 = EncoderStageStridedDW(c2, c3)
-        self.e4 = EncoderStageStridedDW(c3, c4)
+        self.e1 = EncoderStageDenseExpand(c_stem, c1)
+        self.e2 = EncoderStageDenseExpand(c1, c2)
+        self.e3 = EncoderStageDenseExpand(c2, c3)
+        self.e4 = EncoderStageDenseExpand(c3, c4)
 
         self.aux_head = AuxiliaryBoundaryHead(c4, aux_hidden_channels, num_classes)
 
@@ -96,5 +80,5 @@ class FSENetStridedDW(nn.Module):
         return (main_out, aux_out) if self.training else main_out
 
 
-def build_model(num_classes: int = 1, **kwargs) -> FSENetStridedDW:
-    return FSENetStridedDW(num_classes=num_classes, **kwargs)
+def build_model(num_classes: int = 1, **kwargs) -> FSENetDenseExpand:
+    return FSENetDenseExpand(num_classes=num_classes, **kwargs)

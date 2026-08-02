@@ -123,7 +123,7 @@ class FSENetECA(nn.Module):
     ENCODER_CHANNELS = (32, 64, 128, 128, 128)
     DECODER_CHANNELS = (128, 64, 32, 16)       # d4, d3, d2, d1
 
-    def __init__(self, num_classes: int = 1, aux_hidden_channels: int = 32):
+    def __init__(self, num_classes: int = 1, aux_hidden_channels: int = 64):
         super().__init__()
         c_stem, c1, c2, c3, c4 = self.ENCODER_CHANNELS
 

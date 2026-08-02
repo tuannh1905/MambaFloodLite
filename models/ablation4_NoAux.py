@@ -6,7 +6,7 @@ from models.fsenet import EncoderStage, SerialBottleneck, DecoderStage
 
 class FSENetNoAux(nn.Module):
     # Ablation 4: FSENet without the auxiliary boundary head.
-    ENCODER_CHANNELS = (16, 32, 64, 128, 128)  # stem, e1, e2, e3, e4
+    ENCODER_CHANNELS = (32, 64, 128, 128, 128)  # stem, e1, e2, e3, e4
     DECODER_CHANNELS = (128, 64, 32, 16)       # d4, d3, d2, d1
 
     def __init__(self, num_classes: int = 1):
