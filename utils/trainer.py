@@ -37,6 +37,24 @@ class BoundaryLoss(nn.Module):
         loss_dice = self.dice_loss(pred_boundary, gt_boundary)
         return loss_bce + self.dice_weight * loss_dice
 
+class PlainDiceLoss(nn.Module):
+    def forward(self, pred, target, smooth=1e-5):
+        pred = torch.sigmoid(pred)
+        intersection = (pred * target).sum(dim=(2, 3))
+        union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+        dice = (2. * intersection + smooth) / (union + smooth)
+        return 1.0 - dice.mean()
+
+def get_aux_loss(name):
+    name = name.lower()
+    if name == 'boundary':
+        return BoundaryLoss(pos_weight_val=10.0, dice_weight=0.5)
+    if name == 'bce':
+        return nn.BCEWithLogitsLoss()
+    if name == 'dice':
+        return PlainDiceLoss()
+    raise ValueError(f"Unknown aux loss: {name} (expected one of: boundary, bce, dice)")
+
 # ==============================================================================
 # 2. SEED & TRAINER
 # ==============================================================================
@@ -54,7 +72,8 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr, 
-                       dataset, output_path, seed, num_classes=1, dataset_type='floodvn'):
+                       dataset, output_path, seed, num_classes=1, dataset_type='floodvn',
+                       aux_loss_name='boundary', aux_weight=0.4):
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -137,11 +156,8 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     best_val_loss = float('inf')
     
     # -------------------------------------------------------------
-    # INIT BOUNDARY LOSS & DETECT AUX BRANCH
+    # DETECT AUX BRANCH & PICK AUX LOSS
     # -------------------------------------------------------------
-    boundary_criterion = BoundaryLoss(pos_weight_val=10.0, dice_weight=0.5).to(device)
-    aux_weight = 0.4
-
     # Dry run to check if model uses aux loss
     model.train()
     try:
@@ -153,6 +169,8 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     except Exception:
         has_aux = False
 
+    aux_criterion = get_aux_loss(aux_loss_name).to(device) if has_aux else None
+
     # -------------------------------------------------------------
     # LOSS CONFIGURATION LOGGER
     # -------------------------------------------------------------
@@ -161,7 +179,7 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
     print(f"{'='*70}")
     print(f"Main Loss : {loss_name.upper()}")
     if has_aux:
-        print(f"Aux Loss  : BOUNDARY LOSS")
+        print(f"Aux Loss  : {aux_loss_name.upper()}")
         print(f"  + Weight : {aux_weight}")
     else:
         print(f"Aux Loss  : None")
@@ -190,9 +208,9 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
             if isinstance(outputs, (list, tuple)):
                 # 1. Main loss (index 0)
                 loss = criterion(outputs[0], masks)
-                # 2. Aux loss (Boundary Loss for subsequent outputs)
+                # 2. Aux loss (configurable via aux_loss_name / aux_weight)
                 for aux_out in outputs[1:]:
-                    aux_loss = boundary_criterion(aux_out, masks)
+                    aux_loss = aux_criterion(aux_out, masks)
                     loss += aux_weight * aux_loss
             else:
                 # No aux branches
@@ -255,7 +273,9 @@ def train_segmentation(model_name, loss_name, size, epochs, batch_size, lr,
                     'batch_size': batch_size,
                     'lr': lr,
                     'size': size,
-                    'num_classes': num_classes
+                    'num_classes': num_classes,
+                    'aux_loss': aux_loss_name if has_aux else None,
+                    'aux_weight': aux_weight if has_aux else None
                 }
             }
             

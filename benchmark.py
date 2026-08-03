@@ -70,7 +70,8 @@ def verify_reproducibility(args, num_runs=2):
             model_name=args.model, loss_name=args.loss, size=args.size,
             epochs=min(args.epochs, 5), batch_size=args.batch_size, lr=args.lr,
             dataset=args.dataset, output_path=os.path.join(args.output_path, f'repro_run{run}'),
-            seed=args.seed, num_classes=1, dataset_type=args.dataset
+            seed=args.seed, num_classes=1, dataset_type=args.dataset,
+            aux_loss_name=args.aux_loss, aux_weight=args.aux_weight
         )
         results.append(result)
 
@@ -105,7 +106,8 @@ def run_multiseed_experiments(args, seeds):
             model_name=args.model, loss_name=args.loss, size=args.size,
             epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
             dataset=args.dataset, output_path=os.path.join(args.output_path, f'seed_{seed}'),
-            seed=seed, num_classes=1, dataset_type=args.dataset
+            seed=seed, num_classes=1, dataset_type=args.dataset,
+            aux_loss_name=args.aux_loss, aux_weight=args.aux_weight
         )
         results.append({
             'seed': seed,
@@ -147,6 +149,7 @@ def run_multiseed_experiments(args, seeds):
         json.dump({
             'config': {
                 'model': args.model, 'dataset': args.dataset, 'loss': args.loss,
+                'aux_loss': args.aux_loss, 'aux_weight': args.aux_weight,
                 'epochs': args.epochs, 'batch_size': args.batch_size,
                 'lr': args.lr, 'size': args.size
             },
@@ -178,6 +181,9 @@ def main():
     parser.add_argument('--model',        type=str,   required=True)
     parser.add_argument('--size',         type=int,   default=128)
     parser.add_argument('--loss',         type=str,   default='bce')
+    parser.add_argument('--aux_loss',     type=str,   default='boundary',
+                        choices=['boundary', 'bce', 'dice'])
+    parser.add_argument('--aux_weight',   type=float, default=0.4)
     parser.add_argument('--epochs',       type=int,   default=100)
     parser.add_argument('--batch_size',   type=int,   default=4)
     parser.add_argument('--lr',           type=float, default=0.001)
@@ -207,7 +213,8 @@ def main():
 
     print("="*70)
     print(f"Dataset: {args.dataset} | Model: {args.model} | Size: {args.size}")
-    print(f"Loss: {args.loss} | Epochs: {args.epochs} | BS: {args.batch_size} | LR: {args.lr}")
+    print(f"Loss: {args.loss} | Aux loss: {args.aux_loss} (weight={args.aux_weight}) | "
+          f"Epochs: {args.epochs} | BS: {args.batch_size} | LR: {args.lr}")
     print("="*70)
 
     from utils.trainer import train_segmentation
@@ -215,7 +222,8 @@ def main():
         model_name=args.model, loss_name=args.loss, size=args.size,
         epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
         dataset=args.dataset, output_path=args.output_path,
-        seed=args.seed, num_classes=1, dataset_type=args.dataset
+        seed=args.seed, num_classes=1, dataset_type=args.dataset,
+        aux_loss_name=args.aux_loss, aux_weight=args.aux_weight
     )
 
 
